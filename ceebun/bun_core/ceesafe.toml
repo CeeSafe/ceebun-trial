@@ -2,4 +2,4 @@
 name = "bun_core"
 version = "0.1.0"
 kind = "library"
-ceesafec = ">=0.28.0"
+ceesafec = ">=0.29.0"
