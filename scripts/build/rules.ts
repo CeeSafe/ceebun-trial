@@ -55,6 +55,6 @@ export function registerAllRules(n: Ninja, cfg: Config): void {
   // host_tool_cc (darwin cross)
   registerShimRules(n, cfg);
 
-  // ceesafe_obj (CeeBun: CeeSafe packages that replace Rust crates)
+  // ceesafe_lib (CeeBun: CeeSafe packages that replace Rust crates)
   registerCeesafeRules(n, cfg);
 }

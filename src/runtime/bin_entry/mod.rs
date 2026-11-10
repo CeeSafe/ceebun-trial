@@ -183,6 +183,18 @@ pub(crate) unsafe extern "C" fn main(argc: c_int, argv: *const *const c_char) ->
     // 1. Crash handler first so anything below gets a usable trace.
     bun_crash_handler::init();
 
+    // CeeBun (ADR 0088): start the CeeSafe runtime before any thread can call it. Its panics then report through the
+    // crash handler just installed (`ceebun/host/ceebun_host.c`).
+    {
+        unsafe extern "C" {
+            fn ceebun_init(argc: c_int, argv: *const *const c_char) -> i32;
+        }
+        // SAFETY: called once, on the main thread, before any thread is spawned; `argv` holds `argc` C strings
+        // (the C runtime's), which `ceesafe_init` copies.
+        let status = unsafe { ceebun_init(argc, argv) };
+        assert!(status == 0, "ceesafe_init failed: {status}");
+    }
+
     use_mimalloc_in_dependencies();
 
     // SIGPIPE/SIGXFSZ → SIG_IGN.

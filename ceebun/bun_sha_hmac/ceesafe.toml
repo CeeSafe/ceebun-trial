@@ -2,7 +2,7 @@
 name = "bun_sha_hmac"
 version = "0.1.0"
 kind = "library"
-ceesafec = ">=0.27.0"
+ceesafec = ">=0.28.0"
 
 [dependencies]
 bun_boringssl_sys = { path = "../bun_boringssl_sys" }
