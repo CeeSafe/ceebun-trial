@@ -446,7 +446,7 @@ export function emitBun(n: Ninja, cfg: Config, sources: Sources): BunOutput {
   // export the C++ side touches is reached from those roots.
   const shimInputs = emitShims(n, cfg);
   const depLink = lazyDepObjects(cfg, depObjects);
-  // CeeBun: one object per CeeSafe package that replaces a Rust crate; its crate's shim calls its exports.
+  // CeeBun: one archive of the CeeSafe packages that replace Rust crates, and the C host file (ceesafe.ts).
   const ceesafeObjects = emitCeesafe(n, cfg);
   const linkObjects = [...cxxObjects, ...cObjects, ...depLink.eager, ...rustObjects, ...ceesafeObjects, ...windowsRes];
   const ldflags = [...flags.ldflags, ...systemLibs(cfg)];

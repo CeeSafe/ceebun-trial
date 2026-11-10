@@ -37,7 +37,7 @@ const ruleVars = {
   strip: ["stripflags"],
   stripped_verify: ["spec"],
   // ceesafe.ts
-  ceesafe_obj: ["pkgdir", "cflags", "objpath"],
+  ceesafe_lib: ["pkgdir", "cflags", "libpath"],
   // codegen.ts
   bun_install: ["dir", "stamp"],
   codegen: ["cwd", "args", "desc"],
