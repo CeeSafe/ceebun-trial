@@ -1,0 +1,5 @@
+[package]
+name = "bun_boringssl_sys"
+version = "0.1.0"
+kind = "library"
+ceesafec = ">=0.27.0"

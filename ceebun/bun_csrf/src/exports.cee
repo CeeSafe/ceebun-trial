@@ -1,0 +1,82 @@
+// The C ABI that the Rust shim (src/csrf/lib.rs) calls. Every buffer is the caller's: Rust lends its slices as
+// pointer and length for the length of the call, and nothing allocated on one side is freed on the other.
+
+/// `bun_sha_hmac::evp::Algorithm` from the discriminant Rust gives it (`algorithm as u8`, declaration order). A value
+/// that is no variant is a broken caller: it panics, as a `@repr(u8)` parameter would.
+fn algorithmFromRust(index: u8) -> bun_sha_hmac.Algorithm => match (index) {
+    0 => bun_sha_hmac.Algorithm.Blake2b256,
+    1 => bun_sha_hmac.Algorithm.Blake2b512,
+    2 => bun_sha_hmac.Algorithm.Blake2s256,
+    3 => bun_sha_hmac.Algorithm.Md4,
+    4 => bun_sha_hmac.Algorithm.Md5,
+    5 => bun_sha_hmac.Algorithm.Ripemd160,
+    6 => bun_sha_hmac.Algorithm.Sha1,
+    7 => bun_sha_hmac.Algorithm.Sha224,
+    8 => bun_sha_hmac.Algorithm.Sha256,
+    9 => bun_sha_hmac.Algorithm.Sha384,
+    10 => bun_sha_hmac.Algorithm.Sha512,
+    11 => bun_sha_hmac.Algorithm.Sha512_224,
+    12 => bun_sha_hmac.Algorithm.Sha512_256,
+    13 => bun_sha_hmac.Algorithm.Sha3_224,
+    14 => bun_sha_hmac.Algorithm.Sha3_256,
+    15 => bun_sha_hmac.Algorithm.Sha3_384,
+    16 => bun_sha_hmac.Algorithm.Sha3_512,
+    17 => bun_sha_hmac.Algorithm.Shake128,
+    18 => bun_sha_hmac.Algorithm.Shake256,
+    _ => {
+        panic("invalid evp::Algorithm from Rust");
+    }
+};
+
+/// `bun_csrf::generate`: writes the raw token to the start of the caller's 512-byte `outBuffer` and returns its length,
+/// or 0 for `Error::TokenCreationFailed` (a token is never empty).
+/// Safety: Rust passes `secret` and `sessionId` as the pointer and length of live slices (`as_ptr`, so never null), and
+/// `outBuffer` as `&mut [u8; 512]`; none of them is touched by anything else during the call, and none is kept after it.
+@export("bun_csrf__generate")
+fn generateC(
+    secret: *u8,
+    secretLen: usize,
+    sessionId: *u8,
+    sessionIdLen: usize,
+    expiresInMs: u64,
+    algorithm: u8,
+    outBuffer: *mut u8,
+) -> usize {
+    let options = GenerateOptions {
+        secret: unsafe { Slice.fromRaw(secret, secretLen) },
+        sessionId: unsafe { Slice.fromRaw(sessionId, sessionIdLen) },
+        expiresInMs: expiresInMs,
+        algorithm: algorithmFromRust(algorithm),
+    };
+    let out = unsafe { Ptr.toBorrowMut(outBuffer as *mut [u8; TOKEN_BUFFER_SIZE]) };
+    return match (generate(borrow options, mut out)) {
+        Ok(length) => length,
+        Err(Error.TokenCreationFailed) => 0,
+    };
+}
+
+/// `bun_csrf::verify`.
+/// Safety: Rust passes `token`, `secret` and `sessionId` as the pointer and length of live slices (`as_ptr`, so never
+/// null) that nothing writes during the call, and none is kept after it.
+@export("bun_csrf__verify")
+fn verifyC(
+    token: *u8,
+    tokenLen: usize,
+    secret: *u8,
+    secretLen: usize,
+    sessionId: *u8,
+    sessionIdLen: usize,
+    maxAgeMs: u64,
+    encoding: TokenFormat,
+    algorithm: u8,
+) -> bool {
+    let options = VerifyOptions {
+        token: unsafe { Slice.fromRaw(token, tokenLen) },
+        secret: unsafe { Slice.fromRaw(secret, secretLen) },
+        sessionId: unsafe { Slice.fromRaw(sessionId, sessionIdLen) },
+        maxAgeMs: maxAgeMs,
+        encoding: encoding,
+        algorithm: algorithmFromRust(algorithm),
+    };
+    return verify(borrow options);
+}
