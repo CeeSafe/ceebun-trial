@@ -1,0 +1,107 @@
+// The part of `bun_boringssl_sys` (src/boringssl_sys/) that bun_csrf uses: BoringSSL's C functions, each behind one
+// safe wrapper (ADR 0081). BoringSSL is the copy already linked into Bun.
+
+/// `#define EVP_MAX_MD_SIZE 64`: the largest digest BoringSSL produces.
+public const EVP_MAX_MD_SIZE: usize = 64;
+
+extern "C" {
+    fn RAND_bytes(buf: *mut u8, len: usize) -> i32;
+    fn CRYPTO_memcmp(a: *void, b: *void, len: usize) -> i32;
+    fn HMAC(
+        evp_md: *void,
+        key: *void,
+        key_len: usize,
+        data: *u8,
+        data_len: usize,
+        out: *mut u8,
+        out_len: *mut u32,
+    ) -> *mut u8;
+
+    fn EVP_md4() -> *void;
+    fn EVP_md5() -> *void;
+    fn EVP_ripemd160() -> *void;
+    fn EVP_sha1() -> *void;
+    fn EVP_sha224() -> *void;
+    fn EVP_sha256() -> *void;
+    fn EVP_sha384() -> *void;
+    fn EVP_sha512() -> *void;
+    fn EVP_sha512_224() -> *void;
+    fn EVP_sha512_256() -> *void;
+    fn EVP_sha3_224() -> *void;
+    fn EVP_sha3_256() -> *void;
+    fn EVP_sha3_384() -> *void;
+    fn EVP_sha3_512() -> *void;
+    fn EVP_blake2b256() -> *void;
+    fn EVP_blake2b512() -> *void;
+}
+
+/// Fills `buf` from BoringSSL's CSPRNG.
+/// Safety: `buf` is a live, writable slice of `buf.length` bytes; `RAND_bytes` writes exactly that many (it aborts
+/// rather than fail).
+public fn randBytes(buf: SliceMut<u8>) {
+    if (buf.length == 0) {
+        return;
+    }
+    let _ = unsafe { RAND_bytes(buf.ptr, buf.length) };
+}
+
+/// Compares two byte strings in constant time (BoringSSL's `CRYPTO_memcmp`).
+/// Safety: both slices are live and readable for `a.length` bytes, the lengths being equal.
+public fn constantTimeEq(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    return unsafe { CRYPTO_memcmp(a.ptr as *void, b.ptr as *void, a.length) } == 0;
+}
+
+/// An `EVP_MD`: BoringSSL's description of a digest, a static singleton that is never freed.
+public struct EvpMd {
+    public raw: *void;
+}
+
+/// One-shot HMAC of `data` keyed by `key` into `out`; the digest's length, or null when BoringSSL fails.
+/// Safety: `md.raw` is an `EVP_MD` from one of the getters below; `key` and `data` are live readable slices; `out` holds
+/// `EVP_MAX_MD_SIZE` bytes, the most `HMAC` writes, and `outLen` is a live local that `HMAC` writes once.
+public fn hmac(md: EvpMd, key: Slice<u8>, data: Slice<u8>, out: borrow mut [u8; EVP_MAX_MD_SIZE]) -> usize? {
+    var outLen: u32 = truncate<u32>(EVP_MAX_MD_SIZE);
+    let outPtr = borrow mut out[0] as *mut u8;
+    let lenPtr = borrow mut outLen as *mut u32;
+    let result = unsafe { HMAC(md.raw, key.ptr as *void, key.length, data.ptr, data.length, outPtr, lenPtr) };
+    if (result.isNull()) {
+        return null;
+    }
+    return outLen as usize;
+}
+
+/// Safety: `EVP_md4` only returns a pointer to a static.
+public fn evpMd4() -> EvpMd => EvpMd { raw: unsafe { EVP_md4() } };
+/// Safety: `EVP_md5` only returns a pointer to a static.
+public fn evpMd5() -> EvpMd => EvpMd { raw: unsafe { EVP_md5() } };
+/// Safety: `EVP_ripemd160` only returns a pointer to a static.
+public fn evpRipemd160() -> EvpMd => EvpMd { raw: unsafe { EVP_ripemd160() } };
+/// Safety: `EVP_sha1` only returns a pointer to a static.
+public fn evpSha1() -> EvpMd => EvpMd { raw: unsafe { EVP_sha1() } };
+/// Safety: `EVP_sha224` only returns a pointer to a static.
+public fn evpSha224() -> EvpMd => EvpMd { raw: unsafe { EVP_sha224() } };
+/// Safety: `EVP_sha256` only returns a pointer to a static.
+public fn evpSha256() -> EvpMd => EvpMd { raw: unsafe { EVP_sha256() } };
+/// Safety: `EVP_sha384` only returns a pointer to a static.
+public fn evpSha384() -> EvpMd => EvpMd { raw: unsafe { EVP_sha384() } };
+/// Safety: `EVP_sha512` only returns a pointer to a static.
+public fn evpSha512() -> EvpMd => EvpMd { raw: unsafe { EVP_sha512() } };
+/// Safety: `EVP_sha512_224` only returns a pointer to a static.
+public fn evpSha512_224() -> EvpMd => EvpMd { raw: unsafe { EVP_sha512_224() } };
+/// Safety: `EVP_sha512_256` only returns a pointer to a static.
+public fn evpSha512_256() -> EvpMd => EvpMd { raw: unsafe { EVP_sha512_256() } };
+/// Safety: `EVP_sha3_224` only returns a pointer to a static.
+public fn evpSha3_224() -> EvpMd => EvpMd { raw: unsafe { EVP_sha3_224() } };
+/// Safety: `EVP_sha3_256` only returns a pointer to a static.
+public fn evpSha3_256() -> EvpMd => EvpMd { raw: unsafe { EVP_sha3_256() } };
+/// Safety: `EVP_sha3_384` only returns a pointer to a static.
+public fn evpSha3_384() -> EvpMd => EvpMd { raw: unsafe { EVP_sha3_384() } };
+/// Safety: `EVP_sha3_512` only returns a pointer to a static.
+public fn evpSha3_512() -> EvpMd => EvpMd { raw: unsafe { EVP_sha3_512() } };
+/// Safety: `EVP_blake2b256` only returns a pointer to a static.
+public fn evpBlake2b256() -> EvpMd => EvpMd { raw: unsafe { EVP_blake2b256() } };
+/// Safety: `EVP_blake2b512` only returns a pointer to a static.
+public fn evpBlake2b512() -> EvpMd => EvpMd { raw: unsafe { EVP_blake2b512() } };

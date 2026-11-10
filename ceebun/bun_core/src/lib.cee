@@ -1,0 +1,71 @@
+// The part of `bun_core` (src/bun_core/, with `bun_alloc::trim` and `bun_core::fmt::HEX_DECODE_TABLE`) that bun_csrf
+// uses: `strings::trim`, `strings::decode_hex_to_bytes_truncate` and `time::milli_timestamp`.
+
+/// `fmt::HEX_INVALID`: what `HEX_DECODE_TABLE` gives a byte that is not a hex digit.
+public const HEX_INVALID: u8 = 0xFF;
+
+/// `fmt::HEX_DECODE_TABLE`: an ASCII hex digit's value (0 to 15), else `HEX_INVALID`. Rust builds it with a `const`
+/// block; CeeSafe has no compile-time function evaluation (gap G5), so it is written out.
+static HEX_DECODE_TABLE: [u8; 256] = [
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 255, 255, 255, 255, 255, 255,
+    255, 10, 11, 12, 13, 14, 15, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 10, 11, 12, 13, 14, 15, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+];
+
+/// Whether `c` is one of `chars`.
+fn contains(chars: Slice<u8>, c: u8) -> bool {
+    for (x in chars) {
+        if (x == c) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// `strings::trim` (`bun_alloc::trim`): `s` without the bytes of `chars` at either end.
+public fn trim<region r>(s: Slice<r, u8>, chars: Slice<u8>) -> Slice<r, u8> {
+    var begin: usize = 0;
+    while (begin < s.length && contains(chars, s[begin])) {
+        begin += 1;
+    }
+    var end = s.length;
+    while (end > begin && contains(chars, s[end - 1])) {
+        end -= 1;
+    }
+    return s[begin..end];
+}
+
+/// `strings::decode_hex_to_bytes_truncate` for bytes: decodes pairs of hex digits from `source` into `destination`
+/// until either runs out or a pair is not hex; the number of bytes written. Rust hands runs of 16 pairs or more to a
+/// Highway kernel with the same result; this is its scalar loop.
+public fn decodeHexToBytesTruncate(destination: SliceMut<u8>, source: Slice<u8>) -> usize {
+    var written: usize = 0;
+    var at: usize = 0;
+    while (written < destination.length && source.length - at > 1) {
+        let a = HEX_DECODE_TABLE[source[at] as usize];
+        let b = HEX_DECODE_TABLE[source[at + 1] as usize];
+        if (a == HEX_INVALID || b == HEX_INVALID) {
+            break;
+        }
+        destination[written] = (a << 4) | b;
+        written += 1;
+        at += 2;
+    }
+    return written;
+}
+
+/// `time::milli_timestamp`: wall-clock milliseconds since the Unix epoch (`CLOCK_REALTIME`).
+public fn milliTimestamp() -> i64 => Clock.unixMillis();

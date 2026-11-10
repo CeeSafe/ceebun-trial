@@ -1,0 +1,180 @@
+// The part of `bun_base64` (src/base64/lib.rs) that bun_csrf uses, as a file of bun_csrf rather than a package of its
+// own: a `@repr(C)` type in a dependency package makes invalid C (gap G1), and `SIMDUTFResult` must be one. Its names
+// carry a `base64` prefix where they would clash, a package being one namespace.
+// `decode`, `decode_len`, and the zig_base64
+// decoders behind them. The fast path is simdutf, already linked into Bun, through its C wrapper
+// (src/simdutf_sys/bun-simdutf.cpp).
+
+/// `simdutf::SIMDUTFResult`: simdutf's `result`, a status (`error_code`) and a count.
+@repr(C)
+public struct SIMDUTFResult {
+    public status: i32;
+    public count: usize;
+}
+
+/// `simdutf::Status::SUCCESS`.
+public const STATUS_SUCCESS: i32 = 0;
+/// `simdutf::Status::INVALID_BASE64_CHARACTER`.
+public const STATUS_INVALID_BASE64_CHARACTER: i32 = 7;
+
+extern "C" {
+    fn simdutf__base64_decode_from_binary(
+        input: *u8,
+        length: usize,
+        output: *mut u8,
+        outlen: usize,
+        is_urlsafe: i32,
+    ) -> SIMDUTFResult;
+}
+
+/// `simdutf::base64::decode`: strict base64 of one alphabet, whitespace allowed.
+/// Safety: `input` and `output` are live slices of their lengths; simdutf reads `input.length` bytes and writes at
+/// most `output.length`.
+fn simdutfDecode(input: Slice<u8>, output: SliceMut<u8>, isUrlsafe: bool) -> SIMDUTFResult {
+    let urlsafe: i32 = if (isUrlsafe) 1 else 0;
+    return unsafe { simdutf__base64_decode_from_binary(input.ptr, input.length, output.ptr, output.length, urlsafe) };
+}
+
+/// `zig_base64::Error`.
+public enum Base64Error {
+    InvalidCharacter,
+    InvalidPadding,
+    NoSpaceLeft,
+}
+
+/// `Base64Decoder::INVALID_CHAR`.
+const BASE64_INVALID_CHAR: u8 = 0xFF;
+
+/// `zig_base64::STANDARD.decoder.calc_size_for_slice`: the exact decoded size of padded standard base64.
+fn standardCalcSizeForSlice(source: Slice<u8>) -> Result<usize, Base64Error> {
+    let sourceLen = source.length;
+    if (sourceLen % 4 != 0) {
+        return Err(Base64Error.InvalidPadding);
+    }
+    var result = sourceLen / 4 * 3;
+    if (sourceLen >= 1 && source[sourceLen - 1] == '=') {
+        result -= 1;
+    }
+    if (sourceLen >= 2 && source[sourceLen - 2] == '=') {
+        result -= 1;
+    }
+    return Ok(result);
+}
+
+/// `MIXED_DECODER.decoder.char_to_index`: the standard alphabet, with the URL-safe `-` and `_` also mapped to 62 and 63.
+/// Rust computes it in a `const` block; CeeSafe has no compile-time function evaluation (gap G5), so it is written out.
+static MIXED_CHAR_TO_INDEX: [u8; 256] = [
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 62, 255, 62, 255, 63,
+    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 255, 255, 255, 255, 255, 255,
+    255, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+    15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 255, 255, 255, 255, 63,
+    255, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+    41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+];
+
+/// `MIXED_DECODER.char_is_ignored`: 0xFF, space, `\t`, `\r`, `\n`, VT and FF. Ignoring 0xFF, which is also
+/// `INVALID_CHAR`, makes the decoder skip every byte outside the alphabet.
+fn mixedCharIsIgnored(c: u8) -> bool =>
+    c == 0xFF || c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == 0x0B || c == 0x0C;
+
+/// `MIXED_DECODER.decode` (`Base64DecoderWithIgnore::decode` with pad `=`): `wrote` counts the bytes written, and is
+/// current on every return.
+fn mixedDecode(dest: SliceMut<u8>, source: Slice<u8>, wrote: borrow mut usize) -> Result<void, Base64Error> {
+    var acc: u16 = 0;
+    var accLen: u8 = 0;
+    wrote = 0;
+    var leftoverIdx: usize? = null;
+
+    for (srcIdx in 0..source.length) {
+        let c = source[srcIdx];
+        if (mixedCharIsIgnored(c)) {
+            continue;
+        }
+        let d = MIXED_CHAR_TO_INDEX[c as usize];
+        if (d == BASE64_INVALID_CHAR) {
+            if (c == '=') {
+                leftoverIdx = srcIdx;
+                break;
+            }
+            if (mixedCharIsIgnored(BASE64_INVALID_CHAR)) {
+                continue;
+            }
+            return Err(Base64Error.InvalidCharacter);
+        }
+        acc = (acc << 6) + d as u16;
+        accLen += 6;
+        if (accLen >= 8) {
+            if (wrote == dest.length) {
+                return Err(Base64Error.NoSpaceLeft);
+            }
+            accLen -= 8;
+            dest[wrote] = truncate<u8>(acc >> accLen);
+            wrote += 1;
+        }
+    }
+    if (accLen > 4 || (acc & ((1u16 << accLen) - 1)) != 0) {
+        return Err(Base64Error.InvalidPadding);
+    }
+
+    let paddingLen = accLen / 2;
+    match (leftoverIdx) {
+        Some(idx) => {
+            var paddingChars: usize = 0;
+            for (c in source[idx..]) {
+                if (mixedCharIsIgnored(c)) {
+                    continue;
+                }
+                if (c != '=') {
+                    if (c == BASE64_INVALID_CHAR) {
+                        return Err(Base64Error.InvalidCharacter);
+                    }
+                    return Err(Base64Error.InvalidPadding);
+                }
+                paddingChars += 1;
+            }
+            if (paddingChars != paddingLen as usize) {
+                return Err(Base64Error.InvalidPadding);
+            }
+        }
+        null => {
+            if (paddingLen > 0) {
+                return Err(Base64Error.InvalidPadding);
+            }
+        }
+    }
+    return Ok();
+}
+
+/// `bun_base64::decode`: simdutf's strict standard decoder first; when the input does not follow it, the mixed
+/// decoder, which accepts both alphabets and skips whitespace and other bytes (WHATWG forgiving-base64, as Node does).
+public fn base64Decode(destination: SliceMut<u8>, source: Slice<u8>) -> SIMDUTFResult {
+    let result = simdutfDecode(source, destination, false);
+    if (result.status != STATUS_SUCCESS) {
+        var wrote: usize = 0;
+        match (mixedDecode(destination, source, mut wrote)) {
+            Ok() => {}
+            Err(_) => {
+                return SIMDUTFResult { status: STATUS_INVALID_BASE64_CHARACTER, count: wrote };
+            }
+        }
+        return SIMDUTFResult { status: STATUS_SUCCESS, count: wrote };
+    }
+    return result;
+}
+
+/// `bun_base64::decode_len`: the decoded size of padded standard base64, or, when the length is not a multiple of
+/// four, a bound with room for missing padding.
+public fn base64DecodeLen(source: Slice<u8>) -> usize => match (standardCalcSizeForSlice(source)) {
+    Ok(v) => v,
+    Err(_) => source.length / 4 * 3 + 2,
+};

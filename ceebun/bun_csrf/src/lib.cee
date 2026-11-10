@@ -1,0 +1,237 @@
+// CSRF Token implementation for Bun: a port of src/csrf/lib.rs.
+// It provides protection against Cross-Site Request Forgery attacks by generating and validating tokens using HMAC
+// signatures.
+
+/// Default HMAC algorithm used for token signing (a function: a constant cannot be an enum, gap G7).
+public fn defaultAlgorithm() -> bun_sha_hmac.Algorithm => bun_sha_hmac.Algorithm.Sha256;
+
+/// The digest buffer's size, `boring::EVP_MAX_MD_SIZE` (gap G4: an array length cannot name another package's
+/// constant).
+const EVP_MAX_MD_SIZE: usize = 64;
+
+/// The decode buffer's size, `EVP_MAX_MD_SIZE + 32` (an array length is a literal or a constant's name).
+const DECODE_BUFFER_SIZE: usize = EVP_MAX_MD_SIZE + 32;
+
+/// The size of the caller's token buffer.
+public const TOKEN_BUFFER_SIZE: usize = 512;
+
+/// Error types for CSRF operations.
+public enum Error {
+    TokenCreationFailed,
+}
+
+/// Options for generating CSRF tokens.
+public struct GenerateOptions<region a> {
+    /// Secret key to use for signing.
+    public secret: Slice<a, u8>;
+    /// Per-principal associated data mixed into the HMAC; an empty slice means the token is not bound to any
+    /// principal.
+    public sessionId: Slice<a, u8>;
+    /// How long the token should be valid (in milliseconds).
+    public expiresInMs: u64;
+    /// Algorithm to use for signing.
+    public algorithm: bun_sha_hmac.Algorithm;
+}
+
+/// Options for validating CSRF tokens.
+public struct VerifyOptions<region a> {
+    /// The token to verify.
+    public token: Slice<a, u8>;
+    /// Secret key used to sign the token.
+    public secret: Slice<a, u8>;
+    /// Per-principal associated data mixed into the HMAC; an empty slice means the token is not bound to any
+    /// principal.
+    public sessionId: Slice<a, u8>;
+    /// Maximum age of the token in milliseconds.
+    public maxAgeMs: u64;
+    /// Encoding to use for the token.
+    public encoding: TokenFormat;
+    /// Algorithm to use for signing.
+    public algorithm: bun_sha_hmac.Algorithm;
+}
+
+/// Token encoding format.
+@repr(u8)
+public enum TokenFormat {
+    Base64,
+    Base64Url,
+    Hex,
+}
+
+/// `hmac::generate` over `payload`, or over `payload || sessionId` when a session id is given: the digest's length in
+/// `digestBuf`, or null when BoringSSL fails or the concatenation cannot be allocated.
+fn sign(
+    secret: Slice<u8>,
+    payload: Slice<u8>,
+    sessionId: Slice<u8>,
+    algorithm: bun_sha_hmac.Algorithm,
+    digestBuf: borrow mut [u8; EVP_MAX_MD_SIZE],
+) -> usize? {
+    if (sessionId.length == 0) {
+        return bun_sha_hmac.generate(secret, payload, algorithm, mut digestBuf);
+    }
+    var msg = match (Vector<u8>.withCapacity(payload.length + sessionId.length)) {
+        Ok(v) => v,
+        Err(_) => {
+            return null;
+        }
+    };
+    if (msg.extend(payload).isErr() || msg.extend(sessionId).isErr()) {
+        return null;
+    }
+    return bun_sha_hmac.generate(secret, msg.view(), algorithm, mut digestBuf);
+}
+
+/// Generate a new CSRF token.
+///
+/// Parameters:
+/// - options: Configuration for token generation
+/// - outBuffer: caller-provided buffer for the raw token bytes
+///
+/// Returns: the length of the raw token at the start of `outBuffer`.
+public fn generate(
+    options: borrow GenerateOptions,
+    outBuffer: borrow mut [u8; TOKEN_BUFFER_SIZE],
+) -> Result<usize, Error> {
+    // Generate nonce from entropy
+    var nonce = [0u8; 16];
+    bun_boringssl_sys.randBytes(mut nonce[..]);
+
+    // Current timestamp in milliseconds
+    let timestamp: i64 = bun_core.milliTimestamp();
+    let timestampU64: u64 = truncate<u64>(timestamp); // @bitCast i64 -> u64
+
+    // Prepare payload for signing: timestamp|nonce|expires_in
+    var payloadBuf = [0u8; 32];
+    payloadBuf[..].writeBE(0, timestampU64);
+    payloadBuf[8..24].copyFrom(nonce[..]);
+    payloadBuf[..].writeBE(24, options.expiresInMs);
+
+    // Sign the payload. A session id is mixed into the HMAC input as `payload || session_id` but never written to the
+    // token; the fixed 32-byte payload prefix keeps the concatenation unambiguous.
+    var digestBuf = [0u8; EVP_MAX_MD_SIZE];
+    let digestLen = match (sign(options.secret, payloadBuf[..], options.sessionId, options.algorithm, mut digestBuf)) {
+        Some(n) => n,
+        null => {
+            return Err(Error.TokenCreationFailed);
+        }
+    };
+
+    // Create the final token: timestamp|nonce|expires_in|signature in outBuffer
+    outBuffer[0..32].copyFrom(payloadBuf[..]);
+    outBuffer[32..32 + digestLen].copyFrom(digestBuf[0..digestLen]);
+
+    return Ok(32 + digestLen);
+}
+
+/// Validate a CSRF token.
+///
+/// Parameters:
+/// - options: Configuration for token validation
+///
+/// Returns: true if valid, false if invalid
+public fn verify(options: borrow VerifyOptions) -> bool {
+    // Detect the encoding format
+    let encoding = options.encoding;
+
+    // Allocate output buffer for decoded data
+    var buf = [0u8; DECODE_BUFFER_SIZE];
+    // check if ends with \0 (a slice local cannot be re-pointed, gap G3, so the end is computed first)
+    var tokenEnd = options.token.length;
+    if (tokenEnd != 0 && options.token[tokenEnd - 1] == 0) {
+        tokenEnd -= 1;
+    }
+    let token = options.token[0..tokenEnd];
+
+    let decodedLen: usize = match (encoding) {
+        // base64 and base64url share the same decoder, but the encoders differ
+        TokenFormat.Base64Url | TokenFormat.Base64 => {
+            // do the same as Buffer.from(token, "base64url" | "base64")
+            // "\r\n\t " ++ VT (0x0b)
+            let slice = bun_core.trim(token, "\r\n\t \u{0b}".bytes());
+            if (slice.length == 0) {
+                return false;
+            }
+
+            let outlen = base64DecodeLen(slice);
+            if (outlen > buf.length) {
+                return false;
+            }
+
+            base64Decode(mut buf[0..outlen], slice).count
+        }
+        TokenFormat.Hex => {
+            if (token.length % 2 != 0) {
+                return false;
+            }
+            // decoded len
+            let hexLen = token.length / 2;
+            if (hexLen > buf.length) {
+                return false;
+            }
+            let result = bun_core.decodeHexToBytesTruncate(mut buf[0..hexLen], token);
+            if (result != hexLen) {
+                return false;
+            }
+            hexLen
+        }
+    };
+    let decoded = buf[0..decodedLen];
+
+    // Minimum token length: 8 (timestamp) + 16 (nonce) + 8 (expires_in) + 32 (minimum HMAC-SHA256 size)
+    if (decoded.length < 64) {
+        return false;
+    }
+    // We successfully decoded the token but it could be a bad token. base64 and hex can have ambiguity so we need to
+    // check for weird cases and reject them; it could also be a handcrafted token that is invalid.
+
+    // Extract timestamp (first 8 bytes)
+    let timestamp = decoded.readBE<u64>(0);
+
+    // Check if token has expired
+    let currentTime: u64 = truncate<u64>(bun_core.milliTimestamp()); // @bitCast i64 -> u64
+    // Extract expires_in
+    let expiresIn = decoded.readBE<u64>(24);
+    // respect the token's expiration time
+    if (expiresIn > 0) {
+        // handle overflow for invalid expiry, which means bad token
+        if (0xFFFFFFFFFFFFFFFFu64 - timestamp < expiresIn) {
+            return false;
+        }
+        if (currentTime > timestamp + expiresIn) {
+            return false;
+        }
+    }
+    // respect options.maxAgeMs
+    let expiry = options.maxAgeMs;
+    if (expiry > 0) {
+        // handle overflow for invalid expiry, which means bad token
+        if (0xFFFFFFFFFFFFFFFFu64 - timestamp < expiry) {
+            return false;
+        }
+        if (currentTime > timestamp + expiry) {
+            return false;
+        }
+    }
+    // Extract the parts
+    let payload = decoded[0..32]; // timestamp + nonce + expires_in
+    let receivedSignature = decoded[32..];
+
+    // Verify the signature
+    var expectedSignature = [0u8; EVP_MAX_MD_SIZE];
+    let signatureLen = match (sign(
+        options.secret,
+        payload,
+        options.sessionId,
+        options.algorithm,
+        mut expectedSignature,
+    )) {
+        Some(n) => n,
+        null => {
+            return false;
+        }
+    };
+
+    // Compare signatures in constant time (BoringSSL CRYPTO_memcmp).
+    return bun_boringssl_sys.constantTimeEq(receivedSignature, expectedSignature[0..signatureLen]);
+}

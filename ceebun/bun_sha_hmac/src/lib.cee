@@ -1,0 +1,67 @@
+// The part of `bun_sha_hmac` (src/sha_hmac/) that bun_csrf uses: `evp::Algorithm` with `md()` (sha.rs), and
+// `hmac::generate` (hmac.rs).
+
+/// `evp::Algorithm`, in the Rust enum's order. Not `@repr(u8)`: a `@repr` type in a dependency package makes invalid C
+/// (gap G1), so bun_csrf's exports take the Rust discriminant as a `u8` and map it (`algorithmFromRust`).
+public enum Algorithm {
+    Blake2b256,
+    Blake2b512,
+    Blake2s256,
+    Md4,
+    Md5,
+    Ripemd160,
+    Sha1,
+    Sha224,
+    Sha256,
+    Sha384,
+    Sha512,
+    Sha512_224,
+    Sha512_256,
+    Sha3_224,
+    Sha3_256,
+    Sha3_384,
+    Sha3_512,
+    Shake128,
+    Shake256,
+}
+
+/// `bun_boringssl_sys.EVP_MAX_MD_SIZE` again: an array length cannot name another package's constant (gap G4).
+public const EVP_MAX_MD_SIZE: usize = 64;
+
+/// The BoringSSL digest of an algorithm; null for the ones BoringSSL has no `EVP_MD` for.
+public fn md(algorithm: Algorithm) -> bun_boringssl_sys.EvpMd? => match (algorithm) {
+    Algorithm.Blake2b256 => bun_boringssl_sys.evpBlake2b256(),
+    Algorithm.Blake2b512 => bun_boringssl_sys.evpBlake2b512(),
+    Algorithm.Md4 => bun_boringssl_sys.evpMd4(),
+    Algorithm.Md5 => bun_boringssl_sys.evpMd5(),
+    Algorithm.Ripemd160 => bun_boringssl_sys.evpRipemd160(),
+    Algorithm.Sha1 => bun_boringssl_sys.evpSha1(),
+    Algorithm.Sha224 => bun_boringssl_sys.evpSha224(),
+    Algorithm.Sha256 => bun_boringssl_sys.evpSha256(),
+    Algorithm.Sha384 => bun_boringssl_sys.evpSha384(),
+    Algorithm.Sha512 => bun_boringssl_sys.evpSha512(),
+    Algorithm.Sha512_224 => bun_boringssl_sys.evpSha512_224(),
+    Algorithm.Sha512_256 => bun_boringssl_sys.evpSha512_256(),
+    Algorithm.Sha3_224 => bun_boringssl_sys.evpSha3_224(),
+    Algorithm.Sha3_256 => bun_boringssl_sys.evpSha3_256(),
+    Algorithm.Sha3_384 => bun_boringssl_sys.evpSha3_384(),
+    Algorithm.Sha3_512 => bun_boringssl_sys.evpSha3_512(),
+    _ => null,
+};
+
+/// `hmac::generate`: the HMAC of `data` keyed by `key` written to `out`; the digest's length, or null when BoringSSL
+/// fails. An algorithm without an `EVP_MD` is a bug in the caller, as in Rust: it panics.
+public fn generate(
+    key: Slice<u8>,
+    data: Slice<u8>,
+    algorithm: Algorithm,
+    out: borrow mut [u8; EVP_MAX_MD_SIZE],
+) -> usize? {
+    let digest = match (md(algorithm)) {
+        Some(d) => d,
+        null => {
+            panic("Expected BoringSSL algorithm for HMAC");
+        }
+    };
+    return bun_boringssl_sys.hmac(digest, key, data, mut out);
+}
