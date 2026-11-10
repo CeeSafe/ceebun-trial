@@ -8,8 +8,9 @@
  * host's headers: `ceesafe_exports.h` (the exports) and `ceesafe/embed.h` (`ceesafe_init`, the panic hook).
  *
  * `ceebun/host/ceebun_host.c` is the C side of the embedding: `ceebun_init` (called by `bin_entry::main`) starts the
- * runtime with a panic hook that reports through Bun's crash handler, and the file re-declares each export as the
- * Rust shims declare it, so a shim that drifts from the CeeSafe signature is a compile error.
+ * runtime with a panic hook that reports through Bun's crash handler and Rust's allocator (mimalloc, or the C
+ * library's under ASAN; ADR 0088 stage B), and the file re-declares each export as the Rust shims declare it, so a
+ * shim that drifts from the CeeSafe signature is a compile error.
  *
  * The compiler is `$CEESAFEC`, or `ceesafec` on the PATH.
  */
@@ -22,6 +23,7 @@ import { assert } from "./error.ts";
 import { computeDepFlags } from "./flags.ts";
 import type { Ninja } from "./ninja.ts";
 import { quote } from "./shell.ts";
+import type { ResolvedDep } from "./source.ts";
 import { toolIdentityFile } from "./tools.ts";
 
 /** The umbrella root package: one archive per binary (ADR 0088 §2.1). */
@@ -30,7 +32,7 @@ const root = "bun_csrf";
 function ceesafec(): string {
   const found = process.env.CEESAFEC ?? Bun.which("ceesafec");
   assert(found !== null && found !== undefined, "ceesafec not found", {
-    hint: "Set CEESAFEC to the CeeSafe compiler (ceesafec 0.28.0 or later), or put it on the PATH.",
+    hint: "Set CEESAFEC to the CeeSafe compiler (ceesafec 0.29.0 or later), or put it on the PATH.",
   });
   return found;
 }
@@ -60,8 +62,11 @@ export function registerCeesafeRules(n: Ninja, cfg: Config): void {
   });
 }
 
-/** The archive's edge and the host file's; returns what the link takes. */
-export function emitCeesafe(n: Ninja, cfg: Config): string[] {
+/**
+ * The archive's edge and the host file's; returns what the link takes. `mimalloc` is the resolved dependency: the host
+ * file includes its header to give CeeSafe the allocator Rust's `#[global_allocator]` is.
+ */
+export function emitCeesafe(n: Ninja, cfg: Config, mimalloc: ResolvedDep): string[] {
   const ceebun = resolve(cfg.cwd, "ceebun");
   const outDir = resolve(cfg.buildDir, "ceebun");
   const archive = join(outDir, `lib${root}.a`);
@@ -96,10 +101,19 @@ export function emitCeesafe(n: Ninja, cfg: Config): string[] {
   });
 
   // The host side, with the same flags, against the headers written beside the archive. Debug builds read
-  // CEESAFE_ALLOC_REPORT and CEESAFE_FAIL_ALLOC_AT; a release `bun` reads no variable outside BUN_*.
+  // CEESAFE_ALLOC_REPORT and CEESAFE_FAIL_ALLOC_AT; a release `bun` reads no variable outside BUN_*. CEEBUN_MIMALLOC
+  // follows `bin_entry`'s `#[global_allocator]`: mimalloc unless `bun_asan`, which is set exactly when cfg.asan
+  // (rust.ts). mimalloc's outputs signal that its headers are ready, as for Bun's own C (bun.ts).
   const host = cc(n, cfg, join(ceebun, "host", "ceebun_host.c"), {
-    flags: [...cflags, "-I", outDir, ...(cfg.debug ? ["-DCEEBUN_READ_ENVIRONMENT=1"] : [])],
-    implicitInputs: [exportsHeader, embedHeader],
+    flags: [
+      ...cflags,
+      "-I",
+      outDir,
+      ...mimalloc.includes.flatMap(dir => ["-I", dir]),
+      ...(cfg.debug ? ["-DCEEBUN_READ_ENVIRONMENT=1"] : []),
+      ...(cfg.asan ? [] : ["-DCEEBUN_MIMALLOC=1"]),
+    ],
+    implicitInputs: [exportsHeader, embedHeader, ...mimalloc.outputs],
   });
   return [host, archive];
 }

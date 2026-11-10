@@ -447,7 +447,11 @@ export function emitBun(n: Ninja, cfg: Config, sources: Sources): BunOutput {
   const shimInputs = emitShims(n, cfg);
   const depLink = lazyDepObjects(cfg, depObjects);
   // CeeBun: one archive of the CeeSafe packages that replace Rust crates, and the C host file (ceesafe.ts).
-  const ceesafeObjects = emitCeesafe(n, cfg);
+  const mimalloc = deps.find(d => d.name === "mimalloc");
+  assert(mimalloc !== undefined, "CeeBun needs the mimalloc dependency", {
+    hint: "ceebun_host.c gives CeeSafe the allocator Rust's #[global_allocator] is (ceesafe.ts).",
+  });
+  const ceesafeObjects = emitCeesafe(n, cfg, mimalloc);
   const linkObjects = [...cxxObjects, ...cObjects, ...depLink.eager, ...rustObjects, ...ceesafeObjects, ...windowsRes];
   const ldflags = [...flags.ldflags, ...systemLibs(cfg)];
   const exe = link(n, cfg, exeName, linkObjects, {

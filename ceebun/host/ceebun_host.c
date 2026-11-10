@@ -1,8 +1,11 @@
-// CeeBun: the C side of embedding CeeSafe in Bun (ADR 0088, stage A).
+// CeeBun: the C side of embedding CeeSafe in Bun (ADR 0088, stages A and B).
 //
 // - `ceebun_init` starts the CeeSafe runtime once, from `bin_entry::main` before any thread can call CeeSafe, with
 //   Bun's arguments (the runtime copies them) and a panic hook that reports through Bun's crash handler, with
 //   CeeSafe's reason, message, file, line and column.
+// - The allocator CeeSafe uses is the one Rust's `#[global_allocator]` is (`src/runtime/bin_entry/mod.rs`): mimalloc,
+//   or the C library's under ASAN (CEEBUN_MIMALLOC, from scripts/build/ceesafe.ts, is set exactly when `bun_asan` is
+//   not). Either side can then free a block the other allocated, so ownership can cross the boundary.
 // - Debug builds (CEEBUN_READ_ENVIRONMENT, from scripts/build/ceesafe.ts) also read CEESAFE_ALLOC_REPORT and
 //   CEESAFE_FAIL_ALLOC_AT, for allocation reports and failure sweeps inside Bun. A release `bun` does not: every
 //   child process inherits the environment, and a stray CEESAFE_FAIL_ALLOC_AT would fail allocations in every `bun`
@@ -16,9 +19,14 @@
 #include "ceesafe/embed.h"
 #include "ceesafe_exports.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(CEEBUN_MIMALLOC)
+#include <mimalloc.h>
+#endif
 
 // ─── The exports as the Rust shims declare them ───
 
@@ -85,6 +93,41 @@ static void ceebun_panic_hook(void *context, const ceesafe_panic_info *info) {
     Bun__crashHandler((const uint8_t *)r.text, r.length);
 }
 
+// ─── The allocator ───
+
+#if defined(CEEBUN_MIMALLOC)
+// CeeSafe asks for blocks aligned to max(16, alignof(max_align_t)) (embed.h); mimalloc's plain `mi_malloc` gives a
+// small block only its size's alignment (8 for an 8-byte block), so the aligned forms, as `mi_malloc_auto_align`
+// uses for Rust above 16. `mi_free` frees both kinds, so a block from either side can be freed by the other.
+#define CEEBUN_HEAP_ALIGN 16u
+_Static_assert(_Alignof(max_align_t) <= CEEBUN_HEAP_ALIGN, "CeeSafe's heap alignment is max_align_t's");
+
+// mimalloc's functions are thread-safe and keep a heap per thread: the context is unused.
+static void *ceebun_alloc(void *context, size_t size) {
+    (void)context;
+    return mi_malloc_aligned(size, CEEBUN_HEAP_ALIGN);
+}
+
+static void *ceebun_alloc_zeroed(void *context, size_t size) {
+    (void)context;
+    return mi_zalloc_aligned(size, CEEBUN_HEAP_ALIGN);
+}
+
+// On failure the block is kept, as realloc's contract asks.
+static void *ceebun_realloc(void *context, void *block, size_t size) {
+    (void)context;
+    return mi_realloc_aligned(block, size, CEEBUN_HEAP_ALIGN);
+}
+
+static void ceebun_free(void *context, void *block) {
+    (void)context;
+    mi_free(block);
+}
+
+static const ceesafe_allocator ceebun_allocator = {ceebun_alloc, ceebun_alloc_zeroed, ceebun_realloc, ceebun_free,
+                                                   NULL};
+#endif
+
 // ─── Start and shutdown ───
 
 #if defined(CEEBUN_READ_ENVIRONMENT)
@@ -103,6 +146,11 @@ int32_t ceebun_init(int argc, const char *const *argv) {
     config.argc = argc;
     config.argv = argv;
     config.panic_hook = ceebun_panic_hook;
+#if defined(CEEBUN_MIMALLOC)
+    // Installed before CeeSafe allocates anything: argv's copy is the first block. Under ASAN no allocator is given,
+    // so CeeSafe uses malloc and ASAN sees every block, as it sees Rust's.
+    config.allocator = &ceebun_allocator;
+#endif
     int32_t status = ceesafe_init(&config);
 #if defined(CEEBUN_READ_ENVIRONMENT)
     if (status == 0) {
