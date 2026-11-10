@@ -1,12 +1,12 @@
 //! CSRF Token implementation for Bun
 //! It provides protection against Cross-Site Request Forgery attacks
 //! by generating and validating tokens using HMAC signatures
+//!
+//! The implementation is CeeSafe (`ceebun/bun_csrf`), linked into Bun as one object; this crate keeps the public API
+//! and calls its two C exports. Every buffer is the caller's: the slices are lent for the call, nothing is allocated
+//! on one side and freed on the other.
 
 #![warn(unused_must_use)]
-use bun_boringssl_sys as boring;
-use bun_core::strings;
-use bun_sha_hmac::hmac;
-
 use bun_sha_hmac::evp::Algorithm;
 
 /// Default HMAC algorithm used for token signing
@@ -50,11 +50,42 @@ pub struct VerifyOptions<'a> {
 }
 
 /// Token encoding format
+#[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TokenFormat {
     Base64,
     Base64Url,
     Hex,
+}
+
+// The CeeSafe side maps `Algorithm` from its declaration-order discriminant.
+const _: () = assert!(
+    Algorithm::Blake2b256 as u8 == 0
+        && Algorithm::Sha256 as u8 == 8
+        && Algorithm::Shake256 as u8 == 18
+);
+
+unsafe extern "C" {
+    fn bun_csrf__generate(
+        secret: *const u8,
+        secret_len: usize,
+        session_id: *const u8,
+        session_id_len: usize,
+        expires_in_ms: u64,
+        algorithm: u8,
+        out_buffer: *mut u8,
+    ) -> usize;
+    fn bun_csrf__verify(
+        token: *const u8,
+        token_len: usize,
+        secret: *const u8,
+        secret_len: usize,
+        session_id: *const u8,
+        session_id_len: usize,
+        max_age_ms: u64,
+        encoding: TokenFormat,
+        algorithm: u8,
+    ) -> bool;
 }
 
 /// Generate a new CSRF token
@@ -68,55 +99,21 @@ pub fn generate<'a>(
     options: &GenerateOptions<'_>,
     out_buffer: &'a mut [u8; 512],
 ) -> Result<&'a mut [u8], Error> {
-    // Generate nonce from entropy
-    let mut nonce = [0u8; 16];
-    boring::rand_bytes(&mut nonce);
-
-    // Current timestamp in milliseconds
-    let timestamp: i64 = bun_core::time::milli_timestamp();
-    let timestamp_u64: u64 = timestamp as u64; // @bitCast i64 -> u64
-
-    // Write timestamp to out_buffer
-    let mut timestamp_bytes = [0u8; 8];
-    timestamp_bytes.copy_from_slice(&timestamp_u64.to_be_bytes());
-    let mut expires_in_bytes = [0u8; 8];
-    expires_in_bytes.copy_from_slice(&options.expires_in_ms.to_be_bytes());
-    // Prepare payload for signing: timestamp|nonce
-    let mut payload_buf = [0u8; 32]; // 8 (timestamp) + 16 (nonce)
-    payload_buf[0..8].copy_from_slice(&timestamp_bytes);
-    payload_buf[8..24].copy_from_slice(&nonce);
-    payload_buf[24..32].copy_from_slice(&expires_in_bytes);
-
-    // Sign the payload. A session id is mixed into the HMAC input as
-    // `payload || session_id` but never written to the token; the fixed
-    // 32-byte payload prefix keeps the concatenation unambiguous.
-    let mut digest_buf = [0u8; boring::EVP_MAX_MD_SIZE as usize];
-    let digest = if options.session_id.is_empty() {
-        hmac::generate(
-            options.secret,
-            &payload_buf,
-            options.algorithm,
-            &mut digest_buf,
+    // SAFETY: the slices are live for the call and the export keeps none of them; `out_buffer` is 512 writable bytes.
+    let len = unsafe {
+        bun_csrf__generate(
+            options.secret.as_ptr(),
+            options.secret.len(),
+            options.session_id.as_ptr(),
+            options.session_id.len(),
+            options.expires_in_ms,
+            options.algorithm as u8,
+            out_buffer.as_mut_ptr(),
         )
-    } else {
-        let mut msg = Vec::with_capacity(payload_buf.len() + options.session_id.len());
-        msg.extend_from_slice(&payload_buf);
-        msg.extend_from_slice(options.session_id);
-        hmac::generate(options.secret, &msg, options.algorithm, &mut digest_buf)
     };
-    let digest = match digest {
-        Some(d) => d,
-        None => return Err(Error::TokenCreationFailed),
-    };
-
-    // Create the final token: timestamp|nonce|expires_in|signature in out_buffer
-    out_buffer[0..8].copy_from_slice(&timestamp_bytes);
-    out_buffer[8..24].copy_from_slice(&nonce);
-    out_buffer[24..32].copy_from_slice(&expires_in_bytes);
-    out_buffer[32..32 + digest.len()].copy_from_slice(digest);
-
-    // Return slice of the output buffer with the final token
-    let len = 32 + digest.len();
+    if len == 0 {
+        return Err(Error::TokenCreationFailed);
+    }
     Ok(&mut out_buffer[0..len])
 }
 
@@ -127,129 +124,20 @@ pub fn generate<'a>(
 ///
 /// Returns: true if valid, false if invalid
 pub fn verify(options: &VerifyOptions<'_>) -> bool {
-    // Detect the encoding format
-    let encoding: TokenFormat = options.encoding;
-
-    // Allocate output buffer for decoded data
-    let mut buf = [0u8; boring::EVP_MAX_MD_SIZE as usize + 32];
-    let mut token = options.token;
-    // check if ends with \0
-    if !token.is_empty() && token[token.len() - 1] == 0 {
-        token = &token[0..token.len() - 1];
-    }
-
-    // Reshaped for borrowck — compute decoded_len, then borrow buf immutably afterward
-    let decoded_len: usize = match encoding {
-        // base64 and base64url share the same decoder, but the encoders differ
-        TokenFormat::Base64Url | TokenFormat::Base64 => {
-            // do the same as Buffer.from(token, "base64url" | "base64")
-            // "\r\n\t " ++ VT (0x0b)
-            let slice = strings::trim(token, b"\r\n\t \x0b");
-            if slice.is_empty() {
-                return false;
-            }
-
-            let outlen = bun_base64::decode_len(slice);
-            if outlen > buf.len() {
-                return false;
-            }
-
-            bun_base64::decode(&mut buf[0..outlen], slice).count
-        }
-        TokenFormat::Hex => {
-            if !token.len().is_multiple_of(2) {
-                return false;
-            }
-            // decoded len
-            let decoded_len = token.len() / 2;
-            if decoded_len > buf.len() {
-                return false;
-            }
-            let result = strings::decode_hex_to_bytes_truncate(&mut buf[0..decoded_len], token);
-            if result == decoded_len {
-                decoded_len
-            } else {
-                return false;
-            }
-        }
-    };
-    let decoded: &[u8] = &buf[0..decoded_len];
-
-    // Minimum token length: 8 (timestamp) + 16 (nonce) + 8 (expires_in) + 32 (minimum HMAC-SHA256 size)
-    if decoded.len() < 64 {
-        return false;
-    }
-    // We successfully decoded the token but it could be a bad token
-    // base64 and hex can have ambiguity so we need to check for weird cases and reject them
-    // it could also be a handcrafted token that is invalid
-
-    // Extract timestamp (first 8 bytes)
-    let timestamp = u64::from_be_bytes(decoded[0..8].try_into().expect("infallible: size matches"));
-
-    // Check if token has expired
-    let current_time: u64 = bun_core::time::milli_timestamp() as u64; // @bitCast i64 -> u64
-    // Extract expires_in (last 8 bytes)
-    let expires_in = u64::from_be_bytes(
-        decoded[24..32]
-            .try_into()
-            .expect("infallible: size matches"),
-    );
-    {
-        // respect the token's expiration time
-        if expires_in > 0 {
-            // handle overflow for invalid expiry, which means bad token
-            if u64::MAX - timestamp < expires_in {
-                return false;
-            }
-            if current_time > timestamp + expires_in {
-                return false;
-            }
-        }
-    }
-    {
-        // repect options.max_age_ms
-        let expiry = options.max_age_ms;
-        if expiry > 0 {
-            // handle overflow for invalid expiry, which means bad token
-            if u64::MAX - timestamp < expiry {
-                return false;
-            }
-            if current_time > timestamp + expiry {
-                return false;
-            }
-        }
-    }
-    // Extract the parts
-    let payload = &decoded[0..32]; // timestamp + nonce + expires_in
-    let received_signature = &decoded[32..];
-
-    // Verify the signature
-    let mut expected_signature = [0u8; boring::EVP_MAX_MD_SIZE as usize];
-    let signature = if options.session_id.is_empty() {
-        hmac::generate(
-            options.secret,
-            payload,
-            options.algorithm,
-            &mut expected_signature,
+    // SAFETY: the slices are live for the call, nothing writes them meanwhile, and the export keeps none of them.
+    unsafe {
+        bun_csrf__verify(
+            options.token.as_ptr(),
+            options.token.len(),
+            options.secret.as_ptr(),
+            options.secret.len(),
+            options.session_id.as_ptr(),
+            options.session_id.len(),
+            options.max_age_ms,
+            options.encoding,
+            options.algorithm as u8,
         )
-    } else {
-        let mut msg = Vec::with_capacity(payload.len() + options.session_id.len());
-        msg.extend_from_slice(payload);
-        msg.extend_from_slice(options.session_id);
-        hmac::generate(
-            options.secret,
-            &msg,
-            options.algorithm,
-            &mut expected_signature,
-        )
-    };
-    let signature = match signature {
-        Some(s) => s,
-        None => return false,
-    };
-
-    // Compare signatures in constant time (BoringSSL CRYPTO_memcmp).
-    boring::constant_time_eq(received_signature, signature)
+    }
 }
 
 // NOTE: JS bindings live in the *_jsc crate as extension methods.

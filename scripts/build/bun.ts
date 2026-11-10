@@ -35,6 +35,7 @@ import {
   versionScriptPaths,
 } from "./flags.ts";
 import { writeIfChanged } from "./fs.ts";
+import { emitCeesafe } from "./ceesafe.ts";
 import type { Ninja } from "./ninja.ts";
 import { emitRust, windowsShimPath } from "./rust.ts";
 import { quote, slash } from "./shell.ts";
@@ -445,7 +446,9 @@ export function emitBun(n: Ninja, cfg: Config, sources: Sources): BunOutput {
   // export the C++ side touches is reached from those roots.
   const shimInputs = emitShims(n, cfg);
   const depLink = lazyDepObjects(cfg, depObjects);
-  const linkObjects = [...cxxObjects, ...cObjects, ...depLink.eager, ...rustObjects, ...windowsRes];
+  // CeeBun: one object per CeeSafe package that replaces a Rust crate; its crate's shim calls its exports.
+  const ceesafeObjects = emitCeesafe(n, cfg);
+  const linkObjects = [...cxxObjects, ...cObjects, ...depLink.eager, ...rustObjects, ...ceesafeObjects, ...windowsRes];
   const ldflags = [...flags.ldflags, ...systemLibs(cfg)];
   const exe = link(n, cfg, exeName, linkObjects, {
     libs: depLibs,

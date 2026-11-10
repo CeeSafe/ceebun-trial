@@ -36,6 +36,8 @@ const ruleVars = {
   smoke_test: [],
   strip: ["stripflags"],
   stripped_verify: ["spec"],
+  // ceesafe.ts
+  ceesafe_obj: ["pkgdir", "cflags", "objpath"],
   // codegen.ts
   bun_install: ["dir", "stamp"],
   codegen: ["cwd", "args", "desc"],

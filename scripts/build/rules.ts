@@ -19,6 +19,7 @@
  * lives where" question fuzzy. Explicit registration is clearer.
  */
 
+import { registerCeesafeRules } from "./ceesafe.ts";
 import { registerCodegenRules } from "./codegen.ts";
 import { registerCompileRules, registerDirStamps } from "./compile.ts";
 import type { Config } from "./config.ts";
@@ -53,4 +54,7 @@ export function registerAllRules(n: Ninja, cfg: Config): void {
 
   // host_tool_cc (darwin cross)
   registerShimRules(n, cfg);
+
+  // ceesafe_obj (CeeBun: CeeSafe packages that replace Rust crates)
+  registerCeesafeRules(n, cfg);
 }
