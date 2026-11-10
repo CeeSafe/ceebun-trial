@@ -5,7 +5,9 @@
 //   CeeSafe's reason, message, file, line and column.
 // - The allocator CeeSafe uses is the one Rust's `#[global_allocator]` is (`src/runtime/bin_entry/mod.rs`): mimalloc,
 //   or the C library's under ASAN (CEEBUN_MIMALLOC, from scripts/build/ceesafe.ts, is set exactly when `bun_asan` is
-//   not). Either side can then free a block the other allocated, so ownership can cross the boundary.
+//   not). The two sides then share one heap, but their blocks are not interchangeable (ADR 0088 §2.5): each side
+//   frees what it allocated through its own code, so a block CeeSafe hands out comes back through an export, and
+//   Rust never calls `mi_free` on it. A CeeSafe buffer adopted as a Rust `Vec` is left to a later CeeSafe ADR.
 // - Debug builds (CEEBUN_READ_ENVIRONMENT, from scripts/build/ceesafe.ts) also read CEESAFE_ALLOC_REPORT and
 //   CEESAFE_FAIL_ALLOC_AT, for allocation reports and failure sweeps inside Bun. A release `bun` does not: every
 //   child process inherits the environment, and a stray CEESAFE_FAIL_ALLOC_AT would fail allocations in every `bun`
@@ -98,7 +100,7 @@ static void ceebun_panic_hook(void *context, const ceesafe_panic_info *info) {
 #if defined(CEEBUN_MIMALLOC)
 // CeeSafe asks for blocks aligned to max(16, alignof(max_align_t)) (embed.h); mimalloc's plain `mi_malloc` gives a
 // small block only its size's alignment (8 for an 8-byte block), so the aligned forms, as `mi_malloc_auto_align`
-// uses for Rust above 16. `mi_free` frees both kinds, so a block from either side can be freed by the other.
+// uses for Rust above 16. `mi_free` frees an aligned block as it frees any other.
 #define CEEBUN_HEAP_ALIGN 16u
 _Static_assert(_Alignof(max_align_t) <= CEEBUN_HEAP_ALIGN, "CeeSafe's heap alignment is max_align_t's");
 
