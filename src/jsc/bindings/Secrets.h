@@ -1,0 +1,56 @@
+#pragma once
+
+#include <JavaScriptCore/JSGlobalObject.h>
+#include <JavaScriptCore/JSObject.h>
+#include <JavaScriptCore/JSPromise.h>
+#include <wtf/text/WTFString.h>
+#include <wtf/Vector.h>
+#include <span>
+#include <optional>
+
+namespace JSC {
+class JSValue;
+}
+
+namespace Bun {
+
+// Platform-agnostic secrets interface
+namespace Secrets {
+
+enum class ErrorType {
+    None,
+    NotFound,
+    AccessDenied,
+    PlatformError
+};
+
+struct Error {
+    ErrorType type = ErrorType::None;
+    WTF::String message;
+    int code = 0;
+
+    bool isError() const { return type != ErrorType::None; }
+
+    JSC::JSValue toJS(JSC::VM& vm, JSC::JSGlobalObject* globalObject) const;
+};
+
+// CREDENTIALW::Persist for a Windows Credential Manager entry. The macOS and Linux backends ignore it.
+enum class Persist : uint8_t {
+    Local, // CRED_PERSIST_LOCAL_MACHINE: this user on this computer
+    Enterprise, // CRED_PERSIST_ENTERPRISE: this user, also on other computers when the account roams
+};
+
+// Sync platform-specific implementations (used by threadpool)
+// These use CString for thread safety - only called from threadpool
+Error setPassword(const WTF::UTF8CString& service, const WTF::UTF8CString& name, WTF::UTF8CString&& password, bool allowUnrestrictedAccess, Persist persist);
+
+// Use a WTF::Vector here so we can zero out the memory.
+std::optional<WTF::Vector<uint8_t>> getPassword(const WTF::UTF8CString& service, const WTF::UTF8CString& name, Error& error);
+bool deletePassword(const WTF::UTF8CString& service, const WTF::UTF8CString& name, Error& error);
+
+} // namespace Secrets
+
+// JS binding function
+JSC::JSObject* createSecretsObject(JSC::VM& vm, JSC::JSGlobalObject* globalObject);
+
+} // namespace Bun

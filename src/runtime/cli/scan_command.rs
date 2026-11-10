@@ -1,0 +1,65 @@
+use crate::Command;
+use crate::cli::package_manager_command::PackageManagerCommand;
+use bun_core::{Global, Output};
+use bun_install::PackageManager;
+use bun_install::package_manager::security_scanner;
+
+pub(crate) struct ScanCommand;
+
+impl ScanCommand {
+    pub(crate) fn exec_with_manager(
+        ctx: Command::Context,
+        manager: &mut PackageManager,
+        original_cwd: &[u8],
+    ) -> crate::Result<()> {
+        if manager.options.security_scanner.is_none() {
+            bun_core::pretty_errorln!("<r><red>error<r>: no security scanner configured");
+            bun_core::pretty!(
+                "\n\
+                 To use 'bun pm scan', configure a security scanner in bunfig.toml:\n  \
+                 [install.security]\n  \
+                 scanner = \"<cyan>package_name<r>\"\n\
+                 \n\
+                 Security scanners can be npm packages that export a scanner object.\n"
+            );
+            Global::exit(1);
+        }
+
+        bun_core::pretty_error!(
+            "<r><b>bun pm scan <r><d>v{}<r>\n",
+            Global::package_json_version_with_sha,
+        );
+        Output::flush();
+
+        let load_result = manager.load_lockfile_from_cwd::<true>();
+        PackageManagerCommand::handle_load_lockfile_errors_for(
+            &load_result,
+            manager.options.log_level,
+            "scan",
+        );
+
+        let security_scan_results =
+            match security_scanner::perform_security_scan_for_all(manager, &mut *ctx, original_cwd)
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    Output::err_generic("Could not perform security scan (<d>{s}<r>)", (e.name(),));
+                    Global::exit(1);
+                }
+            };
+
+        if let Some(results) = security_scan_results {
+            // `defer { var results_mut = results; results_mut.deinit(); }` — Drop handles it.
+
+            security_scanner::print_security_advisories(manager, &results);
+
+            if results.has_advisories() {
+                Global::exit(1);
+            } else {
+                bun_core::pretty!("<green>No advisories found<r>\n");
+            }
+        }
+
+        Global::exit(0);
+    }
+}

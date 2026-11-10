@@ -1,0 +1,577 @@
+import { describe, expect, it } from "bun:test";
+import { bunEnv, bunExe, isASAN, isDebug, withoutAggressiveGC } from "harness";
+import vm from "node:vm";
+
+const RealStringDecoder = require("string_decoder").StringDecoder;
+
+it("require('string_decoder')", async () => {
+  expect((await import("string_decoder")).StringDecoder).toBe(RealStringDecoder);
+});
+
+it("Bun.inspect(StringDecoder)", async () => {
+  expect((await Bun.inspect(RealStringDecoder).length) > 0).toBe(true);
+});
+
+function FakeStringDecoderCall() {
+  RealStringDecoder.apply(this, arguments);
+}
+require("util").inherits(FakeStringDecoderCall, RealStringDecoder);
+
+class SubStringDecoder extends RealStringDecoder {}
+
+for (const StringDecoder of [FakeStringDecoderCall, RealStringDecoder, SubStringDecoder]) {
+  describe(StringDecoder.name, () => {
+    it("StringDecoder-utf8", () => {
+      test("utf-8", Buffer.from("$", "utf-8"), "$");
+      test("utf-8", Buffer.from("¢", "utf-8"), "¢");
+      test("utf-8", Buffer.from("€", "utf-8"), "€");
+      test("utf-8", Buffer.from("𤭢", "utf-8"), "𤭢");
+      // A mixed ascii and non-ascii string
+      // Test stolen from deps/v8/test/cctest/test-strings.cc
+      // U+02E4 -> CB A4
+      // U+0064 -> 64
+      // U+12E4 -> E1 8B A4
+      // U+0030 -> 30
+      // U+3045 -> E3 81 85
+      test(
+        "utf-8",
+        Buffer.from([0xcb, 0xa4, 0x64, 0xe1, 0x8b, 0xa4, 0x30, 0xe3, 0x81, 0x85]),
+        "\u02e4\u0064\u12e4\u0030\u3045",
+      );
+    });
+
+    it("StringDecoder-ucs-2", () => {
+      test("ucs2", Buffer.from("ababc", "ucs2"), "ababc");
+    });
+
+    it("StringDecoder-utf16le", () => {
+      test("utf16le", Buffer.from("3DD84DDC", "hex"), "\ud83d\udc4d");
+    });
+
+    it("StringDecoder-utf8-additional", () => {
+      let decoder = new StringDecoder("utf8");
+      expect(decoder.write(Buffer.from("E18B", "hex"))).toBe("");
+      expect(decoder.end()).toBe("\ufffd");
+
+      decoder = new StringDecoder("utf8");
+      expect(decoder.write(Buffer.from("\ufffd"))).toBe("\ufffd");
+      expect(decoder.end()).toBe("");
+
+      decoder = new StringDecoder("utf8");
+      expect(decoder.write(Buffer.from("\ufffd\ufffd\ufffd"))).toBe("\ufffd\ufffd\ufffd");
+      expect(decoder.end()).toBe("");
+
+      decoder = new StringDecoder("utf8");
+      expect(decoder.write(Buffer.from("EFBFBDE2", "hex"))).toBe("\ufffd");
+      expect(decoder.end()).toBe("\ufffd");
+
+      decoder = new StringDecoder("utf8");
+      expect(decoder.write(Buffer.from("F1", "hex"))).toBe("");
+      expect(decoder.write(Buffer.from("41F2", "hex"))).toBe("\ufffdA");
+      expect(decoder.end()).toBe("\ufffd");
+
+      // Additional utf8Text test
+      decoder = new StringDecoder("utf8");
+      expect(decoder.text(Buffer.from([0x41]), 2)).toBe("");
+    });
+
+    it("StringDecoder-utf16le-additional", () => {
+      // Additional UTF-16LE surrogate pair tests
+      let decoder = new StringDecoder("utf16le");
+      expect(decoder.write(Buffer.from("3DD8", "hex"))).toBe("");
+      expect(decoder.write(Buffer.from("4D", "hex"))).toBe("");
+      expect(decoder.write(Buffer.from("DC", "hex"))).toBe("\ud83d\udc4d");
+      expect(decoder.end()).toBe("");
+
+      decoder = new StringDecoder("utf16le");
+      expect(decoder.write(Buffer.from("3DD8", "hex"))).toBe("");
+      expect(decoder.end()).toBe("\ud83d");
+
+      decoder = new StringDecoder("utf16le");
+      expect(decoder.write(Buffer.from("3DD8", "hex"))).toBe("");
+      expect(decoder.write(Buffer.from("4D", "hex"))).toBe("");
+      expect(decoder.end()).toBe("\ud83d");
+
+      decoder = new StringDecoder("utf16le");
+      expect(decoder.write(Buffer.from("3DD84D", "hex"))).toBe("\ud83d");
+      expect(decoder.end()).toBe("");
+    });
+
+    // Test verifies that StringDecoder will correctly decode the given input
+    // buffer with the given encoding to the expected output. It will attempt all
+    // possible ways to write() the input buffer, see writeSequences(). The
+    // singleSequence allows for easy debugging of a specific sequence which is
+    // useful in case of test failures.
+    function test(encoding, input, expected, singleSequence) {
+      withoutAggressiveGC(() => {
+        let sequences;
+        if (!singleSequence) {
+          sequences = writeSequences(input.length);
+        } else {
+          sequences = [singleSequence];
+        }
+        sequences.forEach(sequence => {
+          const decoder = new StringDecoder(encoding);
+          let output = "";
+          sequence.forEach(write => {
+            output += decoder.write(input.slice(write[0], write[1]));
+          });
+          output += decoder.end();
+          expect(output).toBe(expected);
+        });
+      });
+    }
+
+    // writeSequences returns an array of arrays that describes all possible ways a
+    // buffer of the given length could be split up and passed to sequential write
+    // calls.
+    //
+    // e.G. writeSequences(3) will return: [
+    //   [ [ 0, 3 ] ],
+    //   [ [ 0, 2 ], [ 2, 3 ] ],
+    //   [ [ 0, 1 ], [ 1, 3 ] ],
+    //   [ [ 0, 1 ], [ 1, 2 ], [ 2, 3 ] ]
+    // ]
+    function writeSequences(length, start, sequence) {
+      if (start === undefined) {
+        start = 0;
+        sequence = [];
+      } else if (start === length) {
+        return [sequence];
+      }
+      let sequences = [];
+      for (let end = length; end > start; end--) {
+        const subSequence = sequence.concat([[start, end]]);
+        const subSequences = writeSequences(length, end, subSequence, sequences);
+        sequences = sequences.concat(subSequences);
+      }
+      return sequences;
+    }
+
+    describe("StringDecoder.end", () => {
+      const encodings = ["base64", "base64url", "hex", "utf8", "utf16le", "ucs2"];
+
+      const bufs = ["☃💩", "asdf"].map(b => Buffer.from(b));
+
+      // Also test just arbitrary bytes from 0-15.
+      for (let i = 1; i <= 16; i++) {
+        const bytes = "."
+          .repeat(i - 1)
+          .split(".")
+          .map((_, j) => j + 0x78);
+        bufs.push(Buffer.from(bytes));
+      }
+
+      encodings.forEach(testEncoding);
+
+      testEnd("utf8", Buffer.of(0xe2), Buffer.of(0x61), "\uFFFDa");
+      testEnd("utf8", Buffer.of(0xe2), Buffer.of(0x82), "\uFFFD\uFFFD");
+      testEnd("utf8", Buffer.of(0xe2), Buffer.of(0xe2), "\uFFFD\uFFFD");
+      testEnd("utf8", Buffer.of(0xe2, 0x82), Buffer.of(0x61), "\uFFFDa");
+      testEnd("utf8", Buffer.of(0xe2, 0x82), Buffer.of(0xac), "\uFFFD\uFFFD");
+      testEnd("utf8", Buffer.of(0xe2, 0x82), Buffer.of(0xe2), "\uFFFD\uFFFD");
+      testEnd("utf8", Buffer.of(0xe2, 0x82, 0xac), Buffer.of(0x61), "€a");
+
+      testEnd("utf16le", Buffer.of(0x3d), Buffer.of(0x61, 0x00), "a");
+      testEnd("utf16le", Buffer.of(0x3d), Buffer.of(0xd8, 0x4d, 0xdc), "\u4DD8");
+      testEnd("utf16le", Buffer.of(0x3d, 0xd8), Buffer.of(), "\uD83D");
+      testEnd("utf16le", Buffer.of(0x3d, 0xd8), Buffer.of(0x61, 0x00), "\uD83Da");
+      testEnd("utf16le", Buffer.of(0x3d, 0xd8), Buffer.of(0x4d, 0xdc), "\uD83D\uDC4D");
+      testEnd("utf16le", Buffer.of(0x3d, 0xd8, 0x4d), Buffer.of(), "\uD83D");
+      testEnd("utf16le", Buffer.of(0x3d, 0xd8, 0x4d), Buffer.of(0x61, 0x00), "\uD83Da");
+      testEnd("utf16le", Buffer.of(0x3d, 0xd8, 0x4d), Buffer.of(0xdc), "\uD83D");
+      testEnd("utf16le", Buffer.of(0x3d, 0xd8, 0x4d, 0xdc), Buffer.of(0x61, 0x00), "👍a");
+
+      testEnd("base64", Buffer.of(0x61), Buffer.of(), "YQ==");
+      testEnd("base64", Buffer.of(0x61), Buffer.of(0x61), "YQ==YQ==");
+      testEnd("base64", Buffer.of(0x61, 0x61), Buffer.of(), "YWE=");
+      testEnd("base64", Buffer.of(0x61, 0x61), Buffer.of(0x61), "YWE=YQ==");
+      testEnd("base64", Buffer.of(0x61, 0x61, 0x61), Buffer.of(), "YWFh");
+      testEnd("base64", Buffer.of(0x61, 0x61, 0x61), Buffer.of(0x61), "YWFhYQ==");
+
+      testEnd("base64url", Buffer.of(0x61), Buffer.of(), "YQ");
+      testEnd("base64url", Buffer.of(0x61), Buffer.of(0x61), "YQYQ");
+      testEnd("base64url", Buffer.of(0x61, 0x61), Buffer.of(), "YWE");
+      testEnd("base64url", Buffer.of(0x61, 0x61), Buffer.of(0x61), "YWEYQ");
+      testEnd("base64url", Buffer.of(0x61, 0x61, 0x61), Buffer.of(), "YWFh");
+      testEnd("base64url", Buffer.of(0x61, 0x61, 0x61), Buffer.of(0x61), "YWFhYQ");
+
+      function testEncoding(encoding) {
+        it(encoding + " testbuf", () => {
+          bufs.forEach(buf => {
+            testBuf(encoding, buf);
+          });
+        });
+      }
+
+      function testBuf(encoding, buf) {
+        // Write one byte at a time.
+        let s = new StringDecoder(encoding);
+        let res1 = "";
+        for (let i = 0; i < buf.length; i++) {
+          res1 += s.write(buf.slice(i, i + 1));
+        }
+        res1 += s.end();
+
+        // Write the whole buffer at once.
+        let res2 = "";
+        s = new StringDecoder(encoding);
+        res2 += s.write(buf);
+        res2 += s.end();
+
+        // .toString() on the buffer
+        const res3 = buf.toString(encoding);
+
+        // One byte at a time should match toString
+        expect(res1).toEqual(res3);
+        // All bytes at once should match toString
+        expect(res2).toEqual(res3);
+      }
+
+      function testEnd(encoding, incomplete, next, expected) {
+        it(`${encoding} partial ${JSON.stringify(expected)}`, () => {
+          let res = "";
+          const s = new StringDecoder(encoding);
+          res += s.write(incomplete);
+          res += s.end();
+          res += s.write(next);
+          res += s.end();
+
+          expect(res).toEqual(expected);
+        });
+      }
+    });
+  });
+}
+
+// Node's normalizeEncoding() maps every UTF-16LE alias (including the legacy
+// ucs2/ucs-2 spellings) to the canonical name "utf16le", and
+// StringDecoder#encoding exposes the normalized name.
+it("normalizes the encoding name like Node", () => {
+  const inputs = ["utf16le", "utf-16le", "ucs2", "ucs-2", "UTF-16LE", "UCS-2", "utf8", "utf-8", "latin1", "binary"];
+  const normalized = Object.fromEntries(inputs.map(name => [name, new RealStringDecoder(name).encoding]));
+  normalized.default = new RealStringDecoder().encoding;
+  expect(normalized).toEqual({
+    "utf16le": "utf16le",
+    "utf-16le": "utf16le",
+    "ucs2": "utf16le",
+    "ucs-2": "utf16le",
+    "UTF-16LE": "utf16le",
+    "UCS-2": "utf16le",
+    "utf8": "utf8",
+    "utf-8": "utf8",
+    "latin1": "latin1",
+    "binary": "latin1",
+    "default": "utf8",
+  });
+});
+
+// A call resolved through a binding that a closure captures (or through a module binding) is
+// compiled with the scope object itself in the this slot, and native callees see it raw.
+// StringDecoder called without new used to mistake that scope object for a body-parser style
+// receiver: it wrote the decoder state onto it and returned it instead of a decoder.
+describe("StringDecoder called without new", () => {
+  it("returns a decoder when the callee is resolved through a captured binding", () => {
+    const StringDecoder = RealStringDecoder;
+    function keep() {
+      return StringDecoder;
+    }
+    const decoder = StringDecoder("latin1");
+    expect(decoder).toBeInstanceOf(RealStringDecoder);
+    expect(decoder.encoding).toBe("latin1");
+    expect(decoder.write(Buffer.from([0xe9]))).toBe("é");
+    expect(keep()).toBe(RealStringDecoder);
+  });
+
+  it("still initializes an explicit object receiver (body-parser style)", () => {
+    const receiver = {};
+    expect(RealStringDecoder.call(receiver, "latin1")).toBe(receiver);
+    expect(receiver.encoding).toBe("latin1");
+  });
+
+  // The constructor used to call asObject() on the receiver before checking that it is one, which
+  // aborts a debug build for any non-object receiver. Run it in a child so the abort shows up as a
+  // failed assertion instead of taking the test runner down.
+  it("returns a decoder for an undefined or primitive receiver", async () => {
+    const src = `
+      const { StringDecoder } = require("node:string_decoder");
+      const local = StringDecoder;
+      const results = [local("utf8"), StringDecoder.call(undefined, "utf8"), StringDecoder.call("x", "utf8")];
+      console.log(results.every(d => d instanceof StringDecoder && d.encoding === "utf8"));
+    `;
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "-e", src],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout, stderr, exitCode }).toEqual({ stdout: "true\n", stderr: "", exitCode: 0 });
+  });
+});
+
+// A native constructor receives new.target in the this slot. One function served both [[Call]] and
+// [[Construct]], so `new Sub()` looked like `StringDecoder.call(Sub)`: it wrote the decoder state
+// onto the class and returned the class.
+describe("StringDecoder constructed with another new.target", () => {
+  it("new Sub() returns an instance of Sub", () => {
+    class Sub extends RealStringDecoder {}
+    const decoder = new Sub("utf16le");
+    expect({
+      isTheClass: decoder === Sub,
+      type: typeof decoder,
+      hasSubPrototype: Object.getPrototypeOf(decoder) === Sub.prototype,
+      instanceOfBase: decoder instanceof RealStringDecoder,
+      classKeys: Reflect.ownKeys(Sub),
+      encoding: decoder.encoding,
+      decoded: decoder.write(Buffer.from("hi", "utf16le")),
+    }).toEqual({
+      isTheClass: false,
+      type: "object",
+      hasSubPrototype: true,
+      instanceOfBase: true,
+      classKeys: ["length", "name", "prototype"],
+      encoding: "utf16le",
+      decoded: "hi",
+    });
+  });
+
+  it("a subclass can add a constructor, fields and methods", () => {
+    class Sub extends RealStringDecoder {
+      chunks = 0;
+      constructor(encoding, label) {
+        super(encoding);
+        this.label = label;
+      }
+      write(buf) {
+        this.chunks++;
+        return super.write(buf);
+      }
+    }
+    const decoder = new Sub("utf8", "euro");
+    expect(decoder.write(Buffer.from([0xe2, 0x82]))).toBe("");
+    expect({ lastNeed: decoder.lastNeed, lastTotal: decoder.lastTotal, lastChar: [...decoder.lastChar] }).toEqual({
+      lastNeed: 1,
+      lastTotal: 3,
+      lastChar: [0xe2, 0x82, 0, 0],
+    });
+    expect(decoder.write(Buffer.from([0xac]))).toBe("€");
+    expect(decoder.end()).toBe("");
+    expect({ label: decoder.label, chunks: decoder.chunks }).toEqual({ label: "euro", chunks: 2 });
+    expect(() => new Sub("bogus")).toThrow(expect.objectContaining({ code: "ERR_UNKNOWN_ENCODING" }));
+  });
+
+  // The shape of Babel's _callSuper helper: an ES5 constructor that forwards its own new.target.
+  it("Reflect.construct takes the prototype from new.target", () => {
+    function Legacy(encoding) {
+      return Reflect.construct(RealStringDecoder, [encoding], new.target);
+    }
+    Object.setPrototypeOf(Legacy.prototype, RealStringDecoder.prototype);
+    Object.setPrototypeOf(Legacy, RealStringDecoder);
+    const decoder = new Legacy("hex");
+    expect(decoder).toBeInstanceOf(Legacy);
+    expect(decoder.write(Buffer.from([0xab]))).toBe("ab");
+    expect(Object.hasOwn(Legacy, "encoding")).toBe(false);
+
+    function Unrelated() {}
+    const other = Reflect.construct(RealStringDecoder, ["latin1"], Unrelated);
+    expect(other).not.toBe(Unrelated);
+    expect(Object.getPrototypeOf(other)).toBe(Unrelated.prototype);
+    expect(Object.hasOwn(Unrelated, "encoding")).toBe(false);
+    expect(RealStringDecoder.prototype.write.call(other, Buffer.from([0xe9]))).toBe("é");
+  });
+
+  // An unfixed build writes `encoding` onto the global Object here. The delete keeps that out of other tests.
+  it("Reflect.construct with Object as new.target does not return or change Object", () => {
+    try {
+      const decoder = Reflect.construct(RealStringDecoder, ["utf8"], Object);
+      expect({
+        isObject: decoder === Object,
+        hasObjectPrototype: Object.getPrototypeOf(decoder) === Object.prototype,
+        objectHasEncoding: Object.hasOwn(Object, "encoding"),
+        decoded: RealStringDecoder.prototype.write.call(decoder, Buffer.from("hi")),
+      }).toEqual({ isObject: false, hasObjectPrototype: true, objectHasEncoding: false, decoded: "hi" });
+    } finally {
+      delete Object.encoding;
+    }
+  });
+
+  it("reads the prototype through a Proxy new.target", () => {
+    class Sub extends RealStringDecoder {}
+    const decoder = Reflect.construct(RealStringDecoder, ["utf8"], new Proxy(Sub, {}));
+    expect(decoder).toBeInstanceOf(Sub);
+    expect(decoder.write(Buffer.from("hi"))).toBe("hi");
+
+    const { proxy, revoke } = Proxy.revocable(Sub, {});
+    revoke();
+    expect(() => Reflect.construct(RealStringDecoder, ["utf8"], proxy)).toThrow(TypeError);
+  });
+
+  it("a class from a node:vm context can extend StringDecoder", () => {
+    const result = vm.runInNewContext(
+      `class Sub extends StringDecoder {}
+       const decoder = new Sub("utf8");
+       [decoder instanceof Sub, decoder instanceof StringDecoder, decoder.write(bytes)];`,
+      { StringDecoder: RealStringDecoder, bytes: Buffer.from("hi") },
+    );
+    expect([...result]).toEqual([true, true, "hi"]);
+  });
+});
+
+// Node's lastTotal getter is MissingBytes + BufferedBytes; Node clears BufferedBytes when a buffered
+// partial is emitted so lastTotal returns to 0. end() resets lastNeed/lastTotal but leaves lastChar.
+// Decoded output was always correct; this is purely about the observable legacy state triple.
+describe("lastNeed/lastTotal/lastChar state matches Node after completing a split character", () => {
+  const state = d => ({ lastNeed: d.lastNeed, lastTotal: d.lastTotal, lastChar: Array.from(d.lastChar) });
+
+  it.each([
+    ["utf8", [[0xf0], [0x9f, 0x98, 0x80]], "😀", [240, 159, 152, 128]],
+    ["utf8", [[0xe2, 0x82], [0xac]], "€", [226, 130, 172, 0]],
+    ["utf8", [[0xcc], [0xcc, 0x8c]], "\ufffd\u030c", [204, 0, 0, 0]],
+    ["utf16le", [[0x41], [0x00, 0x42, 0x00]], "AB", [65, 0, 0, 0]],
+    [
+      "utf16le",
+      [
+        [0x3d, 0xd8],
+        [0x00, 0xde],
+      ],
+      "😀",
+      [61, 216, 0, 222],
+    ],
+    ["base64", [[0x41], [0x42, 0x43]], "QUJD", [65, 66, 67, 0]],
+    ["base64url", [[0x41], [0x42, 0x43]], "QUJD", [65, 66, 67, 0]],
+  ])("%s %j", (encoding, chunks, expected, lastChar) => {
+    const d = new RealStringDecoder(encoding);
+    let out = "";
+    for (const c of chunks) out += d.write(Buffer.from(c));
+    expect(out).toBe(expected);
+    expect(state(d)).toEqual({ lastNeed: 0, lastTotal: 0, lastChar });
+  });
+
+  it("utf8: completing a partial then starting a new one sets fresh state", () => {
+    const d = new RealStringDecoder("utf8");
+    d.write(Buffer.from([0xf0]));
+    expect(d.write(Buffer.from([0x9f, 0x98, 0x80, 0xe2]))).toBe("😀");
+    expect(state(d)).toEqual({ lastNeed: 2, lastTotal: 3, lastChar: [226, 159, 152, 128] });
+  });
+
+  it("end() resets lastNeed/lastTotal but leaves lastChar bytes intact", () => {
+    const d = new RealStringDecoder("utf8");
+    d.write(Buffer.from([0xf0]));
+    expect(state(d)).toEqual({ lastNeed: 3, lastTotal: 4, lastChar: [240, 0, 0, 0] });
+    expect(d.end()).toBe("\ufffd");
+    expect(state(d)).toEqual({ lastNeed: 0, lastTotal: 0, lastChar: [240, 0, 0, 0] });
+  });
+});
+
+it("invalid utf-8 input, pr #3562", () => {
+  const decoder = new RealStringDecoder("utf-8");
+  let output = "";
+  output += decoder.write(Buffer.from("B9", "hex"));
+  output += decoder.write(Buffer.from("A9", "hex"));
+  output += decoder.end();
+  expect(output).toStrictEqual("\uFFFD\uFFFD");
+});
+
+it("decoding latin1, issue #3738", () => {
+  const decoder = new RealStringDecoder("latin1");
+  let output = "";
+  output += decoder.write(Buffer.from("DD", "hex"));
+  output += decoder.write(Buffer.from("59", "hex"));
+  output += decoder.write(Buffer.from("DE", "hex"));
+  output += decoder.end();
+  expect(output).toStrictEqual("ÝYÞ");
+});
+
+it("invalid utf-8 at end of stream can sometimes produce more than one replacement character", () => {
+  let decoder = new RealStringDecoder("utf-8");
+  expect(decoder.write(Buffer.from("36f59c", "hex"))).toEqual("6");
+  expect(decoder.end()).toEqual("\uFFFD\uFFFD");
+  decoder = new RealStringDecoder("utf-8");
+  expect(decoder.write(Buffer.from("36f5", "hex"))).toEqual("6");
+  expect(decoder.end(Buffer.from("9c", "hex"))).toEqual("\uFFFD\uFFFD");
+});
+
+// When the input buffer is too large to be represented as a JS string,
+// write()/end() should throw ERR_STRING_TOO_LONG instead of segfaulting.
+// Previously, Bun__encoding__toString would throw and return an empty JSValue,
+// and JSStringDecoder::write would call .toString() on it before checking for
+// an exception, dereferencing nullptr->m_type (segfault at address 0x5).
+it(
+  "write() with a buffer larger than String::MaxLength throws instead of crashing",
+  async () => {
+    const src = `
+    const { StringDecoder } = require("string_decoder");
+    // Larger than JSC's String::MaxLength (2^31 - 1). allocUnsafe is lazily
+    // committed so this stays cheap until the ASCII scan touches pages.
+    const buf = Buffer.allocUnsafe(2 ** 31);
+    for (const method of ["write", "end"]) {
+      const decoder = new StringDecoder("utf8");
+      try {
+        decoder[method](buf);
+        console.log(method, "no throw");
+      } catch (e) {
+        console.log(method, e.code);
+      }
+    }
+  `;
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "-e", src],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    // ASAN builds unconditionally print "WARNING: ASAN interferes with JSC
+    // signal handlers..." to stderr from WebKit's Options.cpp; filter it out.
+    const stderrFiltered = stderr
+      .split(/\r?\n/)
+      .filter(s => !s.startsWith("WARNING: ASAN interferes"))
+      .join("\n");
+    expect(stderrFiltered).toBe("");
+    expect(stdout).toBe("write ERR_STRING_TOO_LONG\nend ERR_STRING_TOO_LONG\n");
+    expect(exitCode).toBe(0);
+    // The 2 GiB ASCII scan takes ~15s under debug/ASAN vs ~1s in release.
+  },
+  isDebug || isASAN ? 60_000 : undefined,
+);
+
+// StringDecoder.prototype.text(buf, offset) takes the offset as an int32 and
+// previously validated it with `offset > byteLength` where byteLength is
+// unsigned. The comparison promoted the signed offset to unsigned, so for
+// buffers of 2 GiB or more a negative offset slipped past the check and was
+// used directly in pointer arithmetic, decoding memory located before the
+// buffer. A negative offset must yield an empty string without touching the
+// buffer.
+it(
+  "text() with a negative offset on a 2 GiB buffer returns an empty string",
+  async () => {
+    const src = `
+      const { StringDecoder } = require("string_decoder");
+      // Legitimate case: an in-range positive offset still decodes the tail.
+      {
+        const decoder = new StringDecoder("utf8");
+        console.log(JSON.stringify(decoder.text(Buffer.from("hello world"), 6)));
+      }
+      // byteLength must be >= 2**31 for INT32_MIN to pass the old unsigned
+      // comparison (INT32_MIN reinterpreted as uint32 is 2**31). allocUnsafe
+      // is lazily committed, and a rejected offset never reads the buffer, so
+      // this stays cheap.
+      const buf = Buffer.allocUnsafe(2 ** 31 + 16);
+      const decoder = new StringDecoder("utf8");
+      const out = decoder.text(buf, -2147483648);
+      console.log("length:", out.length);
+    `;
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "-e", src],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+    expect(stdout).toBe('"world"\nlength: 0\n');
+    expect(exitCode).toBe(0);
+  },
+  // Allocating a 2 GiB buffer under debug/ASAN is slow even when lazily committed.
+  isDebug || isASAN ? 60_000 : undefined,
+);

@@ -1,0 +1,2479 @@
+//! CLI entry point + command dispatch.
+//!
+//! `Command::which()` + `HelpCommand` + `print_version_and_exit` compile
+//! against lower-tier crates. `Command::start()` (full dispatch) and
+//! per-command exec bodies live in the sibling `*_command.rs` modules.
+
+use bun_core::strings;
+use bun_core::{self as bun, Global, Output};
+use bun_core::{pretty, pretty_error, pretty_errorln};
+
+// ─── compiling submodules ────────────────────────────────────────────────────
+#[path = "add_completions.rs"]
+pub(crate) mod add_completions;
+#[path = "colon_list_type.rs"]
+pub(crate) mod colon_list_type;
+#[path = "discord_command.rs"]
+pub(crate) mod discord_command;
+#[path = "shell_completions.rs"]
+pub(crate) mod shell_completions;
+
+// ─── open (open_url wrapper; Editor/EditorContext live in open.rs) ───────────
+#[path = "open.rs"]
+mod open_full;
+pub(crate) mod open {
+    pub(crate) use super::open_full::{Editor, EditorContext};
+    use bun_core::Output;
+
+    #[cfg(target_os = "macos")]
+    pub(crate) const OPENER: &[u8] = b"/usr/bin/open";
+    #[cfg(windows)]
+    pub(crate) const OPENER: &[u8] = b"start";
+    #[cfg(not(any(target_os = "macos", windows)))]
+    pub(crate) const OPENER: &[u8] = b"xdg-open";
+
+    fn fallback(url: &[u8]) {
+        bun_core::prettyln!("-> {}", bstr::BStr::new(url));
+        Output::flush();
+    }
+
+    /// Spawn `OPENER url` with inherited stdio and fall back to printing the
+    /// URL when the spawn fails or the opener exits non-zero (e.g. headless/CI
+    /// environments).
+    pub(crate) fn open_url(url: &[u8]) {
+        match bun_core::spawn_sync_inherit(&[OPENER, url]) {
+            Ok(status) if status.is_ok() => {}
+            _ => fallback(url),
+        }
+    }
+}
+
+// ─── non-JSC subcommand bodies ───────────────────────────────────────────────
+// `init_command.rs` pulls bun_json/bun_js_parser/bun_js_printer/bun_bundler +
+// `bun_ast::initialize_store`; `package_manager_command.rs` needs
+// bun_install::PackageManager + a real `Command::Context` (blocked on
+// `create_context_data`), so its help/print-only paths are handled inline in
+// `Command::start()` below. `install_completions_command.rs` is fully wired
+// via `exec_install_completions` (its `exec()` takes no Context).
+#[path = "init_command.rs"]
+pub(crate) mod init_command;
+#[path = "install_completions_command.rs"]
+pub(crate) mod install_completions_command;
+#[path = "package_manager_command.rs"]
+pub(crate) mod package_manager_command;
+
+// Surfaced for `crate::test_runner::{bun_test,jest,Execution}` which
+// need `CommandLineReporter`. This is the sole live mount of the file.
+#[path = "test_command.rs"]
+pub(crate) mod test_command;
+/// `bun test` support modules (Scanner / ChangedFilesFilter / ParallelRunner).
+/// Mounted here so `test_command.rs` can `use crate::cli::test::scanner` etc.
+pub(crate) mod test {
+    #[path = "Scanner.rs"]
+    pub(crate) mod scanner;
+
+    /// `bun test --changed`: git-diff → bundler module graph → reverse-import
+    /// walk to filter test files.
+    #[path = "ChangedFilesFilter.rs"]
+    pub(crate) mod changed_files_filter;
+
+    /// `bun test --timings` / `--update-timings`: per-file duration table.
+    #[path = "Timings.rs"]
+    pub(crate) mod timings;
+
+    /// `bun test --aot --shard`: puts test files that import the same modules in the same shard.
+    #[path = "ShardsByReach.rs"]
+    pub(crate) mod shards_by_reach;
+
+    /// `bun test --parallel`: process-pool coordinator/worker entry points.
+    /// Thin façade re-exporting from `parallel::runner`.
+    #[path = "ParallelRunner.rs"]
+    pub(crate) mod parallel_runner;
+
+    /// `test/parallel/` submodule directory (no `mod.rs` on disk; declared
+    /// inline). `ParallelRunner.rs`
+    /// re-exports the public entry points from `runner`; the rest are
+    /// implementation detail of the coordinator/worker split.
+    pub(crate) mod parallel {
+        #[path = "aggregate.rs"]
+        pub(crate) mod aggregate;
+        #[path = "Channel.rs"]
+        pub(crate) mod channel;
+        #[path = "Coordinator.rs"]
+        pub(crate) mod coordinator;
+        #[path = "FileRange.rs"]
+        pub(crate) mod file_range;
+        #[path = "Frame.rs"]
+        pub(crate) mod frame;
+        #[path = "runner.rs"]
+        pub(crate) mod runner;
+        #[path = "Worker.rs"]
+        pub(crate) mod worker;
+    }
+}
+#[path = "Arguments.rs"]
+pub(crate) mod arguments;
+pub(crate) use arguments as Arguments;
+#[path = "run_command.rs"]
+pub(crate) mod run_command;
+
+// ─── per-subcommand bodies ───────────────────────────────────────────────────
+#[path = "build_command.rs"]
+pub(crate) mod build_command;
+#[path = "bunx_command.rs"]
+pub(crate) mod bunx_command;
+pub(crate) mod compile_command;
+#[path = "compile_options.rs"]
+pub(crate) mod compile_options;
+#[path = "create_command.rs"]
+pub(crate) mod create_command;
+#[path = "exec_command.rs"]
+pub(crate) mod exec_command;
+#[path = "fuzzilli_command.rs"]
+pub(crate) mod fuzzilli_command;
+#[cfg(all(bun_fuzzilli, unix))]
+#[path = "fuzzilli_compile_loop.rs"]
+pub(crate) mod fuzzilli_compile_loop;
+#[cfg(all(bun_fuzzilli, unix))]
+#[path = "fuzzilli_run_comparison.rs"]
+pub(crate) mod fuzzilli_run_comparison;
+#[path = "install_command.rs"]
+pub(crate) mod install_command;
+#[path = "repl_command.rs"]
+pub(crate) mod repl_command;
+#[path = "run_compiled.rs"]
+pub(crate) mod run_compiled;
+pub(crate) mod startup_options;
+#[path = "upgrade_command.rs"]
+pub(crate) mod upgrade_command;
+// MOVE_UP: `--analyze` branch + `Cli.log_` access of
+// `bun_install::update_package_json_and_install{,_catch_error}` — see file header.
+#[path = "add_command.rs"]
+pub(crate) mod add_command;
+#[path = "audit_command.rs"]
+pub(crate) mod audit_command;
+#[path = "check_command.rs"]
+pub(crate) mod check_command;
+#[path = "dedupe_command.rs"]
+pub(crate) mod dedupe_command;
+#[path = "filter_arg.rs"]
+pub(crate) mod filter_arg;
+#[path = "filter_run.rs"]
+pub(crate) mod filter_run;
+#[path = "format_command.rs"]
+pub(crate) mod format_command;
+#[path = "link_command.rs"]
+pub(crate) mod link_command;
+#[path = "lint_command.rs"]
+pub(crate) mod lint_command;
+#[path = "lint_js.rs"]
+pub(crate) mod lint_js;
+#[path = "multi_run.rs"]
+pub(crate) mod multi_run;
+#[path = "outdated_command.rs"]
+pub(crate) mod outdated_command;
+#[path = "pack_command.rs"]
+pub(crate) mod pack_command;
+#[path = "patch_command.rs"]
+pub(crate) mod patch_command;
+#[path = "patch_commit_command.rs"]
+pub(crate) mod patch_commit_command;
+pub(crate) mod pm_cache_prune_command;
+#[path = "pm_diff_command.rs"]
+pub(crate) mod pm_diff_command;
+pub(crate) mod pm_diff_normalize;
+pub(crate) mod pm_diff_profile;
+pub(crate) mod pm_diff_relayout;
+pub(crate) mod pm_diff_semantic;
+pub(crate) mod pm_fetch_command;
+#[path = "pm_licenses_command.rs"]
+pub(crate) mod pm_licenses_command;
+#[path = "pm_pkg_command.rs"]
+pub(crate) mod pm_pkg_command;
+#[path = "pm_trusted_command.rs"]
+pub(crate) mod pm_trusted_command;
+pub(crate) mod pm_update_package_json;
+#[path = "pm_version_command.rs"]
+pub(crate) mod pm_version_command;
+#[path = "pm_view_command.rs"]
+pub(crate) mod pm_view_command;
+#[path = "prune_command.rs"]
+pub(crate) mod prune_command;
+#[path = "publish_command.rs"]
+pub(crate) mod publish_command;
+#[path = "remove_command.rs"]
+pub(crate) mod remove_command;
+#[path = "scan_command.rs"]
+pub(crate) mod scan_command;
+#[path = "script_or_command.rs"]
+pub(crate) mod script_or_command;
+pub(crate) mod typescript_libs;
+#[path = "unlink_command.rs"]
+pub(crate) mod unlink_command;
+#[path = "update_command.rs"]
+pub(crate) mod update_command;
+#[path = "update_interactive_command.rs"]
+pub(crate) mod update_interactive_command;
+#[path = "why_command.rs"]
+pub(crate) mod why_command;
+
+// ─── crate-local helper for param-table concatenation ────────────────────────
+// `bun_clap::parse_param!` is a real proc-macro (const `Param<Help>` literal),
+// and `bun_clap::concat_params!` is a const-fn slice concat,
+// so combined tables (`AUTO_PARAMS`, `RUN_PARAMS`, …) are baked into rodata —
+// no `LazyLock`, no init closure in `.text`, no startup heap allocation.
+pub(crate) use ::bun_clap::concat_params;
+
+// ─── process-lifetime globals ────────────────────────────────────────────────
+/// Written once in `Cli::start`
+/// during single-threaded startup, read freely after init. The backing
+/// `OnceLock` lives in `bun_core` (single source of truth); this accessor
+/// remains so existing `crate::cli::start_time()` callers don't churn.
+#[inline]
+fn start_time() -> i128 {
+    bun_core::start_time()
+}
+
+#[allow(non_upper_case_globals)]
+// Owned `Box<[u8]>` so
+// `process.title = "..."` (set_title) drops the previous value instead of
+// leaking. The mutex provides exclusion between `get_title`/`set_title`.
+pub(crate) static Bun__Node__ProcessTitle: bun_threading::Guarded<Option<Box<[u8]>>> =
+    bun_threading::Guarded::new(None);
+
+#[allow(non_upper_case_globals)]
+/// `--redirect-warnings=<path>` — process warnings are appended to this file
+/// instead of stderr (Node's flag; NODE_REDIRECT_WARNINGS is handled by the
+/// C++ consumer as the fallback). Set once during CLI parse.
+pub(crate) static Bun__Node__RedirectWarnings: std::sync::OnceLock<Box<[u8]>> =
+    std::sync::OnceLock::new();
+
+#[allow(non_upper_case_globals)]
+/// `--disable-warning=<code-or-type>` (repeatable) — warnings whose `code`
+/// or `name` matches an entry are suppressed. Set once during CLI parse.
+pub(crate) static Bun__Node__DisabledWarnings: std::sync::OnceLock<Vec<Box<[u8]>>> =
+    std::sync::OnceLock::new();
+
+/// Backing storage for [`cli_arena`]. Written exactly once in [`Cli::start`]
+/// during single-threaded process startup (before `Command::start`, hence
+/// before any `cli_arena()` / `cli_dupe` caller), then read freely — same
+/// "init once in `start()`" shape as `cli::LOG_`.
+///
+/// `RacyCell<MaybeUninit<…>>`, **not** `std::sync::LazyLock`: `LazyLock`'s init
+/// thunk and the `std::sync::Once` poison/slow path it forces are `#[cold]`, and
+/// fat-LTO parks them tens of MB away from the startup symbol cluster.
+/// `cli_arena()` is on the hot `bun <file>` / `bun run <script>` path (via
+/// `cli_dupe` / `cli_dupe_z` / `runner_arena`), so a `LazyLock` there faults a
+/// fresh cold page on every `bun` invocation; a plain cell is the correct shape.
+static CLI_ARENA: bun_core::RacyCell<core::mem::MaybeUninit<bun_alloc::Arena>> =
+    bun_core::RacyCell::new(core::mem::MaybeUninit::uninit());
+
+/// Process-lifetime arena for one-shot CLI commands; allocations live until
+/// exit.
+///
+/// **Main-thread only.** `MimallocArena`'s `Sync` impl is *contract-only*:
+/// `mi_heap_*` allocation calls are thread-local, and
+/// `MimallocArena::assert_owning_thread()` debug-panics on cross-thread alloc.
+/// The heap is pinned to the thread that ran [`Cli::start`] (the CLI dispatch /
+/// main thread, which is where the arena is constructed). Do not call from
+/// worker/watcher threads.
+#[inline]
+fn cli_arena() -> &'static bun_alloc::Arena {
+    // SAFETY: `CLI_ARENA` is written exactly once in `Cli::start` during
+    // single-threaded startup, before `Command::start` runs and therefore
+    // before any caller of `cli_arena()` / `cli_dupe` / `cli_dupe_z` exists.
+    // Read-only for the rest of the process lifetime.
+    unsafe { (*CLI_ARENA.get()).assume_init_ref() }
+}
+
+/// Dupe `s` into the process-lifetime CLI arena. Replaces ad-hoc
+/// `s.to_vec().into_boxed_slice()` leaks at CLI sites. Main-thread only
+/// (see [`cli_arena`]).
+#[inline]
+pub(crate) fn cli_dupe(s: &[u8]) -> &'static [u8] {
+    cli_arena().alloc_slice_copy(s)
+}
+
+/// Adopt an already-owned `Box<[u8]>` into a process-lifetime side-table and
+/// return a `&'static [u8]` borrow — zero-copy (the `Box`'s heap allocation has
+/// a stable address; only the `Box` value moves into the table). Use when the
+/// caller already owns a large buffer (e.g. tarball, request body) so
+/// [`cli_dupe`]'s memcpy + transient double-peak is avoided. Thread-safe.
+fn cli_adopt(b: Box<[u8]>) -> &'static [u8] {
+    static ADOPTED: bun_threading::Guarded<Vec<Box<[u8]>>> =
+        bun_threading::Guarded::new(Vec::new());
+    let (ptr, len) = (b.as_ptr(), b.len());
+    ADOPTED.lock().push(b);
+    // SAFETY: `ADOPTED` is never cleared/drained for the process lifetime; the
+    // `Box<[u8]>` pointee address is stable across `Vec` reallocs (only the
+    // `Box` pointer-value moves), so the returned slice stays valid `'static`.
+    unsafe { core::slice::from_raw_parts(ptr, len) }
+}
+
+/// Dupe `s` into the process-lifetime CLI arena with a trailing NUL and
+/// return the C-string pointer (for argv/envp construction).
+#[inline]
+fn cli_dupe_z(s: &[u8]) -> *const core::ffi::c_char {
+    let buf: &'static mut [u8] = cli_arena().alloc_slice_fill_default(s.len() + 1);
+    buf[..s.len()].copy_from_slice(s);
+    // buf[s.len()] is already 0 (Default for u8).
+    buf.as_ptr().cast::<core::ffi::c_char>()
+}
+
+/// This is set `true` during `Command.which()` if argv0 is "node", in which the CLI is going
+/// to pretend to be node.js by always choosing RunCommand with a relative filepath.
+///
+/// Canonical static lives in `bun_install` so both crates read/write the SAME
+/// flag (`RunCommand::create_fake_temporary_node_executable` lives there).
+pub(crate) use bun_install::PRETEND_TO_BE_NODE;
+
+/// This is set `true` during `Command.which()` if argv0 is "bunx"
+static IS_BUNX_EXE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+bun_core::declare_scope!(CLI, hidden);
+
+pub(crate) type LoaderColonList =
+    colon_list_type::ColonListType<bun_options_types::schema::api::Loader>;
+pub(crate) type DefineColonList = colon_list_type::ColonListType<&'static [u8]>;
+
+impl colon_list_type::ColonListValue for bun_options_types::schema::api::Loader {
+    const IS_LOADER: bool = true;
+    fn resolve_value(input: &'static [u8]) -> crate::Result<Self> {
+        arguments::loader_resolver(input)
+    }
+}
+impl colon_list_type::ColonListValue for &'static [u8] {
+    fn resolve_value(input: &'static [u8]) -> crate::Result<Self> {
+        Ok(input)
+    }
+}
+
+#[cold]
+fn invalid_target(diag: &mut bun_clap::Diagnostic, _target: &[u8]) -> ! {
+    let _ = diag.report(Output::error_writer(), bun_clap::Error::InvalidArgument);
+    Global::exit(1);
+}
+
+// ─── Cli (entry point) ───────────────────────────────────────────────────────
+pub(crate) mod cli {
+    use super::*;
+
+    pub(crate) use bun_options_types::compile_target::CompileTarget;
+
+    // Process-global, init in start().
+    pub(crate) static LOG_: bun_core::RacyCell<core::mem::MaybeUninit<bun_ast::Log>> =
+        bun_core::RacyCell::new(core::mem::MaybeUninit::uninit());
+
+    /// `#[inline(never)]`: this is the first Rust call after `main()` (see
+    /// `src/runtime/bin_entry/mod.rs`) and the head of the `bun <file>` / `bun run`
+    /// startup chain. It must stay a concrete symbol so lld's
+    /// `--symbol-ordering-file` (`src/startup.order`) can cluster it — and the
+    /// callees it walks (`Command::start` → `which` → `create_context_data` →
+    /// `Arguments::parse` → …) — into one contiguous front-loaded `.text` run.
+    /// Without that, fat-LTO + `codegen-units=1` lay these out in
+    /// crate-alphabetical order, scattering the cold-start path across pages
+    /// shared with bundler/install/css/panic-format bodies.
+    #[inline(never)]
+    pub(crate) fn start() {
+        // `bun_crash_handler::cli_state::is_main_thread()` (used to print the
+        // `panic(main thread): …` header) compares against a stored OS tid.
+        bun_crash_handler::cli_state::set_main_thread_id(bun_threading::current_thread_id());
+        bun_core::set_start_time(bun_core::time::nano_timestamp());
+        // SAFETY: single-threaded process startup; nothing else refers to `LOG_` yet.
+        let log = unsafe { (*LOG_.get()).write(bun_ast::Log::init()) };
+        // Init the process-lifetime CLI arena here (not via `LazyLock` on first
+        // use) — see `super::CLI_ARENA`. The write happens before any worker
+        // thread is spawned and before `Command::start` (the first
+        // `cli_arena()` caller), so a plain `RacyCell` is sound.
+        // SAFETY: single-threaded process startup; `mimalloc` is already init.
+        unsafe { (*super::CLI_ARENA.get()).write(bun_alloc::Arena::new()) };
+
+        // (The panic hook is installed by `bun_crash_handler::init()` in `bin_entry::main`.)
+        if let Err(err) = Command::start(log) {
+            // Print accumulated diagnostics BEFORE the
+            // generic `handle_root_error` "An internal error occurred (..)"
+            // message. The bake production path returns `error.BuildFailed`
+            // with the actual parse/link errors sitting in `ctx.log` (== this
+            // `log`); without this print, users see only the opaque error name.
+            let _ = log.print(std::ptr::from_mut::<bun_core::io::Writer>(
+                bun_core::Output::error_writer(),
+            ));
+            bun_crash_handler::handle_root_error(err);
+        }
+    }
+}
+pub(crate) use cli as Cli;
+
+// ─── HelpCommand ─────────────────────────────────────────────────────────────
+pub(crate) mod help_command {
+    use super::*;
+
+    #[derive(Copy, Clone, PartialEq, Eq)]
+    pub(crate) enum Reason {
+        Explicit,
+        InvalidCommand,
+    }
+
+    #[cold]
+    pub(crate) fn exec() -> crate::Result<()> {
+        exec_with_reason(Reason::Explicit)
+    }
+
+    // someone will get mad at me for this
+    const PACKAGES_TO_REMOVE_FILLER: &[&str] = &[
+        "moment",
+        "underscore",
+        "jquery",
+        "backbone",
+        "redux",
+        "browserify",
+        "webpack",
+        "left-pad",
+        "is-array",
+        "babel-core",
+        "@parcel/core",
+    ];
+    const PACKAGES_TO_ADD_FILLER: &[&str] = &[
+        "elysia",
+        "@shumai/shumai",
+        "hono",
+        "react",
+        "lyra",
+        "@remix-run/dev",
+        "@evan/duckdb",
+        "@zarfjs/zarf",
+        "zod",
+        "tailwindcss",
+    ];
+    const PACKAGES_TO_X_FILLER: &[&str] = &[
+        "bun-repl", "next", "vite", "prisma", "nuxi", "prettier", "eslint",
+    ];
+    const PACKAGES_TO_CREATE_FILLER: &[&str] = &["next-app", "vite", "astro", "svelte", "elysia"];
+
+    /// Emits the `pretty!`/`pretty_error!` call directly instead of
+    /// expanding to a bare literal — `pretty!` captures its template as
+    /// `$fmt:expr`, which is opaque to the `pretty_fmt!` proc-macro, so a
+    /// nested `cli_helptext_fmt!()` inside `concat!()` would never be flattened.
+    /// Taking the printer macro (and per-reason prefix line) as parameters keeps
+    /// a single source of truth for the 35-line help body across both
+    /// `Reason::Explicit` (stdout) and `Reason::InvalidCommand` (stderr).
+    /// The spacing between commands is intentional.
+    macro_rules! print_cli_helptext {
+        ($printer:ident, $prefix:literal, $args:expr $(, $extra:expr)*) => {
+            $printer!(
+                concat!($prefix, "\
+<b>Usage:<r> <b>bun \\<command\\> <cyan>[...flags]<r> <b>[...args]<r>
+
+<b>Commands:<r>
+  <b><magenta>run<r>       <d>./my-script.ts<r>       Execute a file with Bun
+            <d>dev<r>                  Run a package.json script
+  <b><magenta>test<r>                           Run unit tests with Bun
+  <b><magenta>check<r>                          Type check a TypeScript project
+  <b><magenta>lint<r>                           Lint JavaScript and TypeScript, like ESLint
+  <b><magenta>fmt<r>                            Format JavaScript and TypeScript, like Prettier
+  <b><magenta>x<r>         <d>{:<16}<r>     Execute a package binary (CLI), installing if needed <d>(bunx)<r>
+  <b><magenta>repl<r>                           Start a REPL session with Bun
+  <b><magenta>exec<r>                           Run a shell script directly with Bun
+
+  <b><blue>install<r>                        Install dependencies for a package.json <d>(bun i)<r>
+  <b><blue>add<r>       <d>{:<16}<r>     Add a dependency to package.json <d>(bun a)<r>
+  <b><blue>remove<r>    <d>{:<16}<r>     Remove a dependency from package.json <d>(bun rm)<r>
+  <b><blue>update<r>    <d>{:<16}<r>     Update outdated dependencies
+  <b><blue>audit<r>                          Check installed packages for vulnerabilities
+  <b><blue>dedupe<r>                         Remove duplicate versions from the lockfile
+  <b><blue>prune<r>                          Remove packages that are not in the lockfile from node_modules
+  <b><blue>outdated<r>                       Display latest versions of outdated dependencies
+  <b><blue>link<r>      <d>[\\<package\\>]<r>          Register or link a local npm package
+  <b><blue>unlink<r>                         Unregister a local npm package
+  <b><blue>publish<r>                        Publish a package to the npm registry
+  <b><blue>patch <d>\\<pkg\\><r>                    Prepare a package for patching
+  <b><blue>pm <d>\\<subcommand\\><r>                Additional package management utilities
+  <b><blue>info<r>      <d>{:<16}<r>     Display package metadata from the registry
+  <b><blue>why<r>       <d>{:<16}<r>     Explain why a package is installed
+
+  <b><yellow>build<r>     <d>./a.ts ./b.jsx<r>       Bundle TypeScript & JavaScript into a single file
+  <b><yellow>compile<r>   <d>./cli.ts<r>             Compile TypeScript & JavaScript into a standalone executable
+
+  <b><cyan>init<r>                           Start an empty Bun project from a built-in template
+  <b><cyan>create<r>    <d>{:<16}<r>     Create a new project from a template <d>(bun c)<r>
+  <b><cyan>upgrade<r>                        Upgrade to latest version of Bun.
+
+  <d>\\<command\\><r> <b><cyan>--help<r>               Print help text for command.
+"),
+                $($extra,)*
+                $args.0, $args.1, $args.2, $args.3, $args.4, $args.5, $args.6,
+            )
+        };
+    }
+
+    // Tag/Reason lack `ConstParamTy` in lower-tier crates, so `reason` is a
+    // runtime arg.
+    #[inline(never)]
+    pub(crate) fn print_with_reason(reason: Reason, show_all_flags: bool) {
+        let mut rand = bun_core::rand::DefaultPrng::init(
+            u64::try_from(bun_core::time::milli_timestamp().max(0)).expect("int cast"),
+        );
+        // xoshiro256++ next_u64() % len is close
+        // enough for filler-word selection (no rejection sampling needed here).
+        let mut pick = |n: usize| (rand.next_u64() as usize) % n;
+
+        let package_x_i = pick(PACKAGES_TO_X_FILLER.len());
+        let package_add_i = pick(PACKAGES_TO_ADD_FILLER.len());
+        let package_remove_i = pick(PACKAGES_TO_REMOVE_FILLER.len());
+        let package_create_i = pick(PACKAGES_TO_CREATE_FILLER.len());
+
+        // The filler tables are `&str` (not `&[u8]`) so the `{:<16}`
+        // width spec actually pads — `Display for BStr` writes raw bytes and
+        // ignores formatter width/alignment.
+        let args = (
+            PACKAGES_TO_X_FILLER[package_x_i],
+            PACKAGES_TO_ADD_FILLER[package_add_i],
+            PACKAGES_TO_REMOVE_FILLER[package_remove_i],
+            PACKAGES_TO_ADD_FILLER[(package_add_i + 1) % PACKAGES_TO_ADD_FILLER.len()],
+            PACKAGES_TO_ADD_FILLER[(package_add_i + 2) % PACKAGES_TO_ADD_FILLER.len()],
+            PACKAGES_TO_ADD_FILLER[(package_add_i + 3) % PACKAGES_TO_ADD_FILLER.len()],
+            PACKAGES_TO_CREATE_FILLER[package_create_i],
+        );
+
+        match reason {
+            Reason::Explicit => {
+                print_cli_helptext!(
+                    pretty,
+                    "<r><b><magenta>Bun<r> is a fast JavaScript runtime, package manager, bundler, and test runner. <d>({})<r>\n\n",
+                    args,
+                    Global::package_json_version_with_revision
+                );
+                if show_all_flags {
+                    pretty!("\n<b>Flags:<r>");
+                    bun_clap::simple_help_bun_top_level(arguments::AUTO_PARAMS);
+                    pretty!(
+                        "\n\n(more flags in <b>bun install --help<r>, <b>bun test --help<r>, and <b>bun build --help<r>)\n",
+                    );
+                }
+                pretty!(
+                    "\nLearn more about Bun:            <magenta>https://bun.com/docs<r>\n\
+Join our Discord community:      <blue>https://bun.com/discord<r>\n"
+                );
+            }
+            Reason::InvalidCommand => {
+                print_cli_helptext!(
+                    pretty_error,
+                    "<r><red>Uh-oh<r> not sure what to do with that command.\n\n",
+                    args
+                );
+            }
+        }
+
+        Output::flush();
+    }
+
+    #[cold]
+    fn exec_with_reason(reason: Reason) -> ! {
+        bun_removable_features::call_removable!(Tools, Abort, print_with_reason, reason, false);
+        if reason == Reason::InvalidCommand {
+            Global::exit(1);
+        }
+        Global::exit(0);
+    }
+}
+pub(crate) use help_command as HelpCommand;
+
+pub(crate) mod reserved_command {
+    use super::*;
+
+    #[cold]
+    pub(crate) fn exec() -> crate::Result<()> {
+        let mut command_name: &[u8] = b"";
+        for (i, arg) in bun::argv().iter().enumerate() {
+            if i == 0 {
+                continue;
+            }
+            if arg.len() > 1 && arg[0] == b'-' {
+                continue;
+            }
+            command_name = arg;
+            break;
+        }
+        if command_name.is_empty() {
+            command_name = bun::argv().get(1).map(|z| z.as_bytes()).unwrap_or(b"");
+        }
+        pretty_error!(
+            "<r><red>Uh-oh<r>. <b><yellow>bun {0}<r> is a subcommand reserved for future use by Bun.\n\nIf you were trying to run a package.json script called {0}, use <b><magenta>bun run {0}<r>.\n",
+            bstr::BStr::new(command_name)
+        );
+        Output::flush();
+        Global::exit(1);
+    }
+}
+pub(crate) use reserved_command as ReservedCommand;
+
+// ─── Command (Tag + which() + dispatch skeleton) ─────────────────────────────
+pub(crate) mod command {
+    use super::*;
+
+    /// Collect `bun::argv()` into an indexable slice of `&'static ZStr`.
+    /// `Argv` only exposes `.get(i)` / `.iter() -> &[u8]`; several call
+    /// sites need a sliceable `&[&ZStr]`.
+    #[inline]
+    fn argv_zslice() -> Vec<&'static bun_core::ZStr> {
+        let a = bun::argv();
+        (0..a.len()).map(|i| a.get(i).unwrap()).collect()
+    }
+
+    pub(crate) use bun_options_types::command_tag::Tag;
+    pub(crate) use bun_options_types::command_tag::{LOADS_CONFIG, USES_GLOBAL_OPTIONS};
+    pub(crate) use bun_options_types::context::{Context, ContextData, HotReload, TestOptions};
+
+    // Process-lifetime
+    // storage, written exactly once in `create_context_data` during
+    // single-threaded startup. The pointer to it is published via
+    // `bun_options_types::context::set_global` (single source of truth).
+    static CONTEXT_DATA: bun_core::RacyCell<core::mem::MaybeUninit<ContextData>> =
+        bun_core::RacyCell::new(core::mem::MaybeUninit::uninit());
+
+    /// Process-global CLI context handle.
+    #[inline]
+    pub(crate) fn get() -> Context<'static> {
+        // SAFETY: only called after `create_context_data` published the ctx
+        // during single-threaded startup; callers treat the result as read-mostly.
+        unsafe { &mut *bun_options_types::context::global_ptr() }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Canonical home: src/runtime/cli/mod.rs, inside `pub mod command { ... }`
+    // (crate path `bun_runtime::cli::command::{is_bun_x, is_node, which}`).
+    //
+    // The `is_node` branch of `which()` must clear
+    // `bun_clap::streaming::WARN_ON_UNRECOGNIZED_FLAG` so node-mode argv parsing
+    // stays silent on unknown flags.
+    // ──────────────────
+    fn is_bun_x(argv0: &[u8]) -> bool {
+        #[cfg(windows)]
+        {
+            return strings::ends_with(argv0, b"bunx.exe") || strings::ends_with(argv0, b"bunx");
+        }
+        #[cfg(not(windows))]
+        {
+            strings::ends_with(argv0, b"bunx")
+        }
+    }
+
+    fn is_node(argv0: &[u8]) -> bool {
+        #[cfg(windows)]
+        {
+            return strings::ends_with(argv0, b"node.exe") || strings::ends_with(argv0, b"node");
+        }
+        #[cfg(not(windows))]
+        {
+            strings::ends_with(argv0, b"node")
+        }
+    }
+
+    /// Cheap argv prescan for the dominant `bun <path>` / `bun .` shape.
+    ///
+    /// `which()` classifies any first positional that isn't one of the ~40
+    /// subcommand keywords as [`Tag::AutoCommand`] — but it pays for the
+    /// `RootCommandMatcher` packed-u96 keyword table (and its rodata) to find
+    /// that out, and `start()` then walks the full per-tag dispatch `match`.
+    /// For a first positional that *looks* like a path — `.`/`..`, a `./`,
+    /// `../`, `/` (or, on Windows, `\`, `.\`, `..\`, `X:\`) prefix, or
+    /// anything whose basename carries a `.` (a file extension) — none of
+    /// which can ever spell a subcommand keyword, so it is unambiguously
+    /// `AutoCommand` and we can jump straight to the run path. Anything
+    /// ambiguous (bare name like `run`/`x`, a leading `-flag`, a `node`/`bunx`
+    /// shim, no args at all) falls through to `which()` unchanged.
+    #[inline]
+    fn looks_like_run_entrypoint(arg: &[u8]) -> bool {
+        // Empty or option-like: let `which()`'s leading-flag skip loop handle it.
+        let Some(&first) = arg.first() else {
+            return false;
+        };
+        if first == b'-' {
+            return false;
+        }
+        if arg == b"." || arg == b".." {
+            return true;
+        }
+        // Unix relative/absolute path prefixes.
+        if first == b'/' || arg.starts_with(b"./") || arg.starts_with(b"../") {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            if first == b'\\' || arg.starts_with(b".\\") || arg.starts_with(b"..\\") {
+                return true;
+            }
+            // Drive-letter root: `C:\…` / `C:/…`.
+            if arg.len() >= 3
+                && first.is_ascii_alphabetic()
+                && arg[1] == b':'
+                && (arg[2] == b'\\' || arg[2] == b'/')
+            {
+                return true;
+            }
+        }
+        // Has a `.` in the basename — `foo.js`, `dir/foo.ts`, `.dotfile`, …
+        // (no subcommand keyword contains a `.`).
+        let basename = match strings::last_index_of_any(arg, b"/\\") {
+            Some(i) => &arg[i + 1..],
+            None => arg,
+        };
+        strings::contains_char(basename, b'.')
+    }
+
+    /// `#[inline(never)]`: argv→`Tag` classification, called once from
+    /// `Cli::start` on every `bun` invocation. Kept a concrete symbol so
+    /// `src/startup.order` can place it next to `Cli::start` /
+    /// `create_context_data` (and the `RootCommandMatcher` helpers it pulls
+    /// in) in the front-loaded startup window, rather than letting fat-LTO
+    /// inline-and-scatter it through cold code.
+    #[inline(never)]
+    fn which() -> Tag {
+        let argv = bun::argv();
+        let mut iter = argv.iter();
+        let Some(argv0) = iter.next() else {
+            return Tag::HelpCommand;
+        };
+
+        if is_bun_x(argv0) {
+            if let Some(next) = argv.get(1) {
+                let next_bytes = next.as_bytes();
+                // To install a package, `bunx` runs its own executable again as `bunx add`, with
+                // the directory it installs into as the working directory.
+                if next_bytes == b"add" {
+                    use bun_install::package_manager_real::run_tasks::is_bunx_tree;
+                    let mut cwd = bun_paths::path_buffer_pool::get();
+                    if bun_sys::getcwd(&mut *cwd).is_ok_and(|len| is_bunx_tree(&cwd[..len])) {
+                        return Tag::AddCommand;
+                    }
+                }
+                // Without a POSIX shell, that install runs each lifecycle script by running this
+                // executable again as `bunx exec --no-env-file`. See `ScriptArgv`.
+                if next_bytes == b"exec"
+                    && (argv.get(2)).is_some_and(|flag| flag.as_bytes() == b"--no-env-file")
+                {
+                    return Tag::ExecCommand;
+                }
+            }
+            // SAFETY: single-threaded startup
+            IS_BUNX_EXE.store(true, core::sync::atomic::Ordering::Relaxed);
+            return Tag::BunxCommand;
+        }
+
+        if is_node(argv0) {
+            // Node-mode must not warn on flags Bun doesn't know.
+            bun_clap::streaming::WARN_ON_UNRECOGNIZED_FLAG
+                .store(false, core::sync::atomic::Ordering::Relaxed);
+            // SAFETY: single-threaded startup
+            PRETEND_TO_BE_NODE.store(true, core::sync::atomic::Ordering::Relaxed);
+            return Tag::RunAsNodeCommand;
+        }
+
+        let Some(mut first_arg_name) = iter.next() else {
+            return Tag::AutoCommand;
+        };
+        while !first_arg_name.is_empty()
+            && first_arg_name[0] == b'-'
+            && !(first_arg_name.len() > 1 && first_arg_name[1] == b'e')
+        {
+            // `--interactive` stays on AutoCommand: Arguments.rs parses it and the no-target check
+            // routes to RunCommand::exec_node_repl. An early ReplCommand return here would bypass
+            // that and boot the legacy `bun repl` implementation instead.
+            match iter.next() {
+                Some(n) => first_arg_name = n,
+                None => return Tag::AutoCommand,
+            }
+        }
+
+        // `bun --cwd <dir> lint`: `<dir>` is the value of a flag.
+        let starts_with_flag = argv.get(1).is_some_and(|it| it.starts_with(b"-"));
+        if starts_with_flag && let Some(it) = super::script_or_command::command_after_flags() {
+            first_arg_name = it;
+        }
+
+        type RootCommandMatcher = strings::ExactSizeMatcher<12>;
+        let x = RootCommandMatcher::r#match(first_arg_name);
+        // PERF: `if x == const` is a chain of compares rather than a jump
+        // table on the packed u96 — profile if it shows up on a hot path.
+        if x == RootCommandMatcher::case(b"init") {
+            return Tag::InitCommand;
+        }
+        if x == RootCommandMatcher::case(b"build") || x == RootCommandMatcher::case(b"bun") {
+            return Tag::BuildCommand;
+        }
+        if x == RootCommandMatcher::case(b"discord") {
+            return Tag::DiscordCommand;
+        }
+        if x == RootCommandMatcher::case(b"upgrade") {
+            return Tag::UpgradeCommand;
+        }
+        if x == RootCommandMatcher::case(b"completions") {
+            return Tag::InstallCompletionsCommand;
+        }
+        if x == RootCommandMatcher::case(b"getcompletes") {
+            return Tag::GetCompletionsCommand;
+        }
+        if x == RootCommandMatcher::case(b"link") {
+            return Tag::LinkCommand;
+        }
+        if x == RootCommandMatcher::case(b"unlink") {
+            return Tag::UnlinkCommand;
+        }
+        if x == RootCommandMatcher::case(b"x") {
+            return Tag::BunxCommand;
+        }
+        if x == RootCommandMatcher::case(b"repl") {
+            return Tag::ReplCommand;
+        }
+        if x == RootCommandMatcher::case(b"i") || x == RootCommandMatcher::case(b"install") {
+            for arg in argv.iter() {
+                if arg == b"-g" || arg == b"--global" {
+                    return Tag::AddCommand;
+                }
+            }
+            return Tag::InstallCommand;
+        }
+        if x == RootCommandMatcher::case(b"ci") {
+            return Tag::InstallCommand;
+        }
+        if x == RootCommandMatcher::case(b"c") || x == RootCommandMatcher::case(b"create") {
+            return Tag::CreateCommand;
+        }
+        if x == RootCommandMatcher::case(b"test") {
+            return Tag::TestCommand;
+        }
+        if x == RootCommandMatcher::case(b"pm") {
+            return Tag::PackageManagerCommand;
+        }
+        if x == RootCommandMatcher::case(b"add") || x == RootCommandMatcher::case(b"a") {
+            return Tag::AddCommand;
+        }
+        if x == RootCommandMatcher::case(b"update") || x == RootCommandMatcher::case(b"up") {
+            return Tag::UpdateCommand;
+        }
+        if x == RootCommandMatcher::case(b"patch") {
+            return Tag::PatchCommand;
+        }
+        if x == RootCommandMatcher::case(b"patch-commit") {
+            return Tag::PatchCommitCommand;
+        }
+        if x == RootCommandMatcher::case(b"r")
+            || x == RootCommandMatcher::case(b"remove")
+            || x == RootCommandMatcher::case(b"rm")
+            || x == RootCommandMatcher::case(b"uninstall")
+        {
+            return Tag::RemoveCommand;
+        }
+        if x == RootCommandMatcher::case(b"run") {
+            return Tag::RunCommand;
+        }
+        if x == RootCommandMatcher::case(b"help") {
+            return Tag::HelpCommand;
+        }
+        if x == RootCommandMatcher::case(b"exec") {
+            return Tag::ExecCommand;
+        }
+        if x == RootCommandMatcher::case(b"outdated") {
+            return Tag::OutdatedCommand;
+        }
+        if x == RootCommandMatcher::case(b"publish") {
+            return Tag::PublishCommand;
+        }
+        if x == RootCommandMatcher::case(b"audit") {
+            return Tag::AuditCommand;
+        }
+        if x == RootCommandMatcher::case(b"compile") {
+            return match super::script_or_command::is_of_the_project(b"compile") {
+                true => Tag::AutoCommand,
+                false => Tag::CompileCommand,
+            };
+        }
+        if x == RootCommandMatcher::case(b"check") {
+            return match super::script_or_command::is_of_the_project(b"check") {
+                true => Tag::AutoCommand,
+                false => Tag::CheckCommand,
+            };
+        }
+        if x == RootCommandMatcher::case(b"lint") {
+            return match super::script_or_command::is_of_the_project(b"lint") {
+                true => Tag::AutoCommand,
+                false => Tag::LintCommand,
+            };
+        }
+        if x == RootCommandMatcher::case(b"fmt") {
+            return match super::script_or_command::is_of_the_project(b"fmt") {
+                true => Tag::AutoCommand,
+                false => Tag::FormatCommand,
+            };
+        }
+        if x == RootCommandMatcher::case(b"info") {
+            return Tag::InfoCommand;
+        }
+        if x == RootCommandMatcher::case(b"dedupe") {
+            return Tag::DedupeCommand;
+        }
+        if x == RootCommandMatcher::case(b"prune") {
+            return Tag::PruneCommand;
+        }
+        // reserved
+        if x == RootCommandMatcher::case(b"deploy")
+            || x == RootCommandMatcher::case(b"cloud")
+            || x == RootCommandMatcher::case(b"config")
+            || x == RootCommandMatcher::case(b"use")
+            || x == RootCommandMatcher::case(b"auth")
+            || x == RootCommandMatcher::case(b"login")
+            || x == RootCommandMatcher::case(b"logout")
+        {
+            return Tag::ReservedCommand;
+        }
+        if x == RootCommandMatcher::case(b"whoami") || x == RootCommandMatcher::case(b"list") {
+            return Tag::PackageManagerCommand;
+        }
+        if x == RootCommandMatcher::case(b"why") {
+            return Tag::WhyCommand;
+        }
+        if x == RootCommandMatcher::case(b"fuzzilli") {
+            if bun_core::Environment::ENABLE_FUZZILLI {
+                return Tag::FuzzilliCommand;
+            }
+            return Tag::AutoCommand;
+        }
+        if x == RootCommandMatcher::case(b"-e") {
+            return Tag::AutoCommand;
+        }
+        Tag::AutoCommand
+    }
+
+    /// Initialize the process-global `CONTEXT_DATA` and publish it via
+    /// `Context::set_global`. Shared by `create_context_data` and the
+    /// standalone-graph fast path in `start()`.
+    fn write_context_no_parse(log: &mut bun_ast::Log) -> &'static mut ContextData {
+        // SAFETY: single-threaded CLI startup; first and only write to
+        // `CONTEXT_DATA` for the process lifetime. `log` is the `&'static mut`
+        // borrow of `Cli::LOG_` taken in `Cli::start()`, so storing its raw
+        // address is sound for the process lifetime.
+        //
+        // One `ContextData::default()` is constructed and written in place,
+        // then the two non-default fields are patched on the live storage —
+        // avoids the second `Default` temporary (and its drop) that the
+        // `..Default::default()` struct-update form would build on the stack.
+        unsafe {
+            let ctx = (*CONTEXT_DATA.get()).write(ContextData::default());
+            ctx.log = std::ptr::from_mut::<bun_ast::Log>(log);
+            ctx.start_time = bun_core::start_time();
+            bun_options_types::context::set_global(ctx);
+            ctx
+        }
+    }
+
+    /// `ContextData.create` — populates the global ctx and runs `Arguments::parse`.
+    ///
+    /// `Tag` lacks `ConstParamTy` (lower-tier crate), so `cmd` is a runtime
+    /// arg; the runtime `USES_GLOBAL_OPTIONS` set covers per-command gating.
+    /// Returns `&'static mut` to the process-global `CONTEXT_DATA`. Sound
+    /// because CLI dispatch is single-threaded and this is the sole live
+    /// borrow at the time of return; callers thread it down via the `ctx`
+    /// parameter rather than re-deriving.
+    ///
+    /// `#[inline(never)]`: this is the `init` step of the `bun run <script>`
+    /// dispatch chain (`exec_auto_or_run → init → RunCommand::exec_with_cfg`)
+    /// and must stay a concrete symbol so `src/startup.order` can place it —
+    /// and the argv→Context parsing it pulls in — contiguously. `#[track_caller]`
+    /// would otherwise make it an inlining candidate, scattering those callees.
+    #[track_caller]
+    #[inline(never)]
+    pub(crate) fn create_context_data(
+        cmd: Tag,
+        log: &mut bun_ast::Log,
+    ) -> crate::Result<&'static mut ContextData> {
+        bun_crash_handler::cli_state::set_cmd_char(cmd.char());
+
+        let ctx = write_context_no_parse(log);
+
+        if USES_GLOBAL_OPTIONS[cmd] {
+            ctx.args = arguments::parse(cmd, ctx)?;
+        }
+
+        super::set_up_watch_restarts(ctx);
+
+        Ok(ctx)
+    }
+    pub(crate) use create_context_data as init;
+
+    /// Full subcommand dispatch.
+    ///
+    /// Kept deliberately tiny: every arm is a single call into a
+    /// `#[cold] #[inline(never)]` helper so this compiles to a <1-page jump
+    /// table. Previously this was a single 20 KB function and the
+    /// `AutoCommand` arm body (the `bun --version` / `bun foo.js` hot path)
+    /// sat at byte offset +0x142d behind ~5 KB of inlined standalone-graph
+    /// setup and per-tag bodies — see perf sample 0x3d628fd. With the bodies
+    /// out-lined, `start` is just `which()` + a `match` of tail calls.
+    ///
+    /// `#[inline(never)]`: the dispatch root must stay a concrete symbol so
+    /// `src/startup.order`'s `--symbol-ordering-file` can anchor the `bun
+    /// <file>` startup cluster on it (and keep `which` / `create_context_data`
+    /// / `exec_auto_or_run` adjacent), instead of fat-LTO inlining it into
+    /// `Cli::start` and re-scattering the per-tag tail calls.
+    #[inline(never)]
+    pub(crate) fn start(log: &mut bun_ast::Log) -> crate::Result<()> {
+        use bun_removable_features::call_removable;
+
+        crate::cli::startup_options::refuse_code_without_interpreter();
+
+        // WebView host subprocess entry. Must be before StandaloneModuleGraph,
+        // before JSC init, before anything that touches a JS engine. The child
+        // runs CFRunLoopRun() as its real main loop — no Bun runtime past this.
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(fd_str) = bun_core::env_var::BUN_INTERNAL_WEBVIEW_HOST::get() {
+                // Parse base-10 directly
+                // from bytes; env var values are `&[u8]`, not assumed UTF-8.
+                let fd: u32 = match bun_core::parse_int::<u32>(fd_str, 10).ok() {
+                    Some(v) if v <= i32::MAX as u32 => v,
+                    _ => Output::panic(format_args!(
+                        "Invalid BUN_INTERNAL_WEBVIEW_HOST fd: {}",
+                        bstr::BStr::new(fd_str),
+                    )),
+                };
+                unsafe extern "C" {
+                    // By-value `i32` only; noreturn entry point — no preconditions.
+                    #[link_name = "Bun__WebView__hostMain"]
+                    safe fn host_main(fd: i32) -> !;
+                }
+                bun_removable_features::call_removable!(WebView, Abort, host_main, fd as i32);
+            }
+        }
+
+        // bun build --compile entry point
+        if !bun_core::env_var::feature_flag::BUN_BE_BUN::get().unwrap_or(false) {
+            if let Some(graph) = bun_standalone_graph::Graph::from_executable()? {
+                // Never taken for a plain `bun` binary; ~2 KB of argv-splice
+                // and ctx-setup code lives behind this cold call.
+                return boot_standalone(graph, log);
+            }
+            // Only `bun build --compile` removes the command line, so this file had a program.
+            if bun_removable_features::is_removed(bun_removable_features::Feature::Tools) {
+                bun_standalone_graph::Graph::exit_without_program();
+            }
+        }
+
+        #[cfg(not(bun_locked_environment))]
+        if let Some(first) = bun::argv().get(1 + bun::bun_options_argc())
+            && first
+                .as_bytes()
+                .starts_with(run_compiled::PROGRAM_FILE_FLAG)
+            && let Some(graph) = run_compiled::load_program_file()?
+        {
+            return boot_standalone(graph, log);
+        }
+
+        // Fast path: `bun -v` / `bun --version` / `bun --revision`, the
+        // empty-eval forms `bun -e ''` / `bun -p ''` (and the `--eval=` /
+        // `--print=` spellings), and the dominant `bun <path>` / `bun .` run
+        // shape. Hoisted ABOVE `which()` and the per-tag `match` so these
+        // common invocations never decode the subcommand-name classifier
+        // (`which()` + its `RootCommandMatcher` name table / rodata) or walk
+        // the per-tag dispatch `match`. `bun --version` also skips
+        // `create_context_data` entirely (`arguments::parse` builds-and-drops
+        // a full `api::TransformOptions` and forces two `LazyLock`s for what
+        // is a no-op). Keeps `command::which`'s code/rodata and `arguments`'s
+        // clap tables out of the `--version` / `bun <file>` working set.
+        //
+        // Correctness guards:
+        //  * argv0 must be a plain `bun` invocation — a `node` / `bunx` shim
+        //    must still fall through to `which()` so `node --version` reports
+        //    Node's version, `bunx --version` is parsed by bunx, etc. Only
+        //    the *predicates* are read here; `which()` performs the matching
+        //    `PRETEND_TO_BE_NODE` / `IS_BUNX_EXE` side effects.
+        //  * the standalone-graph probe above already ran, so a compiled
+        //    executable's `--version` / `-e ''` is still passed through to
+        //    user code (it returned via `boot_standalone`).
+        //  * the version check is exact-argv-shape (`len == 2`) so it cannot
+        //    intercept `bun <bin> --version`, where the flag belongs to
+        //    `<bin>` (the bug the old argv-scan shim had — see the
+        //    NOTE below). The empty-eval check is likewise exact-shape, falling
+        //    through to `HelpCommand.exec`.
+        {
+            let argv = bun::argv();
+            let argv0 = argv.get(0).map(bun_core::ZStr::as_bytes).unwrap_or(b"");
+            if !is_node(argv0) && !is_bun_x(argv0) {
+                if argv.len() == 2 {
+                    match argv.get(1).map(bun_core::ZStr::as_bytes) {
+                        Some(b"-v" | b"--version") => print_version_and_exit(),
+                        Some(b"--revision") => print_revision_and_exit(),
+                        _ => {}
+                    }
+                }
+
+                let empty_eval = match argv.len() {
+                    2 => matches!(
+                        argv.get(1).map(bun_core::ZStr::as_bytes),
+                        Some(b"-e=" | b"-p=" | b"--eval=" | b"--print=")
+                    ),
+                    3 => {
+                        argv.get(2).is_some_and(|a| a.as_bytes().is_empty())
+                            && matches!(
+                                argv.get(1).map(bun_core::ZStr::as_bytes),
+                                Some(b"-e" | b"-p" | b"--eval" | b"--print")
+                            )
+                    }
+                    _ => false,
+                };
+                if empty_eval {
+                    Output::flush();
+                    return HelpCommand::exec();
+                }
+
+                // `bun <path>` / `bun .` — the dominant run shape. argv[1] is
+                // path-shaped (`looks_like_run_entrypoint`), which no
+                // subcommand keyword can be, so `which()` would unambiguously
+                // return `Tag::AutoCommand`; short-circuit straight to that
+                // arm so a plain `bun <file>` never decodes the subcommand
+                // classifier (`which()` + its `RootCommandMatcher` keyword
+                // table / rodata) or walks the per-tag dispatch `match` below.
+                // Dispatches to exactly the arm `which()` would have selected,
+                // so config loading / arg parsing / passthrough are unchanged.
+                if argv
+                    .get(1)
+                    .map(bun_core::ZStr::as_bytes)
+                    .is_some_and(looks_like_run_entrypoint)
+                {
+                    return call_removable!(Tools, Abort, exec_auto_or_run, Tag::AutoCommand, log);
+                }
+            }
+        }
+
+        let tag = call_removable!(Tools, Abort, which);
+
+        // NOTE: an earlier shim used to scan all of `argv` here for
+        // `--version`/`--help`/`--revision` and short-circuit, because
+        // `Arguments::parse` was gated. That shim is removed now that
+        // `arguments::parse` (called via `init` → `create_context_data`) is
+        // live and honours `stop_after_positional_at = 1` — the shim broke
+        // `bun <bin> --version` by intercepting the flag meant for `<bin>`.
+
+        match tag {
+            Tag::AutoCommand | Tag::RunCommand => {
+                call_removable!(Tools, Abort, exec_auto_or_run, tag, log)
+            }
+            Tag::HelpCommand => HelpCommand::exec(),
+            Tag::ReservedCommand => ReservedCommand::exec(),
+            Tag::DiscordCommand => {
+                call_removable!(Tools, Abort, super::discord_command::DiscordCommand::exec)
+            }
+            Tag::InitCommand => call_removable!(Create, Abort, exec_init),
+            Tag::InstallCompletionsCommand => {
+                call_removable!(Tools, Abort, exec_install_completions)
+            }
+            Tag::PackageManagerCommand => call_removable!(Install, Abort, exec_pm, log),
+            Tag::RunAsNodeCommand => call_removable!(Tools, Abort, exec_run_as_node, log),
+            Tag::InfoCommand => call_removable!(Install, Abort, bun_info, log),
+            Tag::BuildCommand => call_removable!(BuildCommand, Abort, exec_build, log),
+            Tag::CompileCommand => call_removable!(AotCompiler, Abort, exec_compile, log),
+            Tag::InstallCommand => call_removable!(Install, Abort, exec_install, log),
+            Tag::AddCommand => call_removable!(Install, Abort, exec_add, log),
+            Tag::UpdateCommand => call_removable!(Install, Abort, exec_update, log),
+            Tag::PatchCommand => call_removable!(Install, Abort, exec_patch, log),
+            Tag::PatchCommitCommand => call_removable!(Install, Abort, exec_patch_commit, log),
+            Tag::OutdatedCommand => call_removable!(Install, Abort, exec_outdated, log),
+            Tag::UpdateInteractiveCommand => {
+                call_removable!(Install, Abort, exec_update_interactive, log)
+            }
+            Tag::PublishCommand => call_removable!(Install, Abort, exec_publish, log),
+            Tag::AuditCommand => call_removable!(Install, Abort, exec_audit, log),
+            Tag::CheckCommand => call_removable!(Check, Abort, exec_check, log),
+            Tag::LintCommand => call_removable!(Lint, Abort, exec_lint, log),
+            Tag::FormatCommand => call_removable!(Fmt, Abort, exec_format, log),
+            Tag::DedupeCommand => call_removable!(Install, Abort, exec_dedupe, log),
+            Tag::PruneCommand => call_removable!(Install, Abort, exec_prune, log),
+            Tag::WhyCommand => call_removable!(Install, Abort, exec_why, log),
+            Tag::BunxCommand => call_removable!(Install, Abort, exec_bunx, log),
+            Tag::ReplCommand => call_removable!(Repl, Abort, exec_repl, log),
+            Tag::RemoveCommand => call_removable!(Install, Abort, exec_remove, log),
+            Tag::LinkCommand => call_removable!(Install, Abort, exec_link, log),
+            Tag::UnlinkCommand => call_removable!(Install, Abort, exec_unlink, log),
+            Tag::TestCommand => call_removable!(TestCommand, Abort, exec_test, log),
+            Tag::GetCompletionsCommand => call_removable!(Tools, Abort, bun_getcompletes, log),
+            Tag::CreateCommand => call_removable!(Create, Abort, bun_create, log),
+            Tag::UpgradeCommand => call_removable!(Upgrade, Abort, exec_upgrade, log),
+            Tag::ExecCommand => call_removable!(Tools, Abort, exec_exec, log),
+            Tag::FuzzilliCommand => call_removable!(Tools, Abort, exec_fuzzilli, log),
+        }
+    }
+
+    // ─── out-lined `start` arm bodies ───────────────────────────────────────
+    // Every per-tag body lives in its own `#[cold] #[inline(never)]` fn so
+    // `start` itself stays a jump table. The `Auto/Run` arm is the hot path
+    // (`bun foo.js`, `bun --version`), so it gets `#[inline(never)]` only —
+    // no `#[cold]` — to avoid pessimising branch weights / section placement.
+
+    type CmdResult = crate::Result<()>;
+
+    /// `bun build --compile` standalone-executable boot. Never taken for a
+    /// plain `bun` binary; out-lined so the ~2 KB of argv-splice / ctx-setup
+    /// code is not decoded on the `bun --version` path.
+    #[cold]
+    #[inline(never)]
+    fn boot_standalone(
+        graph: *mut bun_standalone_graph::Graph,
+        log: &mut bun_ast::Log,
+    ) -> CmdResult {
+        // SAFETY: `from_executable` returns a non-null `*mut Graph` whose
+        // backing storage is process-static (owned by the executable image).
+        let graph: &'static bun_standalone_graph::Graph = unsafe { &*graph };
+        #[cfg(bun_hardened)]
+        if bun_resolver::StandaloneModuleGraph::compiled_program(graph).is_some() {
+            bun_jsc::compiled_program::deny_write_execute_memory();
+            #[cfg(bun_locked_environment)]
+            bun_jsc::compiled_program::refuse_variables_that_are_never_read();
+        }
+        let offset_for_passthrough: usize;
+
+        let ctx: &mut ContextData = 'brk: {
+            // The entry point (`bin_entry::main`) defers argv
+            // init to `bun_core::argv()`'s lazy `Once`, so force that init
+            // now — otherwise `bun_options_argc()` reads 0 here and the
+            // standalone executable silently drops `BUN_OPTIONS` flags.
+            let original_argv_len = bun::argv().len();
+            let bun_options_argc = bun::bun_options_argc();
+            if !graph.compile_exec_argv.is_empty() || bun_options_argc > 0 {
+                let mut argv_list: Vec<&'static bun_core::ZStr> = bun::argv().to_vec();
+                if !graph.compile_exec_argv.is_empty() {
+                    bun::append_options_env(graph.compile_exec_argv, &mut argv_list);
+                    // Inserted from index 1.
+                    arguments::disallow_code_generation_from_strings_as_compiled(
+                        &argv_list[1..][..argv_list.len() - original_argv_len],
+                    );
+                }
+
+                // Store the full argv including user arguments
+                let full_argv: &'static [&'static bun_core::ZStr] = bun::intern_argv(argv_list);
+                let num_exec_argv_options = full_argv.len().saturating_sub(original_argv_len);
+
+                // Calculate offset: skip executable name + all exec argv options + BUN_OPTIONS args
+                let num_parsed_options = num_exec_argv_options + bun_options_argc;
+                offset_for_passthrough = if full_argv.len() > 1 {
+                    1 + num_parsed_options
+                } else {
+                    0
+                };
+
+                // Temporarily set bun.argv to only include executable name + exec_argv options + BUN_OPTIONS args.
+                // This prevents user arguments like --version/--help from being intercepted
+                // by Bun's argument parser (they should be passed through to user code).
+                // SAFETY: single-threaded startup; `full_argv` is process-static.
+                unsafe {
+                    bun::set_argv(&full_argv[..(1 + num_parsed_options).min(full_argv.len())]);
+                }
+
+                // Handle actual options to parse.
+                let result = init(Tag::AutoCommand, log)?;
+
+                // Restore full argv so passthrough calculation works correctly
+                // SAFETY: single-threaded startup.
+                unsafe { bun::set_argv(full_argv) };
+
+                break 'brk result;
+            }
+
+            // If no compile_exec_argv, skip executable name if present
+            offset_for_passthrough = 1.min(bun::argv().len());
+
+            break 'brk write_context_no_parse(log);
+        };
+
+        ctx.args.target = Some(bun_options_types::schema::api::Target::Bun);
+        use bun_options_types::global_cache::GlobalCache;
+        if ctx.debug.global_cache == GlobalCache::auto {
+            ctx.debug.global_cache = GlobalCache::disable;
+        }
+
+        ctx.passthrough = bun::argv()
+            .iter()
+            .skip(offset_for_passthrough)
+            .map(|a| a.to_vec().into_boxed_slice())
+            .collect();
+
+        let entry_name = graph.main_module_path().to_vec().into_boxed_slice();
+        super::run_command::RunCommand::boot_standalone(ctx, entry_name, graph)?;
+        Ok(())
+    }
+
+    /// `bun [run] <script>` / `bun --version` / bare `bun`. The dominant tag
+    /// pair — kept out-of-line so `start` is a jump table, but *not* `#[cold]`.
+    #[inline(never)]
+    fn exec_auto_or_run(tag: Tag, log: &mut bun_ast::Log) -> CmdResult {
+        // Bare `bun` help is served by the empty-positionals fallthrough.
+        let ctx = init(tag, log)?;
+        ctx.args.target = Some(bun_options_types::schema::api::Target::Bun);
+
+        // Scripts have no entry point to start from: the project is checked, as by `bun check`.
+        let runs_several =
+            ctx.parallel || ctx.sequential || !ctx.filters.is_empty() || ctx.workspaces;
+        if runs_several {
+            super::run_compiled::reject(ctx, super::run_compiled::NonFileTarget::SeveralProcesses);
+        }
+        if runs_several
+            && ctx.runtime_options.check
+            && !super::check_command::check_project_before(None)
+        {
+            Global::exit(1);
+        }
+
+        if ctx.parallel || ctx.sequential {
+            // Result<Infallible, _>: if this returns at all, it's Err.
+            let Err(err) = super::multi_run::run(ctx);
+            pretty_errorln!("<r><red>error<r>: {}", err.name());
+            Global::exit(1);
+        }
+
+        if !ctx.filters.is_empty() || ctx.workspaces {
+            // Result<Infallible, _>: if this returns at all, it's Err.
+            let Err(err) = super::filter_run::run_scripts_with_filter(ctx);
+            pretty_errorln!("<r><red>error<r>: {}", err.name());
+            Global::exit(1);
+        }
+
+        // Node: `-i foo.js` runs the script; `-i -e code` evals then enters the
+        // REPL (via process._eval). `-i -p` is not yet threaded through the
+        // bootstrap (Node prints AND enters the REPL), so `-p` currently
+        // bypasses the REPL. RunCommand's positionals carry a leading "run".
+        let no_target = match tag {
+            Tag::AutoCommand => ctx.positionals.is_empty(),
+            Tag::RunCommand => match ctx.positionals.as_slice() {
+                [] => true,
+                [r] => r.as_ref() == b"run",
+                _ => false,
+            },
+            _ => false,
+        };
+        if ctx.runtime_options.interactive && !ctx.runtime_options.eval.eval_and_print && no_target
+        {
+            return run_command::RunCommand::exec_node_repl(ctx);
+        }
+
+        if tag == Tag::AutoCommand && !ctx.runtime_options.eval.script.is_empty() {
+            lint_command::read_program_from_stdin(ctx);
+            return run_command::RunCommand::exec_eval(ctx);
+        }
+
+        if tag == Tag::AutoCommand && ctx.args.entry_points.len() == 1 {
+            let extension = bun_paths::extension(&ctx.args.entry_points[0]);
+            if extension == b".lockb" {
+                return bun_lockb(ctx);
+            }
+        }
+
+        // `bun --check` and `bun run --check` are `bun check`, also where that is a script.
+        if no_target && ctx.runtime_options.check && ctx.runtime_options.eval.script.is_empty() {
+            super::check_command::CheckCommand::exec_without_arguments();
+        }
+
+        if !ctx.positionals.is_empty() {
+            let cfg = run_command::ExecCfg {
+                bin_dirs_only: tag == Tag::AutoCommand,
+                log_errors: tag != Tag::AutoCommand || !ctx.runtime_options.if_present,
+                allow_fast_run_for_extensions: tag == Tag::AutoCommand,
+            };
+            if run_command::RunCommand::exec_with_cfg(ctx, cfg)? {
+                return Ok(());
+            }
+            if tag == Tag::RunCommand {
+                Global::exit(1);
+            }
+            return Ok(());
+        }
+
+        if tag == Tag::AutoCommand {
+            Output::flush();
+            return HelpCommand::exec();
+        }
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn exec_init() -> CmdResult {
+        // InitCommand parses its own argv (no Context).
+        let argv = argv_zslice();
+        super::init_command::InitCommand::exec(&argv[2.min(argv.len())..])
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn exec_install_completions() -> CmdResult {
+        // The full
+        // exec handles both the non-tty path (dump the embedded completion
+        // script to stdout) and the tty install path (bunx symlink, fpath/XDG
+        // dir search, profile patching).
+        for a in bun::argv().iter().skip(2) {
+            if matches!(a, b"--help" | b"-h") {
+                tag_print_help(Tag::InstallCompletionsCommand, true);
+                Global::exit(0);
+            }
+        }
+        super::install_completions_command::InstallCompletionsCommand::exec()?;
+        Global::exit(0);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn exec_run_as_node(log: &mut bun_ast::Log) -> CmdResult {
+        let ctx = init(Tag::RunAsNodeCommand, log)?;
+        run_command::RunCommand::exec_as_if_node(ctx)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn exec_bunx(log: &mut bun_ast::Log) -> CmdResult {
+        let ctx = init(Tag::BunxCommand, log)?;
+        let start_idx = if IS_BUNX_EXE.load(core::sync::atomic::Ordering::Relaxed) {
+            0
+        } else {
+            1
+        };
+        let argv = argv_zslice();
+        super::bunx_command::BunxCommand::exec(ctx, &argv[start_idx..])
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn exec_repl(log: &mut bun_ast::Log) -> CmdResult {
+        // Inits with RunCommand (repl reuses run params).
+        let ctx = init(Tag::RunCommand, log)?;
+        super::repl_command::ReplCommand::exec(ctx)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn exec_build(log: &mut bun_ast::Log) -> CmdResult {
+        let ctx = init(Tag::BuildCommand, log)?;
+        super::build_command::BuildCommand::exec(ctx, None)?;
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn exec_compile(log: &mut bun_ast::Log) -> CmdResult {
+        let ctx = init(Tag::CompileCommand, log)?;
+        super::compile_command::CompileCommand::exec_command(ctx)?;
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn exec_check(log: &mut bun_ast::Log) -> CmdResult {
+        // CheckCommand parses its own argv.
+        init(Tag::CheckCommand, log)?;
+        let argv = argv_zslice();
+        super::check_command::CheckCommand::exec(after_command(&argv, b"check"))
+    }
+
+    /// What follows `command`, which stands after the flags of `bun` and those of `BUN_OPTIONS`.
+    fn after_command<'a>(
+        argv: &'a [&'static bun_core::ZStr],
+        command: &[u8],
+    ) -> &'a [&'static bun_core::ZStr] {
+        let at = super::script_or_command::place_of_command(command);
+        at.and_then(|at| argv.get(at + 1..)).unwrap_or_default()
+    }
+
+    /// The flags of `command` that stand before it, as in `bun --check format` or `bun -c format`, and then what follows it. If
+    /// they were dropped, `--check` would write. `knows` tells whether `command` has a flag. The others are for `bun`, or come
+    /// from `BUN_OPTIONS`.
+    fn with_own_flags_before(
+        argv: &[&'static bun_core::ZStr],
+        command: &[u8],
+        knows: fn(&[u8]) -> bool,
+    ) -> Vec<&'static bun_core::ZStr> {
+        let is_of_bun = |arg: &[u8]| match strings::split_once_char(arg, b'=') {
+            // `bun -c=bunfig.toml lint`. Without a value it's `--check` of `bun fmt`.
+            Some((name, _)) => matches!(name, b"--config" | b"-c" | b"--cwd"),
+            None => matches!(arg, b"--config" | b"--cwd" | b"--help" | b"--silent"),
+        };
+        let at = super::script_or_command::place_of_command(command).unwrap_or(argv.len());
+        let mut args: Vec<_> = (argv.iter().take(at).skip(1))
+            .filter(|arg| arg.as_bytes().starts_with(b"-"))
+            .filter(|arg| !is_of_bun(arg.as_bytes()) && knows(arg.as_bytes()))
+            .copied()
+            .collect();
+        args.extend_from_slice(after_command(argv, command));
+        args
+    }
+
+    /// `bun --help lint`: prints the help of `command` and exits if `--help` or `-h` is among the flags of `bun`, which precede it.
+    fn print_help_if_asked_before(command: &[u8], tag: Tag) {
+        let before = super::script_or_command::arguments_before(command);
+        if before.iter().any(|arg| matches!(*arg, b"--help" | b"-h")) {
+            tag_print_help(tag, false);
+            Global::exit(0);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn exec_lint(log: &mut bun_ast::Log) -> CmdResult {
+        // LintCommand parses its own argv.
+        let ctx = init(Tag::LintCommand, log)?;
+        let argv = argv_zslice();
+        print_help_if_asked_before(b"lint", Tag::LintCommand);
+        let knows = super::lint_command::LintCommand::has_flag;
+        super::lint_command::LintCommand::exec(ctx, &with_own_flags_before(&argv, b"lint", knows))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn exec_format(log: &mut bun_ast::Log) -> CmdResult {
+        // FormatCommand parses its own argv.
+        let ctx = init(Tag::FormatCommand, log)?;
+        let argv = argv_zslice();
+        print_help_if_asked_before(b"fmt", Tag::FormatCommand);
+        let knows = super::format_command::FormatCommand::has_flag;
+        super::format_command::FormatCommand::exec(
+            ctx,
+            &with_own_flags_before(&argv, b"fmt", knows),
+        )
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn exec_audit(log: &mut bun_ast::Log) -> CmdResult {
+        let ctx = init(Tag::AuditCommand, log)?;
+        match super::audit_command::AuditCommand::exec(ctx)? {}
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn exec_exec(log: &mut bun_ast::Log) -> CmdResult {
+        let ctx = init(Tag::ExecCommand, log)?;
+        if ctx.positionals.len() > 1 {
+            super::exec_command::ExecCommand::exec(ctx)?;
+        } else {
+            tag_print_help(Tag::ExecCommand, true);
+        }
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn exec_fuzzilli(log: &mut bun_ast::Log) -> CmdResult {
+        if bun_core::Environment::ENABLE_FUZZILLI {
+            let ctx = init(Tag::FuzzilliCommand, log)?;
+            return super::fuzzilli_command::FuzzilliCommand::exec(ctx);
+        }
+        Err(crate::Error::UnrecognizedCommand)
+    }
+
+    /// Stamps out `#[cold] #[inline(never)] fn $name(log) { init($tag)?; $exec(ctx) }`
+    /// for the trivial `init + exec` arms.
+    macro_rules! cold_exec {
+        ($( $name:ident => ($tag:ident, $($path:tt)+) ),* $(,)?) => {
+            $(
+                #[cold]
+                #[inline(never)]
+                fn $name(log: &mut bun_ast::Log) -> CmdResult {
+                    let ctx = init(Tag::$tag, log)?;
+                    $($path)+(ctx)
+                }
+            )*
+        };
+    }
+    cold_exec! {
+        exec_pm                 => (PackageManagerCommand, super::package_manager_command::PackageManagerCommand::exec),
+        exec_install            => (InstallCommand,        super::install_command::InstallCommand::exec),
+        exec_add                => (AddCommand,            super::add_command::AddCommand::exec),
+        exec_update             => (UpdateCommand,         super::update_command::UpdateCommand::exec),
+        exec_patch              => (PatchCommand,          super::patch_command::PatchCommand::exec),
+        exec_patch_commit       => (PatchCommitCommand,    super::patch_commit_command::PatchCommitCommand::exec),
+        exec_outdated           => (OutdatedCommand,       super::outdated_command::OutdatedCommand::exec),
+        exec_update_interactive => (UpdateInteractiveCommand, super::update_interactive_command::UpdateInteractiveCommand::exec),
+        exec_publish            => (PublishCommand,        super::publish_command::PublishCommand::exec),
+        exec_why                => (WhyCommand,            super::why_command::WhyCommand::exec),
+        exec_dedupe             => (DedupeCommand,         super::dedupe_command::DedupeCommand::exec),
+        exec_prune              => (PruneCommand,          super::prune_command::PruneCommand::exec),
+        exec_remove             => (RemoveCommand,         super::remove_command::RemoveCommand::exec),
+        exec_link               => (LinkCommand,           super::link_command::LinkCommand::exec),
+        exec_unlink             => (UnlinkCommand,         super::unlink_command::UnlinkCommand::exec),
+        exec_test               => (TestCommand,           super::test_command::TestCommand::exec),
+        exec_upgrade            => (UpgradeCommand,        super::upgrade_command::UpgradeCommand::exec),
+    }
+
+    // ─── helper fns hoisted from `Command.start` (kept out of `start` to keep
+    //     its stack frame small) ────────────────────────────────────────────
+
+    const DEFAULT_COMPLETIONS_LIST: &[&[u8]] = &[
+        b"build", b"install", b"add", b"run", b"update", b"link", b"unlink", b"remove", b"create",
+        b"bun", b"upgrade", b"discord", b"test", b"pm", b"x", b"repl", b"info",
+    ];
+
+    // DEFAULT_COMPLETIONS_LIST ++ extras; hand-rolled join (small, fixed).
+    const REJECT_LIST: &[&[u8]] = &[
+        b"build",
+        b"install",
+        b"add",
+        b"run",
+        b"update",
+        b"link",
+        b"unlink",
+        b"remove",
+        b"create",
+        b"bun",
+        b"upgrade",
+        b"discord",
+        b"test",
+        b"pm",
+        b"x",
+        b"repl",
+        b"info",
+        // extras:
+        b"build",
+        b"completions",
+        b"help",
+    ];
+
+    #[cold]
+    #[inline(never)]
+    fn bun_getcompletes(log: &mut bun_ast::Log) -> crate::Result<()> {
+        use super::add_completions;
+        use super::run_command::{Filter, RunCommand};
+        use super::shell_completions::ShellCompletions;
+
+        let ctx = init(Tag::GetCompletionsCommand, log)?;
+        // `ctx.positionals` is `Vec<Box<[u8]>>`; clone into a local
+        // owned vec so `filter` doesn't borrow `ctx` (passed `&mut` below).
+        let positionals: Vec<Box<[u8]>> = ctx.positionals.clone();
+        let positionals_refs: Vec<&[u8]> = positionals.iter().map(|b| &**b).collect();
+        let mut filter: &[&[u8]] = &positionals_refs;
+
+        for (i, item) in filter.iter().enumerate() {
+            if *item == b"getcompletes" {
+                filter = if i + 1 < filter.len() {
+                    &filter[i + 1..]
+                } else {
+                    &[]
+                };
+                break;
+            }
+        }
+        let mut prefilled_completions: [&'static [u8]; add_completions::BIGGEST_LIST] =
+            [b""; add_completions::BIGGEST_LIST];
+        let mut completions = ShellCompletions::default();
+
+        if filter.is_empty() {
+            completions = RunCommand::completions::<{ Filter::All }>(
+                ctx,
+                Some(DEFAULT_COMPLETIONS_LIST),
+                REJECT_LIST,
+            )?;
+        } else if filter[0] == b"s" {
+            completions = RunCommand::completions::<{ Filter::Script }>(ctx, None, REJECT_LIST)?;
+        } else if filter[0] == b"i" {
+            completions = RunCommand::completions::<{ Filter::ScriptExclude }>(
+                ctx,
+                Some(DEFAULT_COMPLETIONS_LIST),
+                REJECT_LIST,
+            )?;
+        } else if filter[0] == b"b" {
+            completions = RunCommand::completions::<{ Filter::Bin }>(ctx, None, REJECT_LIST)?;
+        } else if filter[0] == b"r" {
+            completions = RunCommand::completions::<{ Filter::All }>(ctx, None, REJECT_LIST)?;
+        } else if filter[0] == b"g" {
+            completions =
+                RunCommand::completions::<{ Filter::AllPlusBunJs }>(ctx, None, REJECT_LIST)?;
+        } else if filter[0] == b"j" {
+            completions = RunCommand::completions::<{ Filter::BunJs }>(ctx, None, REJECT_LIST)?;
+        } else if filter[0] == b"z" {
+            completions = RunCommand::completions::<{ Filter::ScriptAndDescriptions }>(
+                ctx,
+                None,
+                REJECT_LIST,
+            )?;
+        } else if filter[0] == b"a" {
+            use add_completions::FirstLetter;
+            'outer: {
+                if filter.len() > 1 && !filter[1].is_empty() {
+                    let first_letter: FirstLetter = match filter[1][0] {
+                        b'a' => FirstLetter::A,
+                        b'b' => FirstLetter::B,
+                        b'c' => FirstLetter::C,
+                        b'd' => FirstLetter::D,
+                        b'e' => FirstLetter::E,
+                        b'f' => FirstLetter::F,
+                        b'g' => FirstLetter::G,
+                        b'h' => FirstLetter::H,
+                        b'i' => FirstLetter::I,
+                        b'j' => FirstLetter::J,
+                        b'k' => FirstLetter::K,
+                        b'l' => FirstLetter::L,
+                        b'm' => FirstLetter::M,
+                        b'n' => FirstLetter::N,
+                        b'o' => FirstLetter::O,
+                        b'p' => FirstLetter::P,
+                        b'q' => FirstLetter::Q,
+                        b'r' => FirstLetter::R,
+                        b's' => FirstLetter::S,
+                        b't' => FirstLetter::T,
+                        b'u' => FirstLetter::U,
+                        b'v' => FirstLetter::V,
+                        b'w' => FirstLetter::W,
+                        b'x' => FirstLetter::X,
+                        b'y' => FirstLetter::Y,
+                        b'z' => FirstLetter::Z,
+                        _ => break 'outer,
+                    };
+                    add_completions::init();
+                    let results = add_completions::get_packages(first_letter);
+
+                    let mut prefilled_i: usize = 0;
+                    for cur in results {
+                        if cur.is_empty() || !strings::has_prefix(cur, filter[1]) {
+                            continue;
+                        }
+                        prefilled_completions[prefilled_i] = cur;
+                        prefilled_i += 1;
+                        if prefilled_i >= prefilled_completions.len() {
+                            break;
+                        }
+                    }
+                    completions.commands =
+                        std::borrow::Cow::Owned(prefilled_completions[0..prefilled_i].to_vec());
+                }
+            }
+        }
+        completions.print();
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn bun_create(log: &mut bun_ast::Log) -> crate::Result<()> {
+        use super::bunx_command::BunxCommand;
+        use super::create_command::{CreateCommand, ExampleTag};
+        use bun_core::ZStr;
+
+        // These are templates from the legacy `bun create`
+        // most of them aren't useful but these few are kinda nice.
+        bun_core::comptime_string_set! {
+            static HARDCODED_NON_BUN_X_LIST = {
+                b"elysia", b"elysia-buchta", b"stric",
+            };
+        }
+
+        // Create command wraps bunx
+        let ctx = init(Tag::CreateCommand, log)?;
+        let args = argv_zslice();
+
+        if args.len() <= 2 {
+            tag_print_help(Tag::CreateCommand, false);
+            Global::exit(1);
+        }
+
+        let mut template_name_start: usize = 0;
+        let mut positionals: [&[u8]; 2] = [b"", b""];
+        let mut positional_i: usize = 0;
+        let mut dash_dash_bun = false;
+        let mut print_help = false;
+
+        if args.len() > 2 {
+            let remainder = &args[1..];
+            let mut remainder_i: usize = 0;
+            while remainder_i < remainder.len() && positional_i < positionals.len() {
+                let slice = strings::trim(remainder[remainder_i].as_bytes(), b" \t\n");
+                if !slice.is_empty() {
+                    if !strings::has_prefix(slice, b"--") {
+                        if positional_i == 1 {
+                            template_name_start = remainder_i + 2;
+                        }
+                        positionals[positional_i] = slice;
+                        positional_i += 1;
+                    }
+                    if slice[0] == b'-' {
+                        if slice == b"--bun" {
+                            dash_dash_bun = true;
+                        } else if slice == b"--help" || slice == b"-h" {
+                            print_help = true;
+                        }
+                    }
+                }
+                remainder_i += 1;
+            }
+        }
+
+        if print_help
+            // "bun create --" / "bun create -abc --"
+            || positional_i == 0
+            || positionals[1].is_empty()
+        {
+            tag_print_help(Tag::CreateCommand, true);
+            Global::exit(0);
+        }
+
+        let template_name = positionals[1];
+
+        // if template_name is "react" — deprecated; redirect to react-app/vite.
+        if template_name == b"react" {
+            pretty_errorln!(
+                "\
+The \"react\" template has been deprecated.
+It is recommended to use \"react-app\" or \"vite\" instead.
+
+To create a project using Create React App, run
+
+  <d>bun create react-app<r>
+
+To create a React project using Vite, run
+
+  <d>bun create vite<r>
+
+Then select \"React\" from the list of frameworks.
+"
+            );
+            Global::exit(1);
+        }
+
+        // if template_name is "next" — redirect to next-app.
+        if template_name == b"next" {
+            pretty_errorln!(
+                "\
+<yellow>warn: No template <b>create-next<r> found.
+To create a project with the official Next.js scaffolding tool, run
+  <b>bun create next-app <cyan>[destination]<r>"
+            );
+            Global::exit(1);
+        }
+
+        let create_command_info = CreateCommand::extract_info()?;
+        let template = create_command_info.template;
+        let example_tag = create_command_info.example_tag;
+
+        let use_bunx = !HARDCODED_NON_BUN_X_LIST.contains(template_name)
+            && (!strings::contains(template_name, b"/")
+                || strings::starts_with_char(template_name, b'@'))
+            && example_tag != ExampleTag::LocalFolder;
+
+        if use_bunx {
+            let mut bunx_args: Vec<&ZStr> =
+                Vec::with_capacity(3 + args.len() - template_name_start + (dash_dash_bun as usize));
+            bunx_args.push(bun_core::zstr!("bunx"));
+            if dash_dash_bun {
+                bunx_args.push(bun_core::zstr!("--bun"));
+            }
+            bunx_args.extend(Global::ca_store_flag());
+            // `add_create_prefix` returns an owned NUL-terminated buffer.
+            // `bun create` is a one-shot CLI subcommand (ends in exec/exit), so
+            // the prefixed package name is a process singleton — park the owning
+            // `ZBox` in a `OnceLock` so the `&'static ZStr` borrow is sound
+            // without leaking (PORTING.md §Forbidden patterns).
+            static CREATE_PREFIX: std::sync::OnceLock<bun_core::ZBox> = std::sync::OnceLock::new();
+            let prefixed = BunxCommand::add_create_prefix(template_name)?;
+            bunx_args.push(CREATE_PREFIX.get_or_init(|| prefixed).as_zstr());
+            for src in &args[template_name_start..] {
+                bunx_args.push(*src);
+            }
+            return BunxCommand::exec(ctx, &bunx_args);
+        }
+
+        CreateCommand::exec(ctx, example_tag, template)
+    }
+
+    /// `bun ./bun.lockb` — print lockfile as yarn.lock (or its hash with `--hash`).
+    #[cold]
+    #[inline(never)]
+    fn bun_lockb(ctx: &mut ContextData) -> crate::Result<()> {
+        use bun_install::lockfile::Printer;
+
+        // SAFETY: single-threaded CLI dispatch; `ctx.log` was populated by
+        // `create_context_data` and no other `&mut Log` borrow is live for the
+        // rest of this function.
+        let log = unsafe { ctx.log_mut() };
+        let entry = &ctx.args.entry_points[0];
+
+        for arg in bun::argv() {
+            if arg == b"--hash" {
+                let file = match bun_sys::File::openat(
+                    bun_sys::Fd::cwd(),
+                    &entry[..],
+                    bun_sys::O::RDONLY,
+                    0,
+                ) {
+                    Ok(f) => f,
+                    Err(err) => {
+                        Output::err(err, "failed to open lockfile", ());
+                        Global::crash();
+                    }
+                };
+                return super::package_manager_command::PackageManagerCommand::print_hash(
+                    log, &file,
+                );
+            }
+        }
+
+        Printer::print(log, entry).map_err(Into::into)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn bun_info(log: &mut bun_ast::Log) -> crate::Result<()> {
+        use bun_install::package_manager_real::{CommandLineArguments, Subcommand as PmSubcommand};
+        use bun_install::{PackageManager, Subcommand};
+
+        let cli = CommandLineArguments::parse(PmSubcommand::Info)?;
+        let ctx = init(Tag::InfoCommand, log)?;
+        let (pm, _) = PackageManager::init(ctx, &cli, Subcommand::Info)?;
+
+        // `["info", "<spec>", "<field>"...]`
+        let mut positionals: &'static [&'static [u8]] = pm.options.positionals;
+        if positionals.first().is_some_and(|p| *p == b"info") {
+            positionals = &positionals[1..];
+        }
+        let package_name: &[u8] = positionals.first().copied().unwrap_or(b"");
+        let fields: &[&[u8]] = positionals.get(1..).unwrap_or(&[]);
+
+        super::pm_view_command::view(pm, package_name, fields, cli.json_output)
+    }
+
+    /// Prints the flags for `bun lint --help` and `bun fmt --help`: the common ones, or with `all`, every flag by group.
+    fn print_flags(help: &bun_lint_driver::cli::Help, all: bool) {
+        if all {
+            for group in help.groups {
+                pretty!("\n<b>{}:<r>", group.title);
+                bun_clap::simple_help(group.params);
+                pretty!("\n");
+            }
+            return;
+        }
+        pretty!("\n<b>Flags:<r>");
+        bun_clap::simple_help(&help.common());
+        pretty!("\n");
+    }
+
+    /// Printed at the end of `bun <command> --help` if the project has a script with the same name.
+    fn print_note_about_script(command: &str) {
+        use crate::cli::script_or_command::{Runs, runs};
+        if matches!(runs(command.as_bytes()), Ok(Runs::Script)) {
+            pretty!(
+                "\n<blue>note<r><d>:<r> package.json has a \"{}\" script, so <b>bun {}<r> runs that script\n  Change the script to <b>\"bun {}\"<r> to use the built-in command, or pass <b>--no-script<r>\n",
+                command,
+                command,
+                command,
+            );
+        }
+    }
+
+    pub(crate) fn tag_print_help(cmd: Tag, show_all_flags: bool) {
+        bun_removable_features::call_removable!(
+            Tools,
+            Abort,
+            print_command_help,
+            cmd,
+            show_all_flags,
+        )
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn print_command_help(cmd: Tag, show_all_flags: bool) {
+        // the output of --help uses the following syntax highlighting
+        // template: <b>Usage<r>: <b><green>bun <command><r> <cyan>[flags]<r> <blue>[arguments]<r>
+        // use [foo] for multiple arguments or flags for foo.
+        // use <bar> to emphasize 'bar'
+        //
+        // Every help block here must pass its template as a *string
+        // literal* to `pretty!()` so the `pretty_fmt!` proc-macro can rewrite
+        // the `<tag>` markers at compile time. Passing a `const &str` through
+        // `{}` prints the raw markup.
+        match cmd {
+            Tag::AutoCommand | Tag::HelpCommand => {
+                HelpCommand::print_with_reason(HelpCommand::Reason::Explicit, show_all_flags);
+            }
+            Tag::RunCommand | Tag::RunAsNodeCommand => {
+                run_command::RunCommand::print_help(None);
+            }
+            Tag::BunxCommand => {
+                pretty_errorln!(
+                    "\
+<b>Usage<r>: <b><green>bunx<r> <cyan>[flags]<r> <blue>\\<package\\><r><d>\\<@version\\><r> [flags and arguments for the package]<r>
+Execute an npm package executable (CLI), automatically installing into a global shared cache if not installed in node_modules.
+
+Flags:
+  <cyan>--bun<r>                  Force the command to run with Bun instead of Node.js
+  <cyan>-p, --package <blue>\\<package\\><r>    Specify package to install when binary name differs from package name
+  <cyan>--no-install<r>           Skip installation if package is not already installed
+  <cyan>--cwd <blue>\\<path\\><r>            Set the working directory
+  <cyan>--env-file <blue>\\<file\\><r>       Load environment variables from the specified file(s)
+  <cyan>--minimum-release-age <blue>\\<seconds\\><r>  Only install packages published at least N seconds ago (security feature)
+  <cyan>--registry <blue>\\<url\\><r>        Install from a specific registry
+  <cyan>--ca <blue>\\<cert\\><r>, <cyan>--cafile <blue>\\<path\\><r>  Trust a Certificate Authority signing certificate during installation
+  <cyan>--use-system-ca<r>, <cyan>--use-openssl-ca<r>, <cyan>--use-bundled-ca<r>  Choose the CA store to trust during installation
+  <cyan>--trust<r>                Run the lifecycle scripts of the package and of ALL of its dependencies during installation
+  <cyan>--ignore-scripts<r>       Run no lifecycle scripts during installation
+  <cyan>--verbose<r>              Enable verbose output during installation
+  <cyan>--silent<r>               Suppress output during installation
+
+Examples<d>:<r>
+  <b><green>bunx<r> <blue>prisma<r> migrate<r>
+  <b><green>bunx<r> <blue>prettier<r> foo.js<r>
+  <b><green>bunx<r> <cyan>-p @angular/cli<r> <blue>ng<r> new my-app
+  <b><green>bunx<r> <cyan>--bun<r> <blue>vite<r> dev foo.js<r>
+"
+                );
+                Output::flush();
+            }
+            Tag::BuildCommand => {
+                pretty!(
+                    "\
+<b>Usage<r>:
+  Transpile and bundle one or more files.
+  <b><green>bun build<r> <cyan>[flags]<r> <blue>\\<entrypoint\\><r>
+
+"
+                );
+                Output::flush();
+                pretty!("<b>Flags:<r>");
+                Output::flush();
+                bun_clap::simple_help(arguments::BUILD_ONLY_PARAMS);
+                pretty!(
+                    "\n\n\
+<b>Examples:<r>
+  <d>Frontend web apps:<r>
+  <b><green>bun build<r> <cyan>--outfile=bundle.js<r> <blue>./src/index.ts<r>
+  <b><green>bun build<r> <cyan>--minify --splitting --outdir=out<r> <blue>./index.jsx ./lib/worker.ts<r>
+
+  <d>Bundle code to be run in Bun (reduces server startup time)<r>
+  <b><green>bun build<r> <cyan>--target=bun --outfile=server.js<r> <blue>./server.ts<r>
+
+  <d>Creating a standalone executable (see https://bun.com/docs/compiler/executables)<r>
+  <b><green>bun build<r> <cyan>--compile --outfile=my-app<r> <blue>./cli.ts<r>
+
+A full list of flags is available at <magenta>https://bun.com/docs/bundler<r>
+"
+                );
+                Output::flush();
+            }
+            Tag::CompileCommand => {
+                pretty!(
+                    "\
+<b>Usage<r>: <b><green>bun compile<r> <cyan>[flags]<r> <blue>[\\<entrypoint\\>]<r>
+  Compile TypeScript & JavaScript into a standalone executable, ahead of time.
+
+  Short for <b>bun build --compile --aot<r>. Without an entry point, it compiles the file that \"bin\" in
+  <b>package.json<r> points to, then \"module\", then \"main\", then index.ts, index.tsx, index.mts or index.js.
+  The entry point can be the name of an executable of an installed package, as in <b>bun run<r>.
+
+<b>Flags:<r>"
+                );
+                Output::flush();
+                bun_clap::simple_help(arguments::COMPILE_HELP_PARAMS);
+                pretty!(
+                    "\n\n\
+<b>Examples:<r>
+  <d>Compile a program into a standalone executable<r>
+  <b><green>bun compile<r> <blue>./cli.ts<r>
+
+  <d>Choose the name of the executable<r>
+  <b><green>bun compile<r> <cyan>--outfile=my-app<r> <blue>./cli.ts<r>
+
+  <d>Compile the command-line tool of an installed package<r>
+  <b><green>bun compile<r> <blue>rollup<r>
+
+  <d>List the code that compiled to a slow path<r>
+  <b><green>bun compile<r> <cyan>--explain<r> <blue>./server.ts<r>
+
+  <d>Remove the Bun and Node.js APIs your code never calls<r>
+  <b><green>bun compile<r> <cyan>--trim<r> <blue>./server.ts<r>
+
+  <d>Build a package to publish: JavaScript, .d.ts files and a package.json in ./dist<r>
+  <b><green>bun compile<r> <cyan>--library<r> <blue>./src/index.ts<r>
+
+Full documentation is available at <magenta>https://bun.com/docs/compiler/aot<r>
+"
+                );
+                print_note_about_script("compile");
+                Output::flush();
+            }
+            Tag::TestCommand => {
+                pretty!(
+                    "\
+<b>Usage<r>: <b><green>bun test<r> <cyan>[flags]<r> <blue>[\\<patterns\\>]<r>
+  Run all matching test files and print the results to stdout"
+                );
+                Output::flush();
+                pretty!("\n\n<b>Flags:<r>");
+                Output::flush();
+                bun_clap::simple_help(arguments::TEST_ONLY_PARAMS);
+                pretty!(
+                    "\n\n\
+<b>Examples:<r>
+  <d>Run all test files<r>
+  <b><green>bun test<r>
+
+  <d>Run all test files with \"foo\" or \"bar\" in the file name<r>
+  <b><green>bun test<r> <blue>foo bar<r>
+
+  <d>Run all test files, only including tests whose names includes \"baz\"<r>
+  <b><green>bun test<r> <cyan>--test-name-pattern<r> <blue>baz<r>
+
+  <d>Type check the test files and what they import, then run them<r>
+  <b><green>bun test<r> <cyan>--check<r>
+
+  <d>Compile the test files ahead of time, then run them<r>
+  <b><green>bun test<r> <cyan>--aot<r>
+
+Full documentation is available at <magenta>https://bun.com/docs/cli/test<r>
+"
+                );
+                Output::flush();
+            }
+            Tag::CreateCommand => {
+                pretty!(
+                    "\
+<b>Usage<r><d>:<r>
+  <b><green>bun create<r> <magenta>\\<MyReactComponent.(jsx|tsx)\\><r>
+  <b><green>bun create<r> <magenta>\\<template\\><r> <cyan>[...flags]<r> <blue>dest<r>
+  <b><green>bun create<r> <magenta>\\<github-org/repo\\><r> <cyan>[...flags]<r> <blue>dest<r>
+
+<b>Environment variables<r><d>:<r>
+  <cyan>GITHUB_TOKEN<r>         <d>Supply a token to download code from GitHub with a higher rate limit<r>
+  <cyan>GITHUB_API_DOMAIN<r>    <d>Configure custom/enterprise GitHub domain. Default \"api.github.com\"<r>
+  <cyan>NPM_CLIENT<r>           <d>Absolute path to the npm client executable<r>
+  <cyan>BUN_CREATE_DIR<r>       <d>Custom path for global templates (default: $HOME/.bun-create)<r>
+
+<b>React Component Projects<r><d>:<r>
+  • Turn an existing React component into a complete frontend dev environment
+  • Automatically starts a hot-reloading dev server
+  • Auto-detects & configures TailwindCSS and shadcn/ui
+
+  <b><magenta>bun create \\<MyReactComponent.(jsx|tsx)\\><r>
+
+<b>Templates<r><d>:<r>
+  • NPM: Runs <b><magenta>bunx create-\\<template\\><r> with given arguments
+  • GitHub: Downloads repository contents as template
+  • Local: Uses templates from $HOME/.bun-create/\\<name\\> or ./.bun-create/\\<name\\>
+
+Learn more: <magenta>https://bun.com/docs/cli/bun-create<r>
+"
+                );
+                Output::flush();
+            }
+            Tag::UpgradeCommand => {
+                let (latest, switch_desc, switch_flag): (&str, &str, &str) =
+                    if bun_core::Environment::IS_CANARY {
+                        (
+                            "canary",
+                            "Switch from the canary version back to the latest stable release",
+                            "stable",
+                        )
+                    } else {
+                        (
+                            "stable",
+                            "Install the most recent canary version of Bun",
+                            "canary",
+                        )
+                    };
+
+                pretty!(
+                    "\
+<b>Usage<r>: <b><green>bun upgrade<r> <cyan>[flags]<r>
+  Upgrade Bun
+
+<b>Examples:<r>
+  <d>Install the latest {} version<r>
+  <b><green>bun upgrade<r>
+
+  <d>{}<r>
+  <b><green>bun upgrade<r> <cyan>--{}<r>
+
+Full documentation is available at <magenta>https://bun.com/docs/installation#upgrading<r>
+",
+                    latest,
+                    switch_desc,
+                    switch_flag,
+                );
+                Output::flush();
+            }
+            Tag::ReplCommand => {
+                pretty!(
+                    "\
+<b>Usage<r>: <b><green>bun repl<r> <cyan>[flags]<r>
+  Open a Bun REPL
+"
+                );
+                Output::flush();
+            }
+            Tag::ExecCommand => {
+                pretty!(
+                    "\
+<b>Usage: bun exec <r><cyan>\\<script\\><r>
+
+Execute a shell script directly from Bun.
+
+<b><red>Note<r>: If executing this from a shell, make sure to escape the string!
+
+<b>Examples<d>:<r>
+  <b>bun exec \"echo hi\"<r>
+  <b>bun exec \"echo \\\"hey friends\\\"!\"<r>
+"
+                );
+                Output::flush();
+            }
+            Tag::GetCompletionsCommand => {
+                pretty!("<b>Usage<r>: <b><green>bun getcompletes<r>");
+                Output::flush();
+            }
+            Tag::PatchCommand => {
+                pm_print_help(PmSubcommand::Patch);
+            }
+            Tag::PatchCommitCommand => {
+                pm_print_help(PmSubcommand::PatchCommit);
+            }
+            Tag::OutdatedCommand => {
+                pm_print_help(PmSubcommand::Outdated);
+            }
+            Tag::UpdateInteractiveCommand => {
+                pm_print_help(PmSubcommand::Update);
+            }
+            Tag::PublishCommand => {
+                pm_print_help(PmSubcommand::Publish);
+            }
+            Tag::AuditCommand => {
+                pm_print_help(PmSubcommand::Audit);
+            }
+            Tag::CheckCommand => {
+                pretty!(
+                    "\
+<b>Usage<r>: <b><green>bun check<r> <cyan>[flags]<r> <blue>[...files or directories]<r>
+  Type check a TypeScript project.
+
+  Uses the nearest <b>tsconfig.json<r> and reports the same errors as <b>tsc<r>, using all CPU cores.
+  Pass files or directories to check only those and their imports.
+  Project <b>references<r> are followed, like <b>tsc -b<r>, and nothing has to be built first.
+
+<b>Flags:<r>"
+                );
+                Output::flush();
+                bun_clap::simple_help(crate::cli::check_command::PARAMS);
+                pretty!(
+                    "
+      <cyan>--strict<r>, <cyan>--target<r><d><cyan>=\\<val\\><r>, ...  Any compiler option, as for <b>tsc<r>. Overrides tsconfig.json
+
+<b>Examples:<r>
+  <d>Check the current project<r>
+  <b><green>bun check<r>
+
+  <d>Check one file and everything it imports<r>
+  <b><green>bun check<r> <blue>src/index.ts<r>
+
+  <d>Check another project<r>
+  <b><green>bun check<r> <cyan>-p<r> <blue>packages/server<r>
+
+  <d>Try a stricter option without editing tsconfig.json<r>
+  <b><green>bun check<r> <cyan>--noUncheckedIndexedAccess<r>
+
+  <d>Check a file, then run it<r>
+  <b><green>bun<r> <cyan>--check<r> <blue>src/index.ts<r>
+
+  <d>Also report the errors bun compile would report<r>
+  <b><green>bun check<r> <cyan>--aot<r> <blue>src/index.ts<r>
+
+Full documentation is available at <magenta>https://bun.com/docs/runtime/check<r>
+"
+                );
+                print_note_about_script("check");
+                Output::flush();
+            }
+            Tag::FormatCommand => {
+                pretty!(
+                    "\
+<b>Usage<r>: <b><green>bun fmt<r> <cyan>[flags]<r> <blue>[...files, directories or patterns]<r>
+  Format JavaScript, TypeScript, CSS, HTML, JSON, YAML, Markdown and more.
+"
+                );
+                print_flags(&crate::cli::format_command::HELP, show_all_flags);
+                pretty!(
+                    "
+<b>Examples:<r>
+  <b><green>bun fmt<r>
+  <b><green>bun fmt<r> <blue>src test/a.test.ts<r>
+  <b><green>bun fmt<r> <cyan>--check<r>
+
+Full documentation is available at <magenta>https://bun.com/docs/format<r>
+"
+                );
+                if !show_all_flags {
+                    pretty!("See every flag with <b><green>bun fmt<r> <cyan>--help --all<r>\n");
+                }
+                print_note_about_script("fmt");
+                Output::flush();
+            }
+            Tag::LintCommand => {
+                pretty!(
+                    "\
+<b>Usage<r>: <b><green>bun lint<r> <cyan>[flags]<r> <blue>[...files, directories or patterns]<r>
+  Find and fix problems in JavaScript and TypeScript.
+"
+                );
+                print_flags(&crate::cli::lint_command::HELP, show_all_flags);
+                pretty!(
+                    "
+<b>Examples:<r>
+  <b><green>bun lint<r>
+  <b><green>bun lint<r> <cyan>--fix<r> <blue>src<r>
+  <b><green>bun lint<r> <cyan>--rule<r> <blue>'no-console: error'<r>
+
+Full documentation is available at <magenta>https://bun.com/docs/lint<r>
+"
+                );
+                if !show_all_flags {
+                    pretty!("See every flag with <b><green>bun lint<r> <cyan>--help --all<r>\n");
+                }
+                print_note_about_script("lint");
+                Output::flush();
+            }
+            Tag::DedupeCommand => {
+                pm_print_help(PmSubcommand::Dedupe);
+            }
+            Tag::PruneCommand => {
+                pm_print_help(PmSubcommand::Prune);
+            }
+            Tag::InfoCommand => {
+                pm_print_help(PmSubcommand::Info);
+            }
+            Tag::WhyCommand => {
+                pm_print_help(PmSubcommand::Why);
+            }
+            Tag::InitCommand => {
+                pretty!(
+                    "\
+<b>Usage<r>: <b><green>bun init<r> <cyan>[flags]<r> <blue>[\\<folder\\>]<r>
+  Initialize a Bun project in the current directory.
+  Creates a package.json, tsconfig.json, and bunfig.toml if they don't exist.
+
+<b>Flags<r>:
+      <cyan>--help<r>             Print this menu
+  <cyan>-y, --yes<r>              Accept all default options
+  <cyan>-m, --minimal<r>          Only initialize type definitions
+  <cyan>-r, --react<r>            Initialize a React project
+      <cyan>--react=tailwind<r>   Initialize a React project with TailwindCSS
+      <cyan>--react=shadcn<r>     Initialize a React project with @shadcn/ui and TailwindCSS
+      <cyan>--use-system-ca<r>    Use the system's trusted certificate authorities during installation
+      <cyan>--use-openssl-ca<r>   Use OpenSSL's default CA store instead of the bundled one during installation
+      <cyan>--use-bundled-ca<r>   Use bundled CA store during installation
+
+<b>Examples:<r>
+  <b><green>bun init<r>
+  <b><green>bun init<r> <cyan>--yes<r>
+  <b><green>bun init<r> <cyan>--react<r>
+  <b><green>bun init<r> <cyan>--react=tailwind<r> <blue>my-app<r>
+"
+                );
+                Output::flush();
+            }
+            Tag::DiscordCommand => {
+                pretty!("<b>Usage<r>: <b><green>bun discord<r>\n  Open Bun's Discord server.\n");
+                Output::flush();
+            }
+            Tag::InstallCompletionsCommand => {
+                pretty!("<b>Usage<r>: <b><green>bun completions<r>\n");
+                Output::flush();
+            }
+            Tag::PackageManagerCommand => {
+                pm_print_help(PmSubcommand::Pm);
+            }
+            _ => HelpCommand::print_with_reason(HelpCommand::Reason::Explicit, false),
+        }
+    }
+
+    use bun_install::package_manager_real::Subcommand as PmSubcommand;
+
+    /// Forward to `bun_install::PackageManager::CommandLineArguments::print_help`.
+    #[inline]
+    fn pm_print_help(subcommand: PmSubcommand) {
+        bun_install::package_manager_real::CommandLineArguments::print_help(subcommand);
+    }
+}
+pub(crate) use command as Command;
+
+// NOT `#[cold]` — `bun --version` is the most-benchmarked startup path, and
+// `#[cold]` relocates the body to `.text.unlikely` ~40 MB past the
+// startup.order cluster. The symbol is listed in src/startup.order instead.
+pub(crate) fn print_version_and_exit() -> ! {
+    // The version string is plain ASCII (no `<tag>` markup), so bypass
+    // `Output::pretty(format_args!(..))` — that path renders the `Arguments`
+    // into a heap `String`, then runs the runtime `<tag>` rewriter into a
+    // second `Vec<u8>`, all to print a ~10-byte constant. Write the bytes
+    // straight to the buffered stdout writer instead. One `write_all` (the
+    // `\n` is baked into the constant) → one syscall.
+    let w = Output::writer();
+    let _ = w.write_all(Global::package_json_version_nl.as_bytes());
+    Output::flush();
+    Global::exit(0);
+}
+
+#[cold]
+pub(crate) fn print_revision_and_exit() -> ! {
+    // See `print_version_and_exit` — plain bytes, no `<tag>` rewrite needed.
+    let w = Output::writer();
+    let _ = w.write_all(Global::package_json_version_with_revision.as_bytes());
+    let _ = w.write_all(b"\n");
+    Output::flush();
+    Global::exit(0);
+}
+
+/// `--check` or `--aot` with `--hot`: nothing runs unchecked, so the process starts again, as under `--watch`.
+/// Call it before `set_up_watch_restarts`.
+pub(crate) fn watch_instead_of_hot_for_check(ctx: &mut command::ContextData) {
+    if ctx.debug.hot_reload == command::HotReload::Hot {
+        ctx.debug.hot_reload = command::HotReload::Watch;
+        #[cfg(not(windows))]
+        {
+            bun_core::set_auto_reload_on_crash(true);
+        }
+    }
+}
+
+/// Under `--watch` on Windows, a manager process starts this one again after each change.
+pub(crate) fn set_up_watch_restarts(ctx: &command::ContextData) {
+    #[cfg(windows)]
+    {
+        if ctx.debug.hot_reload == command::HotReload::Watch {
+            if !bun_sys::windows::is_watcher_child() {
+                bun_sys::windows::become_watcher_manager();
+            } else {
+                bun_core::set_auto_reload_on_crash(true);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = ctx;
+}
+
+/// `--no-clear-screen` and `--watch-kill-signal`, once the watch mode is final. Node reads
+/// `--watch-kill-signal` only in watch mode; elsewhere it is accepted and ignored. Matching is
+/// case-insensitive (node uppercases).
+///
+/// `restarts`: the process can start again on a change, so the kill signal applies. True in watch
+/// mode, and for `bun bake`, which starts again when `bake.config.ts` changes.
+pub(crate) fn apply_watch_mode_flags(ctx: &mut command::ContextData, restarts: bool) {
+    if ctx.debug.no_clear_screen && ctx.debug.hot_reload != command::HotReload::None {
+        let _ = bun_dotenv::HAS_NO_CLEAR_SCREEN_CLI_FLAG.set(true);
+    }
+    if !restarts {
+        return;
+    }
+    let Some(kill_signal) = ctx.debug.watch_kill_signal_arg.as_deref() else {
+        return;
+    };
+    let upper = kill_signal.to_ascii_uppercase();
+    match bun_core::SignalCode::from_name(&upper) {
+        Some(sig) => ctx.debug.watch_kill_signal = sig,
+        None => {
+            Output::print_errorln(format_args!(
+                "TypeError [ERR_UNKNOWN_SIGNAL]: Unknown signal: {}",
+                bstr::BStr::new(kill_signal)
+            ));
+            Output::flush();
+            Global::exit(1);
+        }
+    }
+}

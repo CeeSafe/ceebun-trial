@@ -1,0 +1,142 @@
+---
+title: Use Prisma with Bun
+sidebarTitle: Prisma ORM with Bun
+mode: center
+---
+
+[Prisma ORM](https://www.prisma.io/docs/orm) 8 generates a typed query API from a schema. In this guide you add it to a Bun project, create the tables in a PostgreSQL database, and run a typed query. To start from a template and deploy the result, see [Use Prisma Postgres with Bun](/guides/ecosystem/prisma-postgres).
+
+<Steps>
+	<Step title="Create a new project">
+		Create a directory and initialize it with `bun init`.
+
+    	```bash terminal icon="terminal"
+    	mkdir prisma-app
+    	cd prisma-app
+    	bun init
+    	```
+    </Step>
+
+    <Step title="Initialize Prisma ORM">
+    	Run `orm init` with `bunx`, which installs `prisma` and `@prisma/orm-postgres` with `bun add` and writes a starter schema to `src/prisma/contract.prisma`, a database client to `src/prisma/db.ts`, a `prisma.config.ts` and a `.env` file. The `--authoring psl` flag picks the Prisma Schema Language, the `.prisma` format from earlier Prisma versions.
+
+    	```bash terminal icon="terminal"
+    	bunx prisma@latest orm init --yes --target postgres --authoring psl --write-env
+    	```
+
+    	The starter schema defines a `User` model and a `Post` model:
+
+    	```prisma src/prisma/contract.prisma icon="/icons/ecosystem/prisma.svg"
+    	// use prisma-8
+
+    	model User {
+    	  id        Int      @id @default(autoincrement())
+    	  email     String   @unique
+    	  username  String?
+    	  name      String?
+    	  posts     Post[]
+    	  createdAt TimestamptzString @default(now())
+    	  updatedAt temporal.updatedAtString()
+    	}
+
+    	model Post {
+    	  id        Int      @id @default(autoincrement())
+    	  title     String
+    	  content   String?
+    	  author    User     @relation(fields: [authorId], references: [id])
+    	  authorId  Int
+    	  createdAt TimestamptzString @default(now())
+    	  updatedAt temporal.updatedAtString()
+    	}
+    	```
+
+    	Prisma ORM compiles this file into a contract, `src/prisma/contract.json` and `src/prisma/contract.d.ts`, that your queries are type-checked against. `orm init` emits it once, and after every later change to the schema you run `bunx prisma contract emit` to update it.
+
+    	Every `prisma` command ends with a line that says the agent skills are out of date, which changes nothing and goes away once you run `bunx prisma@latest init` to install the skills for your coding agent.
+    </Step>
+
+    <Step title="Configure database connection">
+    	Set `DATABASE_URL` in the `.env` file to the connection string of an empty PostgreSQL 15 or newer database, because the next step creates tables in it. If you do not have one, `bunx create-db` creates a [Prisma Postgres](https://www.prisma.io/postgres) database without an account and prints its connection string together with a claim URL, and because the database and its data are deleted after 24 hours unless you open that URL, claim it if you want to keep it. The string from `create-db` ends in `sslmode=require`, which makes the `pg` driver print a security warning on every connection, so change it to `sslmode=verify-full`, the mode Prisma Postgres supports. Leave the SSL settings of another provider as its documentation gives them.
+
+    	```ini .env icon="settings"
+    	DATABASE_URL="postgres://USER:PASSWORD@db.prisma.io:5432/postgres?sslmode=verify-full"
+    	```
+
+    	`prisma.config.ts` and `src/prisma/db.ts` load `.env` through `dotenv`, so the CLI and your code both read the variable from there.
+    </Step>
+
+    <Step title="Create the tables">
+    	`db init` creates the tables from the contract and records the contract in the database.
+
+    	```bash terminal icon="terminal"
+    	bunx prisma db init
+    	```
+
+    	```txt
+    	✔ Applied 5 operation(s) across 1 contract space
+
+    	App space
+    	├─ Create table "Post"
+    	├─ Create table "User"
+    	├─ Add unique constraint on "User" (email)
+    	├─ Create index "Post_authorId_idx_e47547ed" on "Post"
+    	├─ Add foreign key "Post_authorId_fkey" on "Post"
+    	└─ marker a51b4833fdaffe730572670ccc27dd89af7e0726ab3de7f428d21702d687cc15
+    	```
+    </Step>
+
+    <Step title="Create a test script">
+    	Replace `index.ts` with a script that creates a new user, then counts the users in the database. Models are namespace-qualified on PostgreSQL, so the `User` model in the default `public` schema is `db.orm.public.User`.
+
+    	```ts index.ts icon="/icons/typescript.svg"
+    	import { db } from "./src/prisma/db";
+
+    	// create a new user
+    	await db.orm.public.User.create({
+    	  name: "John Dough",
+    	  email: `john-${Math.random()}@example.com`,
+    	});
+
+    	// count the users
+    	const { count } = await db.orm.public.User.aggregate(a => ({ count: a.count() }));
+    	console.log(`There are ${count} users in the database.`);
+
+    	await db.close();
+    	```
+
+    	The final `db.close()` lets the script exit, because otherwise the connection pool keeps the process alive.
+    </Step>
+
+    <Step title="Run and test the application">
+    	Run the script with `bun` and watch the count grow, because each run creates a new user.
+
+    	```bash terminal icon="terminal"
+    	bun index.ts
+    	```
+
+    	```txt
+    	There are 1 users in the database.
+    	```
+
+    	```bash terminal icon="terminal"
+    	bun index.ts
+    	```
+
+    	```txt
+    	There are 2 users in the database.
+    	```
+
+    	```bash terminal icon="terminal"
+    	bun index.ts
+    	```
+
+    	```txt
+    	There are 3 users in the database.
+    	```
+    </Step>
+
+</Steps>
+
+---
+
+Prisma ORM is now set up with Bun. See the [Prisma ORM docs](https://www.prisma.io/docs/orm) for filtering, relations, and migrations as you build out your application.

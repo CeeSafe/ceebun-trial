@@ -1,0 +1,1072 @@
+/**
+ * Code generation as ninja rules.
+ *
+ * Each codegen step is a single ninja `build` statement with explicit
+ * inputs (script + sources) and outputs. All rules set `restat = 1` —
+ * most codegen scripts use `writeIfNotChanged`, so downstream is pruned
+ * when output content didn't change.
+ *
+ * Source lists come from the patterns in glob-sources.ts, globbed once at
+ * configure time via `globAllSources()`. The expanded
+ * paths are baked into build.ninja; adding a file picks up on next configure.
+ *
+ * ## Undeclared outputs
+ *
+ * Every generated file that is compiled or #included must be a declared
+ * output of its step. Compiles only order-depend on codegen (bun.ts); the
+ * depfile is what rebuilds them when a generated header changes, and a
+ * depfile entry does that within the same run only if it names a declared
+ * output, which ninja re-stats after the step ran. A file no edge declares
+ * is stat'd once at startup, so a compile that includes it picks up a rerun
+ * of the step one build late. That is why emitBindgen declares
+ * the per-file Generated*.h headers and not just the .cpp that gets compiled.
+ *
+ * Files nothing compiles may stay undeclared (bundle-modules' eval/ dir). The .d.ts files src/js is
+ * typechecked against are declared, in cfg.typesDir: see `generatedTypes`. The remaining
+ * #included exception is BunBuiltinNames+extras.h from bundle-functions.ts,
+ * reached through the PCH.
+ */
+
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { basename, dirname, relative, resolve } from "node:path";
+import type { Sources } from "../glob-sources.ts";
+import { builtinUsesArguments, emitAotCodegen, guardInputs, hashTableInputs, type EngineSources } from "./aot.ts";
+import { generateBuildOptionsRs } from "./buildOptionsRs.ts";
+import { webkitVersionName, type CodegenFields } from "./config.ts";
+import { BuildError, assert } from "./error.ts";
+import { writeIfChanged } from "./fs.ts";
+import { generateJsonByteClass } from "./jsonByteClass.ts";
+import type { Ninja } from "./ninja.ts";
+import { quote, quoteArgs } from "./shell.ts";
+import { generateXmlByteClass } from "./xmlByteClass.ts";
+
+// The individual emit functions take these four params. Bundled to keep
+// signatures short.
+export interface Ctx {
+  n: Ninja;
+  cfg: CodegenFields;
+  sources: Sources;
+  o: CodegenOutputs;
+  dirStamp: string;
+  /** The JavaScriptCore this graph builds against (deps/webkit.ts webkitEngineSources). Undefined: the graph has none (`mode: "codegen"`). */
+  engine?: EngineSources | undefined;
+}
+
+/**
+ * Read a package.json and return the node_modules/<dep> entries it installs.
+ * Used as outputs of `bun install` — if any are missing, install re-runs.
+ * The entry itself, not a file inside it: ninja creates the parent directory
+ * of every declared output before running the edge, and a pre-created
+ * node_modules/<dep>/ directory is exactly what makes bun's isolated linker
+ * skip the symlink it would have put there.
+ */
+function readPackageDeps(pkgDir: string): string[] {
+  const pkgPath = resolve(pkgDir, "package.json");
+  let pkg: { dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
+  try {
+    pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as typeof pkg;
+  } catch (cause) {
+    throw new BuildError(`Could not parse package.json`, { file: pkgPath, cause });
+  }
+  const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
+  const nodeModules = resolve(pkgDir, "node_modules");
+  return Object.keys(deps).map(name => resolve(nodeModules, name));
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Ninja rule registration
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Node-style platform/arch strings for the TARGET (not the host running
+ * codegen). Passed as TARGET_PLATFORM/TARGET_ARCH so scripts that inline
+ * `process.platform` into bundled JS use the target's value.
+ */
+function codegenTarget(cfg: CodegenFields): { platform: string; arch: string } {
+  const platform =
+    cfg.abi === "android"
+      ? "android"
+      : cfg.os === "darwin"
+        ? "darwin"
+        : cfg.os === "windows"
+          ? "win32"
+          : cfg.os === "freebsd"
+            ? "freebsd"
+            : "linux";
+  const arch = cfg.x64 ? "x64" : "arm64";
+  return { platform, arch };
+}
+
+export function registerCodegenRules(n: Ninja, cfg: CodegenFields): void {
+  // Shell syntax: HOST platform, not target; these rules run on the host.
+  const hostWin = cfg.host.os === "windows";
+  const q = (p: string) => quote(p, hostWin);
+  const bun = q(cfg.bun);
+  const esbuild = q(cfg.esbuild);
+  const { platform, arch } = codegenTarget(cfg);
+
+  // Generic codegen: `cd <cwd> && [env VARS] <runtime> <args>`.
+  //
+  // `codegen` runs the script with cfg.jsRuntime, the runtime that runs
+  // configure (node in CI, bun for `bun bd`). So its scripts must run
+  // under both. `codegen_bun` is for the scripts that still need bun.
+  // Its $args can start with a bun subcommand (`run`, `build`).
+  //
+  // TARGET_PLATFORM/ARCH: scripts that inline process.platform into the
+  // bundled JS modules (replacements.ts, bundle-modules.ts,
+  // create-hash-table.ts) read these so a cross-compiled binary doesn't
+  // ship with the build host's platform baked in.
+  //
+  // restat = 1 because the scripts use writeIfNotChanged().
+  const env = hostWin
+    ? `set TARGET_PLATFORM=${platform}&& set TARGET_ARCH=${arch}&& `
+    : `TARGET_PLATFORM=${platform} TARGET_ARCH=${arch} `;
+  const codegenCommand = (runtime: string) =>
+    hostWin ? `cmd /c "cd /d $cwd && ${env}${runtime} $args"` : `cd $cwd && ${env}${runtime} $args`;
+  n.rule("codegen", {
+    command: codegenCommand(cfg.jsRuntime),
+    description: "gen $desc",
+    restat: true,
+  });
+  n.rule("codegen_bun", {
+    command: codegenCommand(bun),
+    description: "gen $desc",
+    restat: true,
+  });
+
+  // esbuild invocations. No restat — esbuild always touches outputs.
+  // No pool — esbuild is fast and single-threaded per bundle.
+  n.rule("esbuild", {
+    command: hostWin ? `cmd /c "cd /d $cwd && ${esbuild} $args"` : `cd $cwd && ${esbuild} $args`,
+    description: "esbuild $desc",
+  });
+
+  // bun install. Inputs: package.json + bun.lock. Outputs: a stamp file we
+  // touch on success, plus each node_modules/<dep> entry as IMPLICIT outputs
+  // (so deleting node_modules/ correctly retriggers install).
+  //
+  // Why stamp + restat instead of just the node_modules paths as outputs:
+  // `bun install --frozen-lockfile` with no changes doesn't touch anything.
+  // If package.json was edited at time T and install ran at T-1day, the
+  // node_modules files have mtimes from T-1day < T → ninja loops forever.
+  // Touching the stamp gives ninja something with mtime T to compare against.
+  // Restat lets implicit outputs keep their old mtimes, pruning downstream.
+  //
+  // CMake only tracked package.json as input; we add bun.lock so lockfile
+  // version bumps actually reinstall.
+  const touch = hostWin ? "type nul >" : "touch";
+  n.rule("bun_install", {
+    command: hostWin
+      ? `cmd /c "cd /d $dir && ${bun} install --frozen-lockfile && ${touch} $stamp"`
+      : `cd $dir && ${bun} install --frozen-lockfile && ${touch} $stamp`,
+    description: "install $dir",
+    restat: true,
+    // bun install can be memory-hungry and grabs a lockfile; serialize.
+    pool: "bun_install",
+  });
+  n.pool("bun_install", 1);
+
+  // `--package-manager=npm` installs each package.json with `npm ci`.
+  // npm-ci.ts writes package-lock.json from bun.lock for the duration of the
+  // install and deletes it after. `npm ci` replaces node_modules, so a tree
+  // that `bun install` wrote does not get in the way.
+  if (cfg.npm !== undefined) {
+    const npmCi = `${cfg.jsRuntime} ${q(resolve(cfg.cwd, "scripts", "build", "npm-ci.ts"))} ${q(cfg.npm)} $dir`;
+    n.rule("npm_install", {
+      command: hostWin ? `cmd /c "${npmCi} && ${touch} $stamp"` : `${npmCi} && ${touch} $stamp`,
+      description: "npm install $dir",
+      restat: true,
+      pool: "bun_install",
+    });
+  }
+
+  // Codegen dir stamp — all outputs go into cfg.codegenDir, but the dir must
+  // exist first. Scripts generally mkdir themselves, but some (esbuild) don't.
+  n.build({
+    outputs: [codegenDirStamp(cfg)],
+    rule: "mkdir_stamp",
+    inputs: [],
+    vars: { dir: n.rel(cfg.codegenDir) },
+  });
+
+  // Stamps dir — holds bun_install stamp files.
+  const stampsDir = resolve(cfg.buildDir, "stamps");
+  n.build({
+    outputs: [resolve(stampsDir, ".dir")],
+    rule: "mkdir_stamp",
+    inputs: [],
+    vars: { dir: n.rel(stampsDir) },
+  });
+}
+
+function codegenDirStamp(cfg: CodegenFields): string {
+  return resolve(cfg.codegenDir, ".dir");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Codegen step emitters
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * All codegen outputs, grouped by consumer. Downstream phases (cpp compile,
+ * rust build, link) add the appropriate group to their implicit inputs.
+ */
+export interface CodegenOutputs {
+  /** All codegen outputs — use for phony target `codegen`. */
+  all: string[];
+
+  /**
+   * The generated TypeScript a typecheck needs: phony target `generated-types`. The type declarations
+   * `src/js/builtins.d.ts` references, in cfg.typesDir, and `src/runtime/bake/generated.ts`. Made from
+   * source alone, so every profile's graph declares the same files (like a dep's `vendor/<name>/.ref`).
+   */
+  generatedTypes: string[];
+
+  /**
+   * Outputs a Rust crate reads (`include!`, `include_bytes!`), or needs to exist. The crates' edges are ordered
+   * after all of them (rust.ts); which crate recompiles when one changes comes from rustc's dep-info.
+   */
+  rustInputs: string[];
+
+  /** Generated .cpp files. Compiled alongside handwritten C++ in bun.ts. */
+  cppSources: string[];
+
+  /** Those of `cppSources` that are the table of built-ins. JavaScriptCore names its symbols, so WebKit's own programs link the objects too. */
+  builtinTableSources: string[];
+
+  /**
+   * Generated headers that are #included by hand-written .cpp files.
+   * The PCH order-depends on all of these, and cxx waits on PCH — so
+   * they're guaranteed to exist before any compile. Depfile tracking
+   * handles subsequent changes.
+   */
+  cppHeaders: string[];
+
+  /**
+   * ALL cpp-relevant codegen outputs — the union of cppHeaders and
+   * cppSources. cxx compilation order-depends on THIS (not `all`): cxx
+   * doesn't need bake.*.js, runtime.out.js, or any other rust-side embedded
+   * outputs: those are inputs of the Rust crates, not of any C++ object.
+   *
+   * The "undeclared .h files" issue (some scripts emit .h alongside their
+   * declared outputs): those steps also emit a .cpp or .h that IS declared
+   * here, so they still run before any cxx compile.
+   */
+  cppAll: string[];
+
+  /**
+   * The InternalModuleRegistryConstants.S path — compiled via cc() in bun.ts
+   * and linked alongside the C++ objects. Carries the concatenated JS module
+   * sources as a `.incbin` of the sibling `.bin`.
+   */
+  internalModulesAsm: string;
+  /** The `.incbin`'d blob — implicit input to the `.S` compile edge. */
+  internalModulesBin: string;
+
+  /** What src/builtin_sources/archive.S `.incbin`s. Undefined in a graph without an engine. */
+  builtinSourcesArchive?: string;
+
+  /** The bundled text of src/runtime.bun.js. */
+  bundledHelpers: string;
+
+  /**
+   * Stamp output from `bun install` at repo root.
+   * The esbuild tool and the cppbind lezer parser live here. Any
+   * step that uses esbuild (or imports node_modules deps at configure
+   * time) depends on this.
+   */
+  rootInstall: string;
+}
+
+/**
+ * Emit all codegen steps. Returns grouped outputs for downstream wiring.
+ *
+ * Call after registerCodegenRules() and after registerDirStamps() (we use
+ * the `mkdir_stamp` rule for the codegen dir).
+ */
+export function emitCodegen(n: Ninja, cfg: CodegenFields, sources: Sources, engine?: EngineSources): CodegenOutputs {
+  n.comment("─── Codegen ───");
+  n.blank();
+
+  const dirStamp = codegenDirStamp(cfg);
+
+  // ─── Root install (provides esbuild + lezer-cpp for cppbind) ───
+  const rootInstall = emitPackageInstall(n, cfg, cfg.cwd);
+
+  const o: CodegenOutputs = {
+    all: [],
+    generatedTypes: [],
+    rustInputs: [],
+    cppSources: [],
+    builtinTableSources: [],
+    cppHeaders: [],
+    cppAll: [],
+    internalModulesAsm: resolve(cfg.codegenDir, "InternalModuleRegistryConstants.S"),
+    internalModulesBin: resolve(cfg.codegenDir, "InternalModuleRegistryConstants.bin"),
+    bundledHelpers: resolve(cfg.codegenDir, "runtime.out.js"),
+    rootInstall,
+  };
+
+  const ctx: Ctx = { n, cfg, sources, o, dirStamp, engine };
+
+  // Configure-time write (not a ninja edge — it's a constant manifest like
+  // depVersionsHeader). bun_core `include!`s it, and bun_core/build.rs emits the
+  // matching `rerun-if-changed`.
+  const buildOptionsRs = generateBuildOptionsRs(cfg);
+  o.all.push(buildOptionsRs);
+  o.rustInputs.push(buildOptionsRs);
+
+  // Same shape: the JSON byte-classification tables, consumed by both the
+  // Highway kernel (.h) and the Rust scalar indexer (.rs).
+  const jsonByteClass = generateJsonByteClass(cfg);
+  o.all.push(jsonByteClass.h, jsonByteClass.rs);
+  o.rustInputs.push(jsonByteClass.rs);
+  o.cppHeaders.push(jsonByteClass.h);
+  const xmlByteClass = generateXmlByteClass(cfg);
+  o.all.push(xmlByteClass.h, xmlByteClass.rs);
+  o.rustInputs.push(xmlByteClass.rs);
+  o.cppHeaders.push(xmlByteClass.h);
+
+  emitAotCodegen(ctx);
+  emitBunError(ctx);
+  emitStringMaps(ctx);
+  emitRuntimeJs(ctx);
+  emitNodeFallbacks(ctx);
+  emitErrorCode(ctx);
+  emitHostExports(ctx);
+  emitCppBind(ctx);
+  emitJsModules(ctx);
+  emitBakeCodegen(ctx);
+  emitBindgen(ctx);
+  emitObjectLuts(ctx);
+  emitLintDocs(ctx);
+  emitCompressedEmbeds(ctx);
+
+  n.phony("codegen", o.all);
+  n.phony("generated-types", o.generatedTypes);
+  n.blank();
+
+  // Assemble cppAll — the cxx-relevant subset. See field docstring.
+  o.cppAll = [...new Set([...o.cppHeaders, ...o.cppSources])];
+
+  return o;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Helpers
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Emit the install step for a package directory, with `cfg.packageManager`. Returns the stamp file
+ * path — use it as an implicit input on anything that needs node_modules/.
+ *
+ * The stamp is the explicit output; each node_modules/<dep> entry is an
+ * implicit output (so deleting node_modules/ correctly retriggers install,
+ * and restat prunes downstream when install was a no-op).
+ */
+function emitPackageInstall(n: Ninja, cfg: CodegenFields, pkgDir: string): string {
+  const rule = cfg.packageManager === "npm" ? "npm_install" : "bun_install";
+  const depPackageJsons = readPackageDeps(pkgDir);
+  assert(depPackageJsons.length > 0, `package.json has no dependencies: ${pkgDir}/package.json`);
+
+  const pkgJson = resolve(pkgDir, "package.json");
+  const lockfile = resolve(pkgDir, "bun.lock");
+  // bun.lock is optional (some packages might not have one yet), but if it
+  // exists it MUST be an input — lockfile bumps reinstall.
+  const inputs = [pkgJson];
+  try {
+    readFileSync(lockfile); // exists check
+    inputs.push(lockfile);
+  } catch {
+    // no lockfile, that's fine
+  }
+
+  // Stamp lives in the build dir, not the package dir — keeps the source
+  // tree clean and makes `rm -rf build/` fully reset install state.
+  // Uniqueify by hashing the package dir path (multiple installs possible).
+  const stampName = pkgDir.replace(/[^A-Za-z0-9]+/g, "_");
+  const stamp = resolve(cfg.buildDir, "stamps", `install_${stampName}.stamp`);
+
+  n.build({
+    outputs: [stamp],
+    implicitOutputs: depPackageJsons,
+    rule,
+    inputs,
+    implicitInputs: rule === "npm_install" ? [resolve(cfg.cwd, "scripts", "build", "npm-ci.ts")] : [],
+    orderOnlyInputs: [resolve(cfg.buildDir, "stamps", ".dir")],
+    // stamp must be absolute — the command `cd $dir && ... && touch $stamp`
+    // runs from $dir, not from buildDir. n.rel() would break that.
+    vars: { dir: pkgDir, stamp },
+  });
+
+  return stamp;
+}
+
+/**
+/** `--debug=ON` / `--debug=OFF` flag used by several scripts. */
+export function debugFlag(cfg: CodegenFields): string {
+  return cfg.debug ? "--debug=ON" : "--debug=OFF";
+}
+
+/**
+ * Shell-quote args for a codegen rule command string. These rules wrap in
+ * `cmd /c` on a Windows HOST, so quoting follows the host shell.
+ */
+export function shJoin(cfg: CodegenFields, args: string[]): string {
+  return quoteArgs(args, cfg.host.os === "windows");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Individual step emitters
+// ───────────────────────────────────────────────────────────────────────────
+
+function emitBunError({ n, cfg, sources, o, dirStamp }: Ctx): void {
+  const sourceDir = resolve(cfg.cwd, "packages", "bun-error");
+  const installStamp = emitPackageInstall(n, cfg, sourceDir);
+
+  const outDir = resolve(cfg.codegenDir, "bun-error");
+  const outputs = [resolve(outDir, "index.js"), resolve(outDir, "bun-error.css")];
+
+  n.build({
+    outputs,
+    rule: "esbuild",
+    inputs: sources.bunError,
+    // Install stamp as implicit — changing preact version re-bundles.
+    // Root install as well (esbuild tool lives there).
+    implicitInputs: [installStamp, o.rootInstall],
+    orderOnlyInputs: [dirStamp],
+    vars: {
+      cwd: sourceDir,
+      desc: "bun-error",
+      args: shJoin(cfg, [
+        "index.tsx",
+        "bun-error.css",
+        `--outdir=${outDir}`,
+        `--define:process.env.NODE_ENV="production"`,
+        "--minify",
+        "--bundle",
+        "--platform=browser",
+        "--format=esm",
+      ]),
+    },
+  });
+
+  o.all.push(...outputs);
+  o.rustInputs.push(...outputs);
+}
+
+/**
+ * zstd-compressed twins of assets that Bun never executes or parses itself —
+ * the shell completion scripts and the JS/CSS bundles that are only ever
+ * shipped to a browser (dev-server client runtime, error overlay, error page).
+ * Release builds embed these via `bun_zstd::embed_compressed!` and inflate on
+ * first use instead of carrying the plain text in `.rodata`. Anything that runs
+ * inside Bun (builtin modules, bake.server.js, FFI headers, …) stays as-is,
+ * except text that only `bun lint`, `bun fmt` and `bun check` read.
+ * Output: `<codegenDir>/compressed/<name>.zst`.
+ */
+function emitCompressedEmbeds({ n, cfg, o, dirStamp }: Ctx): void {
+  const script = resolve(cfg.cwd, "src", "codegen", "compress-embed.ts");
+  const assets: { inputs: string[]; name: string }[] = [
+    // Repo files, named by repo-relative path.
+    ...[
+      "completions/bun.bash",
+      "completions/bun.zsh",
+      "completions/bun.fish",
+      "src/runtime/bake/bun-framework-react/client.tsx",
+      "src/runtime/bake/bun-bake-react/client.tsx",
+      "src/lint/linter/config/presets.txt",
+      "src/lint/linter/deprecated.txt",
+      "src/lint/linter/schema/schemas.txt",
+      "src/lint/oxlint_help.txt",
+      "src/sema/messages.txt",
+      "src/lint/js_plugin/worker/eslint_patch.js",
+    ].map(rel => ({ inputs: [resolve(cfg.cwd, rel)], name: rel })),
+    // Codegen outputs (browser bundles, lint rule docs), named `codegen/<path in codegenDir>`.
+    ...[
+      "bake.client.js",
+      "bake.error.js",
+      "bun-error/index.js",
+      "bun-error/bun-error.css",
+      "node-fallbacks/react-refresh.js",
+      ...LINT_DOCS,
+    ].map(rel => ({ inputs: [resolve(cfg.codegenDir, rel)], name: `codegen/${rel}` })),
+    // Files that are read together share a frame. The Rust side relies on the order.
+    {
+      name: "lint/plugin-host.js",
+      inputs: ["paths.js", "ast.js", "scope.js", "processor.js", "eslint.js", "prettier.js", "main.js"].map(file =>
+        resolve(cfg.cwd, "src/lint/js_plugin/worker", file),
+      ),
+    },
+    {
+      name: "lint/config-scripts.js",
+      inputs: [
+        "evaluate-start.js",
+        "evaluate-describe.js",
+        "evaluate-stand-ins.js",
+        "evaluate-eslint.js",
+        "evaluate-eslintrc.js",
+        "fmt/evaluate-prettier.js",
+        "fmt/tailwind.js",
+      ].map(file => resolve(cfg.cwd, "src/lint/driver", file)),
+    },
+  ];
+  for (const { inputs, name } of assets) {
+    const out = resolve(cfg.codegenDir, "compressed", `${name}.zst`);
+    n.build({
+      outputs: [out],
+      rule: "codegen",
+      inputs: [script, ...inputs],
+      orderOnlyInputs: [dirStamp],
+      vars: { cwd: cfg.cwd, desc: `compressed/${name}.zst`, args: shJoin(cfg, [script, out, ...inputs]) },
+    });
+    o.all.push(out);
+    // Debug reads the originals at runtime; only release embeds these.
+    o.rustInputs.push(out);
+  }
+}
+
+/** The text that `bun lint --rules` and `bun lint --explain` print. Written to `codegenDir`. */
+const LINT_DOCS = ["lint-rule-pages.txt"];
+
+function emitLintDocs({ n, cfg, sources, o, dirStamp }: Ctx): void {
+  const script = resolve(cfg.cwd, "src", "codegen", "generate-lint-docs.ts");
+  const outputs = LINT_DOCS.map(name => resolve(cfg.codegenDir, name));
+  n.build({
+    outputs,
+    rule: "codegen",
+    inputs: [script, ...sources.lintRuleDocs],
+    orderOnlyInputs: [dirStamp],
+    vars: {
+      cwd: cfg.cwd,
+      desc: "lint-rule-pages.txt",
+      args: shJoin(cfg, [script, resolve(cfg.cwd, "docs", "lint", "rules"), ...outputs]),
+    },
+  });
+  o.all.push(...outputs);
+  o.rustInputs.push(...outputs);
+}
+
+function emitRuntimeJs({ n, cfg, o, dirStamp }: Ctx): void {
+  const src = resolve(cfg.cwd, "src", "runtime.bun.js");
+  const out = o.bundledHelpers;
+
+  n.build({
+    outputs: [out],
+    rule: "esbuild",
+    inputs: [src],
+    // runtime.bun.js re-exports it.
+    implicitInputs: [resolve(cfg.cwd, "src", "runtime.js"), o.rootInstall],
+    orderOnlyInputs: [dirStamp],
+    vars: {
+      cwd: cfg.cwd,
+      desc: "runtime.out.js",
+      args: shJoin(cfg, [
+        src,
+        `--outfile=${out}`,
+        `--define:process.env.NODE_ENV="production"`,
+        "--target=esnext",
+        "--bundle",
+        "--format=esm",
+        "--platform=node",
+        "--minify",
+        "--external:/bun:*",
+      ]),
+    },
+  });
+
+  o.all.push(out);
+  o.rustInputs.push(out);
+}
+
+function emitNodeFallbacks({ n, cfg, sources, o, dirStamp }: Ctx): void {
+  const sourceDir = resolve(cfg.cwd, "src", "node-fallbacks");
+  const installStamp = emitPackageInstall(n, cfg, sourceDir);
+
+  const outDir = resolve(cfg.codegenDir, "node-fallbacks");
+  // Two outputs per source: the bundled `.js` (read at runtime by debug
+  // builds) and its zstd-compressed `.js.zst` twin (embedded by release
+  // builds — see src/resolver/node_fallbacks.rs).
+  const jsOutputs = sources.nodeFallbacks.map(s => resolve(outDir, basename(s)));
+  const outputs = [...jsOutputs, ...jsOutputs.map(o => `${o}.zst`)];
+
+  // The script (build-fallbacks.ts) reads its args as [outdir, ...sources]
+  // but actually ignores the sources — it does readdirSync(".") to discover
+  // files. We pass them anyway so ninja tracks them as inputs.
+  const script = resolve(sourceDir, "build-fallbacks.ts");
+  n.build({
+    outputs,
+    rule: "codegen_bun",
+    inputs: [script, ...sources.nodeFallbacks],
+    implicitInputs: [installStamp],
+    orderOnlyInputs: [dirStamp],
+    vars: {
+      cwd: sourceDir,
+      desc: "node-fallbacks/*.js",
+      // `bun run build-fallbacks` resolves to `./build-fallbacks.ts` in cwd
+      args: shJoin(cfg, ["run", "build-fallbacks", outDir, ...sources.nodeFallbacks]),
+    },
+  });
+
+  o.all.push(...outputs);
+  o.rustInputs.push(...outputs);
+
+  // ─── react-refresh (separate bundle, uses node-fallbacks' node_modules) ───
+  const rrSrc = resolve(sourceDir, "node_modules", "react-refresh", "cjs", "react-refresh-runtime.development.js");
+  const rrOut = resolve(outDir, "react-refresh.js");
+  n.build({
+    outputs: [rrOut],
+    rule: "codegen_bun",
+    inputs: [resolve(sourceDir, "package.json"), resolve(sourceDir, "bun.lock")],
+    implicitInputs: [installStamp],
+    orderOnlyInputs: [dirStamp],
+    vars: {
+      cwd: sourceDir,
+      desc: "node-fallbacks/react-refresh.js",
+      args: shJoin(cfg, [
+        "build",
+        rrSrc,
+        `--outfile=${rrOut}`,
+        "--target=browser",
+        "--format=cjs",
+        "--minify",
+        `--define:process.env.NODE_ENV="development"`,
+      ]),
+    },
+  });
+
+  o.all.push(rrOut);
+  o.rustInputs.push(rrOut);
+}
+
+/**
+ * `*.string-map.ts` → length-bucketed lookup fns (`generate-string-map.ts`).
+ * Output lands **in-tree** as `<dir>/<stem>.generated.rs` (checked in) so
+ * plain `cargo check` / rust-analyzer work without `BUN_CODEGEN_DIR` or a
+ * per-crate `build.rs`. The `.string-map.ts` is the source of truth; the
+ * `.generated.rs` is a deterministic artifact. A stale checked-in copy is
+ * regenerated and pushed back to the PR by the autofix workflow
+ * (.github/workflows/format.yml runs `codegen:string-maps` with the
+ * formatters); `bun run codegen:verify` is the local equivalent. `restat = 1`
+ * on the codegen rule + `writeIfNotChanged` in the script keep this a no-op
+ * when unchanged.
+ */
+function emitStringMaps({ n, cfg, sources, o, dirStamp }: Ctx): void {
+  const script = resolve(cfg.cwd, "src", "codegen", "generate-string-map.ts");
+  for (const src of sources.stringMaps) {
+    // `src/js_parser/defines_table.string-map.ts` → `src/js_parser/defines_table.generated.rs`
+    const stem = basename(src).replace(/\.string-map\.ts$/, "");
+    const out = resolve(dirname(src), `${stem}.generated.rs`);
+    n.build({
+      outputs: [out],
+      rule: "codegen",
+      inputs: [script, src],
+      orderOnlyInputs: [dirStamp],
+      vars: {
+        cwd: cfg.cwd,
+        desc: `string-map ${stem}`,
+        args: shJoin(cfg, [script, src, out]),
+      },
+    });
+    o.all.push(out);
+    o.rustInputs.push(out);
+  }
+}
+
+function emitErrorCode({ n, cfg, o, dirStamp }: Ctx): void {
+  const script = resolve(cfg.cwd, "src", "codegen", "generate-node-errors.ts");
+  const inputs = [
+    script,
+    resolve(cfg.cwd, "src", "jsc", "bindings", "ErrorCode.ts"),
+    // ErrorCode.cpp/.h are listed in CMake but the script doesn't read them;
+    // they're there so changes to the handwritten side (e.g. new error
+    // category added to the C++ enum) invalidate this step. We include them
+    // for the same reason.
+    resolve(cfg.cwd, "src", "jsc", "bindings", "ErrorCode.cpp"),
+    resolve(cfg.cwd, "src", "jsc", "bindings", "ErrorCode.h"),
+    // Read by the script: ErrorCode.d.ts leaves out every $ERR_* that builtins.d.ts declares by hand.
+    resolve(cfg.cwd, "src", "js", "builtins.d.ts"),
+  ];
+
+  const cppOutputs = [resolve(cfg.codegenDir, "ErrorCode+List.h"), resolve(cfg.codegenDir, "ErrorCode+Data.h")];
+  const rustOutput = resolve(cfg.codegenDir, "ErrorCode.generated.rs");
+  const types = resolve(cfg.typesDir, "ErrorCode.d.ts");
+  const outputs = [...cppOutputs, rustOutput, types];
+
+  n.build({
+    outputs,
+    rule: "codegen",
+    inputs,
+    orderOnlyInputs: [dirStamp],
+    vars: {
+      cwd: cfg.cwd,
+      desc: "ErrorCode+*.h",
+      args: shJoin(cfg, [script, cfg.codegenDir, cfg.typesDir]),
+    },
+  });
+
+  o.all.push(...outputs);
+  o.generatedTypes.push(types);
+  o.rustInputs.push(...cppOutputs, rustOutput);
+  o.cppHeaders.push(...cppOutputs);
+}
+
+/** What says which types a native member may declare. */
+const declaredTypeInputs = (cfg: Ctx["cfg"]): string[] => [
+  resolve(cfg.cwd, "src", "codegen", "declared-type-checks.ts"),
+];
+function emitHostExports({ n, cfg, sources, o, dirStamp }: Ctx): void {
+  const script = resolve(cfg.cwd, "src", "codegen", "generate-host-exports.ts");
+  const output = resolve(cfg.codegenDir, "generated_host_exports.rs");
+
+  // Inputs: every .rs under src/runtime + src/jsc + src/http_jsc (the scrape scope). The
+  // `sources.rust` glob already covers these plus Cargo manifests; filter to
+  // those crates so unrelated edits (e.g. src/bundler) don't re-run the
+  // scrape. restat=1 + writeIfNotChanged means a no-marker-change edit
+  // produces identical output and nothing downstream rebuilds.
+  const slashed = (p: string) => p.replace(/\\/g, "/");
+  const scrapeDirs = [
+    slashed(`${cfg.cwd}/src/runtime/`),
+    slashed(`${cfg.cwd}/src/jsc/`),
+    slashed(`${cfg.cwd}/src/http_jsc/`),
+  ];
+  const rsInputs = sources.rust.filter(p => {
+    const q = slashed(p);
+    return q.endsWith(".rs") && scrapeDirs.some(d => q.includes(d)) && !q.endsWith("generated_host_exports.rs");
+  });
+
+  n.build({
+    outputs: [output],
+    rule: "codegen",
+    inputs: [script],
+    implicitInputs: rsInputs,
+    orderOnlyInputs: [dirStamp],
+    vars: {
+      cwd: cfg.cwd,
+      desc: "generated_host_exports.rs",
+      args: shJoin(cfg, [script, cfg.codegenDir]),
+    },
+  });
+
+  o.all.push(output);
+  // bun_runtime `include!`s this file, so the workspace crate edges must wait
+  // on it — `rustInputs` is the list they are ordered after (rust.ts).
+  o.rustInputs.push(output);
+}
+
+function emitCppBind({ n, cfg, sources, o, dirStamp }: Ctx): void {
+  const script = resolve(cfg.cwd, "src", "codegen", "cppbind.ts");
+
+  const outputRs = resolve(cfg.codegenDir, "cpp.rs");
+
+  // Write the .cpp file list for cppbind to scan. Build system owns the
+  // glob (glob-sources.ts); we hand the result to cppbind
+  // as an explicit input instead of it reading a magic hardcoded path.
+  // Relative paths, forward slashes — same format cppbind expects.
+  //
+  // Written at CONFIGURE time (not via a ninja rule): it's a derived
+  // manifest from our glob, and we want writeIfChanged semantics so a
+  // stable .cpp set → unchanged mtime → ninja doesn't re-run cppbind.
+  // codegenDir may not exist yet on first configure — mkdir it.
+  mkdirSync(cfg.codegenDir, { recursive: true });
+  const cxxSourcesFile = resolve(cfg.codegenDir, "cxx-sources.txt");
+  const cxxSourcesLines = sources.cxx.map(p => relative(cfg.cwd, p).replace(/\\/g, "/"));
+  writeIfChanged(cxxSourcesFile, cxxSourcesLines.join("\n") + "\n");
+
+  n.build({
+    outputs: [outputRs],
+    rule: "codegen",
+    inputs: [script],
+    // cppbind scans ALL .cpp files for [[ZIG_EXPORT]] annotations. Every
+    // .cpp is an implicit input so changing an annotation retriggers.
+    // ~540 files — ninja handles this fine via .ninja_deps stat caching.
+    // cxxSourcesFile also listed — if the list itself changes (file
+    // added/removed), that's a different input set.
+    implicitInputs: [
+      cxxSourcesFile,
+      ...sources.cxx,
+      ...sources.jsCodegen,
+      // cppbind imports @lezer/cpp from the root install. The stamp also
+      // catches lezer version bumps.
+      o.rootInstall,
+    ],
+    orderOnlyInputs: [dirStamp],
+    vars: {
+      cwd: cfg.cwd,
+      desc: "cpp.rs (cppbind)",
+      // cppbind.ts takes: <srcdir> <codegendir> <cxx-sources>.
+      args: shJoin(cfg, [script, resolve(cfg.cwd, "src"), cfg.codegenDir, cxxSourcesFile]),
+    },
+  });
+
+  o.all.push(outputRs);
+  // bun_jsc `include!`s cpp.rs.
+  o.rustInputs.push(outputRs);
+}
+
+function emitJsModules({ n, cfg, sources, o, dirStamp, engine }: Ctx): void {
+  const script = resolve(cfg.cwd, "src", "codegen", "bundle-modules.ts");
+
+  // InternalModuleRegistry.cpp is read by the script (for a sanity check).
+  const extraInput = resolve(cfg.cwd, "src", "jsc", "bindings", "InternalModuleRegistry.cpp");
+  // replacements.ts bakes ErrorCode.ts indices into every bundled module
+  // ($makeErrorWithCode(N, ...)); without this dep an ErrorCode.ts edit leaves
+  // stale error numbers in the JS bundles while the C++ enum regenerates.
+  const errorCodeInput = resolve(cfg.cwd, "src", "jsc", "bindings", "ErrorCode.ts");
+  // internal-module-registry-scanner.ts reads the native module ids from this file.
+  const nativeModuleListInput = resolve(cfg.cwd, "src", "jsc", "modules", "NativeModuleList.h");
+  // replacements.ts reads the native globals' names from this file.
+  const globalObjectTableInput = resolve(cfg.cwd, "src", "jsc", "bindings", "ZigGlobalObject.lut.txt");
+  // replacements.ts bakes js_classes.ts indices into every bundled module ($inherits(N, ...)).
+  const jsClassesInput = resolve(cfg.cwd, "src", "jsc", "bindings", "js_classes.ts");
+  // bundle-modules.ts hashes this header's entries into the builtins section (engineStamp).
+  const builtinNamesInput = resolve(cfg.cwd, "src", "js", "builtins", "BunBuiltinNames.h");
+
+  const outputs = [
+    resolve(cfg.codegenDir, "WebCoreJSBuiltins.cpp"),
+    resolve(cfg.codegenDir, "WebCoreJSBuiltins.h"),
+    resolve(cfg.codegenDir, "InternalModuleRegistryConstants.h"),
+    resolve(cfg.codegenDir, "InternalModuleRegistry+createInternalModuleById.h"),
+    resolve(cfg.codegenDir, "InternalModuleRegistry+enum.h"),
+    resolve(cfg.codegenDir, "InternalModuleRegistry+numberOfModules.h"),
+    resolve(cfg.codegenDir, "JSClasses+enum.h"),
+    resolve(cfg.codegenDir, "NativeModuleImpl.h"),
+    resolve(cfg.codegenDir, "SyntheticModuleType.h"),
+    resolve(cfg.codegenDir, "BuiltinModuleKeys.h"),
+    resolve(cfg.codegenDir, "GeneratedJS2Native.h"),
+    // Specifier → module-ID tag table: include!()'d by the
+    // `resolved_source_tag` module in src/jsc/lib.rs. Must be a declared
+    // output: bun_jsc's dep-info names it, and ninja can only rebuild that
+    // crate in the same build as this step if it knows the file.
+    resolve(cfg.codegenDir, "generated_resolved_source_tag.rs"),
+    // Canonical builtin key -> BuiltinModuleKeys.h index: include!()'d by `builtin_module_key_index` in src/jsc/lib.rs.
+    resolve(cfg.codegenDir, "generated_builtin_module_key_index.rs"),
+    o.internalModulesAsm,
+    o.internalModulesBin,
+  ];
+  // generated.d.ts from bundle-modules.ts, WebCoreJSBuiltins.d.ts from the bundle-functions.ts it calls.
+  const types = [resolve(cfg.typesDir, "generated.d.ts"), resolve(cfg.typesDir, "WebCoreJSBuiltins.d.ts")];
+
+  n.build({
+    outputs: [...outputs, ...types],
+    rule: "codegen_bun",
+    inputs: [
+      script,
+      ...sources.js,
+      ...sources.jsCodegen,
+      extraInput,
+      errorCodeInput,
+      nativeModuleListInput,
+      globalObjectTableInput,
+      jsClassesInput,
+      builtinNamesInput,
+    ],
+    implicitInputs: guardInputs({ cfg, engine }).filter(path => !sources.jsCodegen.includes(path)),
+    orderOnlyInputs: [dirStamp],
+    vars: {
+      cwd: cfg.cwd,
+      desc: "JS modules (bundle-modules)",
+      // Note: arg is BUILD_PATH (buildDir), not CODEGEN_PATH. The script
+      // derives CODEGEN_DIR = join(BUILD_PATH, "codegen") internally.
+      args: shJoin(cfg, [
+        "run",
+        script,
+        debugFlag(cfg),
+        cfg.buildDir,
+        cfg.typesDir,
+        typesOnlyFlag(cfg, sources),
+        `--webkit-version=${webkitVersionName(cfg.webkitVersion)}`,
+        ...builtinUsesArguments({ cfg, engine }),
+      ]),
+    },
+  });
+
+  o.all.push(...outputs, ...types);
+  o.generatedTypes.push(...types);
+  o.rustInputs.push(...outputs);
+  o.cppSources.push(outputs[0]!); // WebCoreJSBuiltins.cpp
+  o.cppHeaders.push(...outputs.filter(p => p.endsWith(".h")));
+}
+
+function emitBakeCodegen({ n, cfg, sources, o, dirStamp }: Ctx): void {
+  const script = resolve(cfg.cwd, "src", "codegen", "bake-codegen.ts");
+
+  // InternalModuleRegistry.cpp is listed as a dep in CMake for this step too.
+  // The script doesn't read it; CMake copy-paste. We skip it.
+
+  // CMake only declares bake.client.js and bake.server.js as outputs. The
+  // script also emits bake.error.js (the runtime embeds it). We declare
+  // all three.
+  //
+  // Debug uses order-only deps on these .js files (loaded at runtime,
+  // no need to relink on change). Release uses implicit (embedded into
+  // the binary, must relink).
+  const outputs = [
+    resolve(cfg.codegenDir, "bake.client.js"),
+    resolve(cfg.codegenDir, "bake.server.js"),
+    resolve(cfg.codegenDir, "bake.error.js"),
+  ];
+  // The enums of dev_server/protocol.rs as TypeScript, written beside the runtime sources that import it. It is the
+  // same in every profile, like the declarations in cfg.typesDir.
+  const generatedTs = resolve(cfg.cwd, "src", "runtime", "bake", "generated.ts");
+
+  n.build({
+    outputs: [...outputs, generatedTs],
+    rule: "codegen_bun",
+    inputs: [script, ...sources.bakeRuntime],
+    orderOnlyInputs: [dirStamp],
+    vars: {
+      cwd: cfg.cwd,
+      desc: "bake.{client,server,error}.js",
+      args: shJoin(cfg, ["run", script, debugFlag(cfg), `--codegen-root=${cfg.codegenDir}`]),
+    },
+  });
+
+  o.all.push(...outputs, generatedTs);
+  o.generatedTypes.push(generatedTs);
+  // Debug reads these at runtime; release embeds them.
+  o.rustInputs.push(...outputs);
+}
+
+/** A `*_test.bind.ts` binds what exists for tests. Only a build where Rust has `debug_assertions` has it, and none ships. */
+function isCompiled(cfg: CodegenFields, src: string): boolean {
+  return cfg.debug || cfg.assertions || !src.endsWith("_test.bind.ts");
+}
+
+export function typesOnlyFlag(cfg: CodegenFields, sources: Sources): string {
+  return `--types-only=${sources.bindgen
+    .filter(src => !isCompiled(cfg, src))
+    .map(src => basename(src))
+    .join(",")}`;
+}
+
+/** Exported for test/internal/build-codegen-declared-outputs.test.ts. */
+export function emitBindgen({ n, cfg, sources, o, dirStamp, engine }: Ctx): void {
+  const script = resolve(cfg.cwd, "src", "codegen", "bindgen.ts");
+  const crates = new Map(sources.bindgen.map(src => [src, crateOf(src)]));
+  const compiled = sources.bindgen.filter(src => isCompiled(cfg, src));
+
+  // What bindgen.ts writes follows from the names and places of its inputs alone.
+  const outputNames = compiled.map(src => `Generated${pascalCase(basename(src, ".bind.ts"))}`);
+  outputNames.forEach((name, i) => {
+    const first = outputNames.indexOf(name);
+    if (first !== i) throw new BuildError(`${compiled[first]} and ${compiled[i]} both generate ${name}.h`);
+  });
+  const cpp = outputNames.map(name => resolve(cfg.codegenDir, `${name}.cpp`));
+  const headers = [
+    ...outputNames.map(name => resolve(cfg.codegenDir, `${name}.h`)),
+    resolve(cfg.codegenDir, "GeneratedBindings+Tables.h"),
+    resolve(cfg.codegenDir, "GeneratedBindings+Counts.h"),
+    resolve(cfg.codegenDir, "GeneratedBindings+Classes.h"),
+  ];
+  const rust = [...new Set(compiled.map(src => crates.get(src)))].map(crate =>
+    resolve(cfg.codegenDir, `generated_bindgen_${crate}.rs`),
+  );
+  const types = resolve(cfg.typesDir, "Bindgen.d.ts");
+
+  n.build({
+    outputs: [...cpp, ...headers, ...rust, types],
+    rule: "codegen",
+    inputs: [...sources.bindgen, ...sources.bindgenCodegen],
+    implicitInputs: [...declaredTypeInputs(cfg), ...guardInputs({ cfg, engine })],
+    orderOnlyInputs: [dirStamp],
+    vars: {
+      cwd: cfg.cwd,
+      desc: ".bind.ts → Generated*.{cpp,h}, generated_bindgen_*.rs",
+      args: shJoin(cfg, [
+        script,
+        // Every schema: build/types is shared by every profile, so Bindgen.d.ts describes them all.
+        `--sources=${sources.bindgen.map(src => `${crates.get(src)}=${src}`).join(",")}`,
+        typesOnlyFlag(cfg, sources),
+        `--codegen-path=${cfg.codegenDir}`,
+        `--types-path=${cfg.typesDir}`,
+        ...builtinUsesArguments({ cfg, engine }),
+      ]),
+    },
+  });
+
+  o.all.push(...cpp, ...headers, ...rust, types);
+  o.generatedTypes.push(types);
+  o.rustInputs.push(...rust);
+  o.cppSources.push(...cpp);
+  o.cppHeaders.push(...headers);
+}
+
+/** `node_os` → `NodeOs`. A copy of `pascalCase()` in src/codegen/bindgen-lib-internal.ts, which node warns about importing here (MODULE_TYPELESS_PACKAGE_JSON). build-codegen-declared-outputs.test.ts holds the two together. */
+function pascalCase(s: string): string {
+  return s
+    .split(/[^A-Za-z0-9]+/)
+    .filter(part => part.length > 0)
+    .map(part => part[0]!.toUpperCase() + part.slice(1))
+    .join("");
+}
+
+/** The Cargo package whose directory contains `file`. */
+export function crateOf(file: string): string {
+  for (let dir = dirname(file); dir !== dirname(dir); dir = dirname(dir)) {
+    const manifest = resolve(dir, "Cargo.toml");
+    if (!existsSync(manifest)) continue;
+    const name = /^\s*name\s*=\s*"([^"]+)"/m.exec(readFileSync(manifest, "utf8"));
+    if (name) return name[1]!;
+  }
+  throw new BuildError(`${file} is not inside a Cargo package`);
+}
+
+/**
+ * LUT sources → .lut.h outputs. One build statement PER pair, because the
+ * script takes a single (src, out) pair.
+ *
+ * The source .cpp files contain `@begin XXXTable ... @end` blocks that the
+ * perl script parses into JSC HashTableValue arrays. The TS wrapper adds
+ * platform-specific #if preprocessing via TARGET_PLATFORM env var.
+ */
+function emitObjectLuts({ n, cfg, o, dirStamp, engine }: Ctx): void {
+  const script = resolve(cfg.cwd, "src", "codegen", "create-hash-table.ts");
+  const perlScript = resolve(cfg.cwd, "src", "codegen", "create_hash_table");
+
+  // (source, output) pairs.
+  const pairs: [src: string, out: string][] = [
+    [resolve(cfg.cwd, "src/jsc/bindings/BunObject.cpp"), resolve(cfg.codegenDir, "BunObject.lut.h")],
+    [resolve(cfg.cwd, "src/jsc/bindings/ZigGlobalObject.lut.txt"), resolve(cfg.codegenDir, "ZigGlobalObject.lut.h")],
+    [resolve(cfg.cwd, "src/jsc/bindings/JSBuffer.cpp"), resolve(cfg.codegenDir, "JSBuffer.lut.h")],
+    [resolve(cfg.cwd, "src/jsc/bindings/BunProcess.cpp"), resolve(cfg.codegenDir, "BunProcess.lut.h")],
+    [
+      resolve(cfg.cwd, "src/jsc/bindings/ProcessBindingBuffer.cpp"),
+      resolve(cfg.codegenDir, "ProcessBindingBuffer.lut.h"),
+    ],
+    [
+      resolve(cfg.cwd, "src/jsc/bindings/ProcessBindingConstants.cpp"),
+      resolve(cfg.codegenDir, "ProcessBindingConstants.lut.h"),
+    ],
+    [resolve(cfg.cwd, "src/jsc/bindings/ProcessBindingFs.cpp"), resolve(cfg.codegenDir, "ProcessBindingFs.lut.h")],
+    [
+      resolve(cfg.cwd, "src/jsc/bindings/ProcessBindingNatives.cpp"),
+      resolve(cfg.codegenDir, "ProcessBindingNatives.lut.h"),
+    ],
+    [
+      resolve(cfg.cwd, "src/jsc/bindings/ProcessBindingHTTPParser.cpp"),
+      resolve(cfg.codegenDir, "ProcessBindingHTTPParser.lut.h"),
+    ],
+    [resolve(cfg.cwd, "src/jsc/modules/NodeModuleModule.cpp"), resolve(cfg.codegenDir, "NodeModuleModule.lut.h")],
+    [resolve(cfg.cwd, "src/jsc/bindings/webcore/JSEvent.cpp"), resolve(cfg.codegenDir, "JSEvent.lut.h")],
+  ];
+
+  // create-hash-table.ts reads TARGET_PLATFORM env (set in registerCodegenRules)
+  // with process.platform fallback.
+  for (const [src, out] of pairs) {
+    n.build({
+      outputs: [out],
+      rule: "codegen",
+      inputs: [src],
+      implicitInputs: [script, perlScript, ...hashTableInputs({ cfg, engine })],
+      orderOnlyInputs: [dirStamp],
+      vars: {
+        cwd: cfg.cwd,
+        desc: basename(out),
+        args: shJoin(cfg, [script, src, out, ...builtinUsesArguments({ cfg, engine })]),
+      },
+    });
+    o.all.push(out);
+    o.cppHeaders.push(out);
+  }
+}

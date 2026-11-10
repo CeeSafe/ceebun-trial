@@ -1,0 +1,16 @@
+[package]
+name = "bun_perf"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+bun_core.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+bun_sys.workspace = true

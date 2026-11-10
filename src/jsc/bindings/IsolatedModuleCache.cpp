@@ -1,0 +1,129 @@
+#include "IsolatedModuleCache.h"
+#include "BunClientData.h"
+#include "ModuleLoader.h"
+#include "ZigGlobalObject.h"
+#include "ZigSourceProvider.h"
+#include "JavaScriptCore/JSCInlines.h"
+#include <JavaScriptCore/JSFunction.h>
+#include <JavaScriptCore/StrongInlines.h>
+#include <JavaScriptCore/UnlinkedFunctionExecutable.h>
+
+namespace Bun {
+
+#if ENABLE(AOT)
+void didCacheSource(JSC::VM&, const WTF::String& key, bool isPluginSource);
+#endif
+
+bool IsolatedModuleCache::canUse(JSC::VM&, void* bunVM, const BunString* typeAttribute)
+{
+    if (!isBunTest)
+        return false;
+    if (!Bun__VM__useIsolationSourceProviderCache(bunVM))
+        return false;
+    if (typeAttribute && !typeAttribute->isEmpty())
+        return false;
+    return true;
+}
+
+extern "C" uint64_t Bun__hashPluginContents(const EncodedSlice* contents, BunLoaderType loader);
+extern "C" bool Bun__VM__hasGlobalsOfVitest(void* bunVM);
+
+static uint64_t madeFromHash(JSC::VM& vm, const WTF::String& key, const CodeString* pluginContents)
+{
+    void* bunVM = WebCore::clientData(vm)->bunVM;
+    uint64_t hash = pluginContents ? Bun__hashPluginContents(&pluginContents->string, pluginContents->loader) : 0;
+    // An entry point is transpiled differently from an import of the same file.
+    BunString borrowedKey = Bun::toString(key);
+    if (Bun__VM__isTestEntryPoint(bunVM, &borrowedKey))
+        hash ^= 0x9e3779b97f4a7c15ULL;
+    return Bun__VM__hasGlobalsOfVitest(bunVM) ? ~hash : hash;
+}
+
+Zig::SourceProvider* IsolatedModuleCache::lookup(JSC::VM& vm, const WTF::String& key, const CodeString* pluginContents)
+{
+    auto& cache = WebCore::clientData(vm)->isolationSourceProviderCache;
+    auto it = cache.find(key);
+    if (it == cache.end())
+        return nullptr;
+    ASSERT(it->value);
+    auto* provider = static_cast<Zig::SourceProvider*>(it->value.get());
+    return provider->m_madeFromHash == madeFromHash(vm, key, pluginContents) ? provider : nullptr;
+}
+
+void IsolatedModuleCache::insert(JSC::VM& vm, const WTF::String& key, Zig::SourceProvider& provider, const CodeString* pluginContents)
+{
+    if (!isTagCacheable(static_cast<SyntheticModuleType>(provider.m_tag)) || provider.m_dependsOnMoreThanSource)
+        return;
+    provider.m_madeFromHash = madeFromHash(vm, key, pluginContents);
+    WebCore::clientData(vm)->isolationSourceProviderCache.set(key, &provider);
+#if ENABLE(AOT)
+    didCacheSource(vm, key, !!pluginContents);
+#endif
+}
+
+const IsolatedInternalModule* IsolatedModuleCache::lookupInternalModule(JSC::VM& vm, uint32_t id)
+{
+    auto& modules = WebCore::clientData(vm)->isolationInternalModules;
+    return id < modules.size() && modules[id].executable ? &modules[id] : nullptr;
+}
+
+void IsolatedModuleCache::insertInternalModule(JSC::VM& vm, uint32_t id, const JSC::SourceCode& source, JSC::UnlinkedFunctionExecutable* executable)
+{
+    auto& modules = WebCore::clientData(vm)->isolationInternalModules;
+    if (id >= modules.size())
+        modules.grow(id + 1);
+    modules[id] = { source, JSC::Strong<JSC::UnlinkedFunctionExecutable>(vm, executable) };
+}
+
+void IsolatedModuleCache::insertIfAbsent(JSC::VM& vm, const WTF::String& key, Zig::SourceProvider& provider, const CodeString* pluginContents)
+{
+    if (!lookup(vm, key, pluginContents))
+        insert(vm, key, provider, pluginContents);
+}
+
+void IsolatedModuleCache::evict(JSC::VM& vm, const WTF::String& key)
+{
+    WebCore::clientData(vm)->isolationSourceProviderCache.remove(key);
+}
+
+void IsolatedModuleCache::clear(JSC::VM& vm)
+{
+    WebCore::clientData(vm)->isolationSourceProviderCache.clear();
+}
+
+// Test-only (bun:internal-for-testing). Returns the cached provider's
+// JSC::SourceProviderSourceType name for a resolved specifier, or null when
+// the key isn't cached. Lets tests assert that transpiled ESM enters the
+// cache as BunTranspiledModule (module_info attached — record rebuilt without
+// re-parsing) rather than a plain Module.
+JSC_DEFINE_HOST_FUNCTION(jsFunctionIsolatedModuleCacheSourceType, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
+{
+    auto& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    auto key = callFrame->argument(0).toWTFString(globalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    auto* provider = IsolatedModuleCache::lookup(vm, key);
+    if (!provider)
+        return JSC::JSValue::encode(JSC::jsNull());
+    switch (provider->sourceType()) {
+    case JSC::SourceProviderSourceType::Program:
+        return JSC::JSValue::encode(JSC::jsNontrivialString(vm, "Program"_s));
+    case JSC::SourceProviderSourceType::Module:
+        return JSC::JSValue::encode(JSC::jsNontrivialString(vm, "Module"_s));
+    case JSC::SourceProviderSourceType::BunTranspiledModule:
+        return JSC::JSValue::encode(JSC::jsNontrivialString(vm, "BunTranspiledModule"_s));
+    default:
+        // Unreachable today (isTagCacheable only admits JS-ish tags, whose
+        // providers are Program/Module/BunTranspiledModule), but keep the
+        // `string | null` contract if that ever widens.
+        return JSC::JSValue::encode(JSC::jsNontrivialString(vm, "Unknown"_s));
+    }
+}
+
+JSC::JSValue createIsolatedModuleCacheSourceTypeForTesting(Zig::GlobalObject* globalObject)
+{
+    auto& vm = JSC::getVM(globalObject);
+    return JSC::JSFunction::create(vm, globalObject, 1, "isolatedModuleCacheSourceType"_s, jsFunctionIsolatedModuleCacheSourceType, JSC::ImplementationVisibility::Public);
+}
+
+} // namespace Bun

@@ -1,0 +1,3576 @@
+/**
+ *
+ * To run tests, run `bun test`
+ *
+ * @example
+ *
+ * ```bash
+ * $ bun test
+ * ```
+ *
+ * @example
+ * ```bash
+ * $ bun test <filename>
+ * ```
+ */
+declare module "bun:test" {
+  export type Mock<T extends (...args: any[]) => any> = JestMock.Mock<T>;
+
+  /**
+   * `T` with every nested function and class typed as a {@link Mock}.
+   */
+  export type Mocked<T> = T extends new (...args: infer Args) => infer Instance
+    ? Mock<(...args: Args) => Mocked<Instance>> & { prototype: Mocked<Instance> } & {
+        [K in Exclude<keyof T, "prototype">]: Mocked<T[K]>;
+      }
+    : T extends (...args: any[]) => any
+      ? Mock<T> & { [K in keyof T]: Mocked<T[K]> }
+      : T extends object
+        ? { [K in keyof T]: Mocked<T[K]> }
+        : T;
+
+  /**
+   * Returns a mocked module's exports, or a promise for them. Call `importOriginal()` to load the real module.
+   *
+   * @example
+   * ```ts
+   * vi.mock("./math", async importOriginal => ({ ...(await importOriginal()), add: vi.fn() }));
+   * ```
+   */
+  export type ModuleMockFactory<T = any> = (importOriginal: <M = T>() => Promise<M>) => any;
+
+  export interface ModuleMockOptions {
+    /**
+     * Keep each exported function's real implementation and record its calls.
+     */
+    spy?: boolean | undefined;
+  }
+
+  export const mock: {
+    /**
+     * Creates a mock function. The optional `Function` becomes the mock's implementation.
+     */
+    <T extends (...args: any[]) => any>(Function?: T): Mock<T>;
+    /**
+     * Creates a mock class. Calling the mock with `new` runs the `Class` constructor.
+     */
+    <Args extends any[], Instance>(Class: new (...args: Args) => Instance): Mock<(...args: Args) => Instance>;
+    // Repeated because `ReturnType<typeof mock>` and `Parameters<typeof mock>` use the last overload.
+    <T extends (...args: any[]) => any>(Function?: T): Mock<T>;
+
+    /**
+     * Replace the module `id` with the return value of `factory`.
+     *
+     * If the module is already loaded, exports are overwritten with the return
+     * value of `factory`. If an export didn't exist before, it is not added to
+     * existing import statements. This is a consequence of how ESM works.
+     *
+     * If the module is already loaded and `factory` returns a promise that is
+     * still pending, the exports are overwritten once it settles and the
+     * returned promise resolves after that. Otherwise nothing is returned.
+     *
+     * @param id module ID to mock
+     * @param factory a function returning an object used as the exports of the mocked module. It receives a function
+     * that loads the real module.
+     *
+     * @example
+     * ```ts
+     * import { mock } from "bun:test";
+     *
+     * mock.module("fs/promises", () => {
+     *  return {
+     *    readFile: () => Promise.resolve("hello world"),
+     *  };
+     * });
+     *
+     * import { readFile } from "fs/promises";
+     *
+     * console.log(await readFile("hello.txt", "utf8")); // hello world
+     * ```
+     */
+    module(id: string, factory: ModuleMockFactory): void | Promise<void>;
+    /**
+     * Restore the previous value of mocks.
+     */
+    restore(): void;
+
+    /**
+     * Reset all mock function state (calls, results, etc.) without restoring their original implementation.
+     */
+    clearAllMocks(): void;
+  };
+
+  /**
+   * Control the system time used by:
+   * - `Date.now()`
+   * - `new Date()`
+   * - `Intl.DateTimeFormat().format()`
+   *
+   * The real time is restored when the test file ends, unless a preload set the time.
+   *
+   * @param now The time to set the system time to. If omitted, the system time is reset
+   * @since v0.6.13
+   *
+   * ## Set Date to a specific time
+   *
+   * ```js
+   * import { setSystemTime } from 'bun:test';
+   *
+   * setSystemTime(new Date('2020-01-01T00:00:00.000Z'));
+   * console.log(new Date().toISOString()); // 2020-01-01T00:00:00.000Z
+   * ```
+   * ## Reset Date to the current time
+   *
+   * ```js
+   * import { setSystemTime } from 'bun:test';
+   *
+   * setSystemTime();
+   * ```
+   */
+  export function setSystemTime(now?: Date | number | string): void;
+
+  /**
+   * A function or clock that `useFakeTimers()` can fake. The names are the ones `@sinonjs/fake-timers` uses.
+   */
+  export type FakeableAPI =
+    | "setTimeout"
+    | "clearTimeout"
+    | "setInterval"
+    | "clearInterval"
+    | "setImmediate"
+    | "clearImmediate"
+    | "Date"
+    | "performance"
+    | "hrtime"
+    | "nextTick"
+    | "queueMicrotask"
+    | "requestAnimationFrame"
+    | "cancelAnimationFrame"
+    | "requestIdleCallback"
+    | "cancelIdleCallback"
+    | "Intl"
+    | "Temporal";
+
+  export interface FakeTimersOptions {
+    /**
+     * The time `Date` reports when the fake clock starts.
+     */
+    now?: number | Date | undefined;
+    /**
+     * Fake only these.
+     *
+     * @default ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "requestAnimationFrame", "cancelAnimationFrame", "Date", "performance", "hrtime"]
+     */
+    toFake?: FakeableAPI[] | undefined;
+    /**
+     * Don't fake these. This is Jest's name for the option.
+     */
+    doNotFake?: FakeableAPI[] | undefined;
+    /**
+     * Don't fake these. This is Vitest's name for the option.
+     */
+    toNotFake?: FakeableAPI[] | undefined;
+    /**
+     * Advance the fake clock by `advanceTimeDelta` milliseconds every `advanceTimeDelta` real milliseconds.
+     *
+     * @default false
+     */
+    shouldAdvanceTime?: boolean | undefined;
+    /**
+     * @default 20
+     */
+    advanceTimeDelta?: number | undefined;
+    /**
+     * Jest's name for `shouldAdvanceTime` (pass `true`) and `advanceTimeDelta` (pass a number).
+     */
+    advanceTimers?: boolean | number | undefined;
+    /**
+     * The number of timers `runAllTimers()` runs before it throws. Any function that moves the clock also throws
+     * after this many faked `process.nextTick` or `queueMicrotask` callbacks in a row.
+     *
+     * @default 10_000 for `vi.useFakeTimers()`, 100_000 for `jest.useFakeTimers()`
+     */
+    loopLimit?: number | undefined;
+    /**
+     * Jest's name for `loopLimit`.
+     */
+    timerLimit?: number | undefined;
+  }
+
+  export namespace jest {
+    function restoreAllMocks(): typeof jest;
+    function clearAllMocks(): typeof jest;
+    function resetAllMocks(): typeof jest;
+    function fn<T extends (...args: any[]) => any>(func?: T): Mock<T>;
+    function fn<Args extends any[], Instance>(func: new (...args: Args) => Instance): Mock<(...args: Args) => Instance>;
+    // Repeated because `ReturnType<typeof jest.fn>` and `Parameters<typeof jest.fn>` use the last overload.
+    function fn<T extends (...args: any[]) => any>(func?: T): Mock<T>;
+    /**
+     * Returns `true` if `fn` is a mock function or a spy.
+     */
+    function isMockFunction(fn: unknown): fn is Mock<(...args: any[]) => any>;
+    /**
+     * Returns `item` typed as {@link Mocked}. Does nothing at runtime.
+     */
+    function mocked<T>(item: T, options?: unknown): Mocked<T>;
+    /**
+     * Replace the module `id` with the return value of `factory`. The call is hoisted above the file's imports.
+     *
+     * Without a factory, the module is replaced with the file of the same name in a `__mocks__` directory. If there
+     * isn't one, it's replaced with a copy of the module where every function is a mock.
+     */
+    function mock(id: string, factory?: ModuleMockFactory): typeof jest;
+    /**
+     * Like {@link mock}, but the call isn't hoisted.
+     */
+    function doMock(id: string, factory?: ModuleMockFactory): typeof jest;
+    /**
+     * Stop mocking the module `id`. The call is hoisted above the file's imports.
+     */
+    function unmock(id: string): typeof jest;
+    /**
+     * Like {@link unmock}, but the call isn't hoisted.
+     */
+    function dontMock(id: string): typeof jest;
+    /**
+     * `require()` the real module `id`, even if it's mocked.
+     */
+    function requireActual<T = any>(id: string): T;
+    /**
+     * `require()` the mocked version of the module `id`, even if it isn't mocked.
+     */
+    function requireMock<T = any>(id: string): T;
+    /**
+     * `require()` the real module `id` and return a copy where every function is a mock.
+     */
+    function createMockFromModule<T = any>(id: string): Mocked<T>;
+    /**
+     * Re-evaluate each module on its next `import()` or `require()`. Mocked modules stay mocked, and their factories
+     * run again.
+     */
+    function resetModules(): typeof jest;
+    function setSystemTime(now?: number | Date | string): void;
+    function setTimeout(milliseconds: number): void;
+    /**
+     * Replace the timer functions on `globalThis` with fakes that use a fake clock. The clock only moves when the test
+     * moves it. A reference saved before this call, such as `const savedSetTimeout = setTimeout`, stays real.
+     *
+     * The real timers are restored when the test file ends, unless a preload made this call at its top level.
+     */
+    function useFakeTimers(options?: FakeTimersOptions | "modern" | "legacy"): typeof jest;
+    /**
+     * Restore the real timer functions and clocks, and discard pending fake timers.
+     */
+    function useRealTimers(): typeof jest;
+    /**
+     * Advance the fake clock and run the timers that come due.
+     */
+    function advanceTimersByTime(milliseconds: number): typeof jest;
+    /**
+     * Like {@link advanceTimersByTime}, but runs promise jobs and one turn of the real event loop between timers, so it
+     * picks up timers that a callback schedules after an `await`.
+     */
+    function advanceTimersByTimeAsync(milliseconds: number): Promise<void>;
+    /**
+     * Advance the fake clock to the next timer and run every timer due at that time. Repeats `steps` times.
+     */
+    function advanceTimersToNextTimer(steps?: number): typeof jest;
+    /**
+     * Like {@link advanceTimersToNextTimer}, but runs promise jobs and one turn of the real event loop between timers.
+     */
+    function advanceTimersToNextTimerAsync(steps?: number): Promise<void>;
+    /**
+     * Advance the fake clock to the next multiple of 16 milliseconds. That's when a faked `requestAnimationFrame` runs
+     * its callbacks.
+     */
+    function advanceTimersToNextFrame(): typeof jest;
+    /**
+     * Run timers until none are left. Throws after `timerLimit` timers.
+     */
+    function runAllTimers(): typeof jest;
+    /**
+     * Like {@link runAllTimers}, but runs promise jobs and one turn of the real event loop between timers.
+     */
+    function runAllTimersAsync(): Promise<void>;
+    /**
+     * Advance the fake clock to the last timer that's currently pending.
+     */
+    function runOnlyPendingTimers(): typeof jest;
+    /**
+     * Like {@link runOnlyPendingTimers}, but runs promise jobs and one turn of the real event loop between timers.
+     */
+    function runOnlyPendingTimersAsync(): Promise<void>;
+    /**
+     * Run the callbacks queued with a faked `process.nextTick` or `queueMicrotask`.
+     */
+    function runAllTicks(): typeof jest;
+    /**
+     * Run the callbacks queued with a faked `setImmediate`.
+     */
+    function runAllImmediates(): typeof jest;
+    /**
+     * Choose how the fake clock moves when the test doesn't move it.
+     * - `manual`: it doesn't move. This is the default.
+     * - `nextAsync`: each turn of the real event loop runs the next timer.
+     * - `interval`: it advances by `delta` milliseconds (default 20) every `delta` real milliseconds.
+     */
+    function setTimerTickMode(
+      config: { mode: "manual" | "nextAsync" } | { mode: "interval"; delta?: number | undefined },
+    ): typeof jest;
+    function getTimerCount(): number;
+    function clearAllTimers(): void;
+    function isFakeTimers(): boolean;
+    /**
+     * Returns the real time in milliseconds since the epoch, no matter what's faked.
+     */
+    function getRealSystemTime(): number;
+    function spyOn<T extends object, K extends keyof T>(obj: T, property: K, accessType: "get"): Mock<() => T[K]>;
+    function spyOn<T extends object, K extends keyof T>(
+      obj: T,
+      property: K,
+      accessType: "set",
+    ): Mock<(value: T[K]) => void>;
+    function spyOn<T extends object, K extends keyof T>(
+      obj: T,
+      methodOrPropertyValue: K,
+    ): Mock<Extract<T[K], (...args: any[]) => any>>;
+
+    /**
+     * Constructs the type of a mock function, such as the return type of `jest.fn()`.
+     */
+    type Mock<T extends (...args: any[]) => any = (...args: any[]) => any> = JestMock.Mock<T>;
+    /**
+     * Wraps a class, function or object type with Jest mock type definitions.
+     */
+    // type Mocked<T extends object> = JestMock.Mocked<T>;
+    /**
+     * Wraps a class type with Jest mock type definitions.
+     */
+    // type MockedClass<T extends JestMock.ClassLike> = JestMock.MockedClass<T>;
+    /**
+     * Wraps a function type with Jest mock type definitions.
+     */
+    // type MockedFunction<T extends (...args: any[]) => any> = JestMock.MockedFunction<T>;
+    /**
+     * Wraps an object type with Jest mock type definitions.
+     */
+    // type MockedObject<T extends object> = JestMock.MockedObject<T>;
+    /**
+     * Constructs the type of a replaced property.
+     */
+    type Replaced<T> = JestMock.Replaced<T>;
+    /**
+     * Constructs the type of a spied class or function.
+     */
+    type Spied<T extends JestMock.ClassLike | ((...args: any[]) => any)> = JestMock.Spied<T>;
+    /**
+     * Constructs the type of a spied class.
+     */
+    type SpiedClass<T extends JestMock.ClassLike> = JestMock.SpiedClass<T>;
+    /**
+     * Constructs the type of a spied function.
+     */
+    type SpiedFunction<T extends (...args: any[]) => any> = JestMock.SpiedFunction<T>;
+    /**
+     * Constructs the type of a spied getter.
+     */
+    type SpiedGetter<T> = JestMock.SpiedGetter<T>;
+    /**
+     * Constructs the type of a spied setter.
+     */
+    type SpiedSetter<T> = JestMock.SpiedSetter<T>;
+  }
+
+  /**
+   * Create a spy on a property's getter. The spy calls the original getter until you give it another implementation.
+   *
+   * @example
+   * ```ts
+   * spyOn(navigator, "userAgent", "get").mockReturnValue("test");
+   * ```
+   */
+  export function spyOn<T extends object, K extends keyof T>(obj: T, property: K, accessType: "get"): Mock<() => T[K]>;
+  /**
+   * Create a spy on a property's setter. The spy calls the original setter until you give it another implementation.
+   */
+  export function spyOn<T extends object, K extends keyof T>(
+    obj: T,
+    property: K,
+    accessType: "set",
+  ): Mock<(value: T[K]) => void>;
+  /**
+   * Create a spy on an object property or method
+   */
+  export function spyOn<T extends object, K extends keyof T>(
+    obj: T,
+    methodOrPropertyValue: K,
+  ): Mock<Extract<T[K], (...args: any[]) => any>>;
+
+  /**
+   * Vitest-compatible mocking utilities, for migrating tests from Vitest to Bun.
+   */
+  export const vi: {
+    /**
+     * Create a mock function
+     */
+    fn: typeof jest.fn;
+    /**
+     * Create a spy on an object property or method
+     */
+    spyOn: typeof spyOn;
+    isMockFunction: typeof jest.isMockFunction;
+    mocked: typeof jest.mocked;
+    /**
+     * Deeply mock `value`, the same way `vi.mock()` mocks a module when it has no factory. Returns a copy where
+     * functions and classes are mocks that return `undefined` and arrays are empty. Primitives and builtin objects are
+     * kept.
+     *
+     * With `{ spy: true }`, functions keep their implementation, arrays keep their elements, and objects are modified
+     * in place instead of copied.
+     *
+     * @example
+     * ```ts
+     * const mocked = vi.mockObject({ add: (a: number, b: number) => a + b });
+     * mocked.add(1, 2); // undefined
+     * mocked.add.mockReturnValue(3);
+     * ```
+     */
+    mockObject<T>(value: T, options?: { spy?: boolean | undefined }): Mocked<T>;
+    /**
+     * Like `vi.mock(id, factory)`, but takes `import("./math")` instead of a string, so `importOriginal` is typed as
+     * that module.
+     */
+    mock<T>(module: Promise<T>, factory?: ModuleMockFactory<T> | ModuleMockOptions): void | Promise<void>;
+    /**
+     * Replace a module with the return value of `factory`. The call is hoisted above the file's imports.
+     *
+     * Without a factory, the module is replaced with the file of the same name in a `__mocks__` directory. If there
+     * isn't one, it's replaced with a copy of the module where every function is a mock. With `{ spy: true }`, the
+     * functions keep their implementation.
+     *
+     * @example
+     * ```ts
+     * import { add } from "./math";
+     *
+     * vi.mock("./math", async importOriginal => ({ ...(await importOriginal()), add: vi.fn(() => 3) }));
+     * ```
+     */
+    mock(id: string, factory?: ModuleMockFactory | ModuleMockOptions): void | Promise<void>;
+    /**
+     * Like `vi.mock`, but the call isn't hoisted, so it only applies to imports that run after it.
+     *
+     * Disposing the return value removes the mock, as in `using _ = vi.doMock("./math", factory)`.
+     */
+    doMock(id: string, factory?: ModuleMockFactory | ModuleMockOptions): Disposable | (Disposable & Promise<void>);
+    doMock<T>(
+      module: Promise<T>,
+      factory?: ModuleMockFactory<T> | ModuleMockOptions,
+    ): Disposable | (Disposable & Promise<void>);
+    /**
+     * Stop mocking the module. The call is hoisted above the file's imports.
+     */
+    unmock(id: string | Promise<unknown>): void;
+    /**
+     * Like `vi.unmock`, but the call isn't hoisted.
+     */
+    doUnmock(id: string | Promise<unknown>): void;
+    /**
+     * Import the real module `id`, even if it's mocked.
+     */
+    importActual<T = any>(id: string): Promise<T>;
+    /**
+     * Import the mocked version of the module `id`, even if it isn't mocked.
+     */
+    importMock<T = any>(id: string): Promise<Mocked<T>>;
+    /**
+     * Re-evaluate each module on its next `import()` or `require()`. Mocked modules stay mocked.
+     */
+    resetModules(): typeof vi;
+    /**
+     * Calls `factory` and returns its result. The statement is hoisted above the file's imports, so a `vi.mock`
+     * factory can use the result.
+     *
+     * @example
+     * ```ts
+     * const mocks = vi.hoisted(() => ({ add: vi.fn() }));
+     * vi.mock("./math", () => ({ add: mocks.add }));
+     * ```
+     */
+    hoisted<T>(factory: () => T): T;
+    /**
+     * Restore every spied-on property. A `vi.spyOn()` spy keeps its recorded calls and its implementation.
+     */
+    restoreAllMocks(): typeof vi;
+    /**
+     * Clear all mock state (calls, results, etc.) without restoring original implementation
+     */
+    clearAllMocks(): typeof vi;
+    /**
+     * Clear all mock state and implementations. A `vi.fn(implementation)` mock goes back to `implementation`, and a
+     * `vi.spyOn()` spy goes back to the original. Mocks made with `jest.fn()`, `mock()` or `spyOn()` return
+     * `undefined`.
+     */
+    resetAllMocks(): typeof vi;
+    /**
+     * Replace the timer functions on `globalThis` with fakes that use a fake clock. The clock only moves when the test
+     * moves it. A reference saved before this call, such as `const savedSetTimeout = setTimeout`, stays real.
+     *
+     * The real timers are restored when the test file ends, unless a preload made this call at its top level.
+     */
+    useFakeTimers(options?: FakeTimersOptions | "modern" | "legacy"): typeof vi;
+    /**
+     * Restore the real timer functions and clocks, and discard pending fake timers.
+     */
+    useRealTimers(): typeof vi;
+    /**
+     * Advance the fake clock and run the timers that come due.
+     */
+    advanceTimersByTime(milliseconds: number): typeof vi;
+    /**
+     * Like `advanceTimersByTime`, but runs promise jobs and one turn of the real event loop between timers, so it picks
+     * up timers that a callback schedules after an `await`.
+     */
+    advanceTimersByTimeAsync(milliseconds: number): Promise<typeof vi>;
+    /**
+     * Advance the fake clock to the next timer and run every timer due at that time. Repeats `steps` times.
+     */
+    advanceTimersToNextTimer(steps?: number): typeof vi;
+    /**
+     * Like `advanceTimersToNextTimer`, but runs promise jobs and one turn of the real event loop between timers.
+     */
+    advanceTimersToNextTimerAsync(steps?: number): Promise<typeof vi>;
+    /**
+     * Advance the fake clock to the next multiple of 16 milliseconds. That's when a faked `requestAnimationFrame` runs
+     * its callbacks.
+     */
+    advanceTimersToNextFrame(): typeof vi;
+    /**
+     * Run timers until none are left. Throws after `loopLimit` timers.
+     */
+    runAllTimers(): typeof vi;
+    /**
+     * Like `runAllTimers`, but runs promise jobs and one turn of the real event loop between timers.
+     */
+    runAllTimersAsync(): Promise<typeof vi>;
+    /**
+     * Advance the fake clock to the last timer that's currently pending.
+     */
+    runOnlyPendingTimers(): typeof vi;
+    /**
+     * Like `runOnlyPendingTimers`, but runs promise jobs and one turn of the real event loop between timers.
+     */
+    runOnlyPendingTimersAsync(): Promise<typeof vi>;
+    /**
+     * Run the callbacks queued with a faked `process.nextTick` or `queueMicrotask`.
+     */
+    runAllTicks(): typeof vi;
+    /**
+     * Choose how the fake clock moves when the test doesn't move it.
+     * - `manual`: it doesn't move. This is the default.
+     * - `nextTimerAsync`: each turn of the real event loop runs the next timer.
+     * - `interval`: it advances by `interval` milliseconds (default 20) every `interval` real milliseconds.
+     */
+    setTimerTickMode(mode: "manual" | "nextTimerAsync"): typeof vi;
+    setTimerTickMode(mode: "interval", interval?: number): typeof vi;
+    getTimerCount(): number;
+    clearAllTimers(): typeof vi;
+    isFakeTimers(): boolean;
+    /**
+     * Set the time `Date` reports. Without fake timers, only `Date` is mocked, until you call `vi.useRealTimers()`.
+     */
+    setSystemTime(now?: number | Date | string): typeof vi;
+    /**
+     * Returns the mocked time, or `null` if neither `vi.setSystemTime()` nor `vi.useFakeTimers()` is in effect.
+     */
+    getMockedSystemTime(): Date | null;
+    /**
+     * Returns the real time in milliseconds since the epoch, no matter what's faked.
+     */
+    getRealSystemTime(): number;
+    /**
+     * Set `process.env[name]`, which is also `import.meta.env[name]`. The stub lasts until `vi.unstubAllEnvs()` or the
+     * end of the test file. Passing `undefined` deletes the variable.
+     */
+    stubEnv<T extends string>(
+      name: T,
+      value: T extends "PROD" | "DEV" | "SSR" ? boolean | undefined : string | undefined,
+    ): typeof vi;
+    /**
+     * Restore every variable changed by `vi.stubEnv()` to the value it had before it was first stubbed.
+     */
+    unstubAllEnvs(): typeof vi;
+    /**
+     * Define `globalThis[name]`. The stub lasts until `vi.unstubAllGlobals()` or the end of the test file.
+     */
+    stubGlobal(name: string | symbol | number, value: unknown): typeof vi;
+    /**
+     * Restore every global changed by `vi.stubGlobal()` to the property descriptor it had before it was first stubbed.
+     */
+    unstubAllGlobals(): typeof vi;
+    /**
+     * Change the configuration for the rest of the test file. If a preload script calls it, the change applies to
+     * every test file. Vitest's other options are accepted but ignored.
+     */
+    setConfig(config: {
+      /** Default timeout in milliseconds for tests registered after this call. `0` and `Infinity` mean no timeout. */
+      testTimeout?: number | undefined;
+      /** Default timeout in milliseconds for hooks registered after this call. `0` and `Infinity` mean no timeout. */
+      hookTimeout?: number | undefined;
+      /** The number of concurrent tests that can run at the same time. */
+      maxConcurrency?: number | undefined;
+      /** Call `vi.clearAllMocks()` before each test. This is the default for tests that use `test` from `"vitest"`. */
+      clearMocks?: boolean | undefined;
+      /** Call `vi.resetAllMocks()` before each test. */
+      mockReset?: boolean | undefined;
+      /** Call `vi.restoreAllMocks()` before each test. */
+      restoreMocks?: boolean | undefined;
+      /** Call `vi.unstubAllEnvs()` before each test. */
+      unstubEnvs?: boolean | undefined;
+      /** Call `vi.unstubAllGlobals()` before each test. */
+      unstubGlobals?: boolean | undefined;
+      [option: string]: unknown;
+    }): void;
+    /**
+     * Undo every `vi.setConfig()` call.
+     */
+    resetConfig(): void;
+    /**
+     * Wait until every in-flight `import()` has settled, including ones that start during the wait.
+     */
+    dynamicImportSettled(): Promise<void>;
+    /**
+     * Call `callback` right away, then every `interval` milliseconds, until it doesn't throw or reject. Resolves with
+     * its value. After `timeout` milliseconds, rejects with its last error.
+     *
+     * The wait uses the real clock. While fake timers are on, `vi.advanceTimersByTime(interval)` runs before each call.
+     *
+     * @param options the timeout, or `{ timeout = 1000, interval = 50 }`
+     *
+     * @example
+     * ```ts
+     * await vi.waitFor(() => expect(server.isReady).toBe(true), { timeout: 500 });
+     * ```
+     */
+    waitFor<T>(
+      callback: () => T | Promise<T>,
+      options?: number | { timeout?: number | undefined; interval?: number | undefined },
+    ): Promise<T>;
+    /**
+     * Call `callback` right away, then every `interval` milliseconds, until it returns a truthy value. Resolves with
+     * that value. Rejects right away if `callback` throws or rejects, and with a timeout error after `timeout`
+     * milliseconds.
+     *
+     * The wait uses the real clock. While fake timers are on, `vi.advanceTimersByTime(interval)` runs before each call.
+     *
+     * @param options the timeout, or `{ timeout = 1000, interval = 50 }`
+     *
+     * @example
+     * ```ts
+     * const element = await vi.waitUntil(() => document.querySelector(".element"));
+     * ```
+     */
+    waitUntil<T>(
+      callback: () => T | Promise<T>,
+      options?: number | { timeout?: number | undefined; interval?: number | undefined },
+    ): Promise<Exclude<T, false | "" | 0 | 0n | null | undefined>>;
+  };
+
+  interface FunctionLike {
+    readonly name: string;
+  }
+
+  type DescribeLabel = number | string | Function | FunctionLike;
+
+  /**
+   * Describes a group of related tests.
+   *
+   * @example
+   * ```ts
+   * function sum(a, b) {
+   *   return a + b;
+   * }
+   * describe("sum()", () => {
+   *   test("can sum two values", () => {
+   *     expect(sum(1, 1)).toBe(2);
+   *   });
+   * });
+   * ```
+   *
+   * @param label the label for the tests
+   * @param fn the function that defines the tests
+   *
+   * @category Testing
+   */
+  export interface Describe<T extends Readonly<any[]>> {
+    (fn: () => void): void;
+
+    (label: DescribeLabel, fn: (...args: T) => void): void;
+    /**
+     * Skips all other tests, except this group of tests.
+     */
+    only: Describe<T>;
+    /**
+     * Skips this group of tests.
+     */
+    skip: ((label: string | number) => void) & Describe<T>;
+    /**
+     * Marks this group of tests as to be written or to be fixed.
+     */
+    todo: ((label: string | number) => void) & Describe<T>;
+    /**
+     * Marks this group of tests to be executed concurrently.
+     */
+    concurrent: Describe<T>;
+    /**
+     * Marks this group of tests to be executed serially (one after another),
+     * even when the --concurrent flag is used.
+     */
+    serial: Describe<T>;
+    /**
+     * Marks this group of tests to be executed serially (one after another).
+     * @alias serial
+     */
+    sequential: Describe<T>;
+    /**
+     * Runs the tests in this group and its nested groups in random order.
+     *
+     * The run summary prints the seed. Use `bun test --seed=<seed>` to get the same order again.
+     */
+    shuffle: Describe<T>;
+    /**
+     * Runs this group of tests, only if `condition` is true.
+     *
+     * This is the opposite of `describe.skipIf()`.
+     *
+     * @param condition if these tests should run
+     */
+    if(condition: boolean): Describe<T>;
+    /**
+     * Runs this group of tests, only if `condition` is true.
+     * @alias if
+     */
+    runIf(condition: boolean): Describe<T>;
+    /**
+     * Skips this group of tests, if `condition` is true.
+     *
+     * @param condition if these tests should be skipped
+     */
+    skipIf(condition: boolean): Describe<T>;
+    /**
+     * Marks this group of tests as to be written or to be fixed, if `condition` is true.
+     *
+     * @param condition if these tests should be marked TODO
+     */
+    todoIf(condition: boolean): Describe<T>;
+    /**
+     * Returns a function that runs for each item in `table`.
+     *
+     * @param table Array of Arrays with the arguments that are passed into the test fn for each row.
+     */
+    each<T extends Readonly<[any, ...any[]]>>(table: readonly T[]): Describe<[...T]>;
+    each<T extends readonly any[]>(table: readonly T[]): Describe<[...T]>;
+    each<const T>(table: readonly T[]): Describe<[T]>;
+    /**
+     * Takes the table as a tagged template. The first line names the columns, and each row is passed as an object.
+     */
+    each(headings: TemplateStringsArray, ...values: any[]): Describe<[row: any]>;
+    // Repeated because `Parameters<typeof describe.each>` and `ReturnType<typeof describe.each>` use the last overload.
+    each<const T>(table: readonly T[]): Describe<[T]>;
+    /**
+     * Like `each()`, but an array row is passed as one argument instead of being spread.
+     */
+    for<const T>(table: readonly T[]): Describe<[row: T]>;
+    for(headings: TemplateStringsArray, ...values: any[]): Describe<[row: any]>;
+  }
+  /**
+   * Describes a group of related tests.
+   *
+   * @example
+   * ```ts
+   * function sum(a, b) {
+   *   return a + b;
+   * }
+   * describe("sum()", () => {
+   *   test("can sum two values", () => {
+   *     expect(sum(1, 1)).toBe(2);
+   *   });
+   * });
+   * ```
+   *
+   * @param label the label for the tests
+   * @param fn the function that defines the tests
+   */
+  export const describe: Describe<[]>;
+  /**
+   * Skips a group of related tests.
+   *
+   * This is equivalent to calling `describe.skip()`.
+   *
+   * @param label the label for the tests
+   * @param fn the function that defines the tests
+   */
+  export const xdescribe: Describe<[]>;
+
+  type HookOptions = number | { timeout?: number };
+  /**
+   * Runs a function, once, before all the tests.
+   *
+   * Use this for setup, like initializing a global variable or
+   * connecting to a database.
+   *
+   * If the function throws, no tests in the file run.
+   *
+   * @example
+   * ```ts
+   * let database;
+   * beforeAll(async () => {
+   *   database = await connect("localhost");
+   * });
+   * ```
+   *
+   * @param fn the function to run
+   */
+  export function beforeAll(
+    fn: (() => void | Promise<unknown>) | ((done: (err?: unknown) => void) => void),
+    options?: HookOptions,
+  ): void;
+  /**
+   * Runs a function before each test.
+   *
+   * Use this for setup, like initializing a global variable or
+   * connecting to a database.
+   *
+   * If the function throws, the test does not run.
+   *
+   * @param fn the function to run
+   */
+  export function beforeEach(
+    fn: (() => void | Promise<unknown>) | ((done: (err?: unknown) => void) => void),
+    options?: HookOptions,
+  ): void;
+  /**
+   * Runs a function, once, after all the tests.
+   *
+   * Use this for cleanup, like closing a socket or
+   * deleting temporary files.
+   *
+   * @example
+   * ```ts
+   * let database;
+   * afterAll(async () => {
+   *   if (database) {
+   *     await database.close();
+   *   }
+   * });
+   * ```
+   *
+   * @param fn the function to run
+   */
+  export function afterAll(
+    fn: (() => void | Promise<unknown>) | ((done: (err?: unknown) => void) => void),
+    options?: HookOptions,
+  ): void;
+  /**
+   * Runs a function after each test.
+   *
+   * Use this for cleanup, like closing a socket or
+   * deleting temporary files.
+   *
+   * @param fn the function to run
+   */
+  export function afterEach(
+    fn: (() => void | Promise<unknown>) | ((done: (err?: unknown) => void) => void),
+    options?: HookOptions,
+  ): void;
+  /**
+   * Wraps each test in a function. The function does its setup, awaits `runTest()`, then does its teardown.
+   *
+   * `runTest()` runs the `beforeEach` hooks, the test, the `afterEach` hooks and the `onTestFinished()` callbacks.
+   * They run in the async context `runTest()` is called in, so they see the store of an `AsyncLocalStorage`
+   * whose `run()` calls it. The promise it returns resolves even if the test fails.
+   *
+   * - The first hook registered is the outermost one, and the hooks of an outer `describe()` block go around those of an inner one.
+   * - The hook runs again for each retry and each repeat. It doesn't run for a skipped or todo test.
+   * - The test fails if the hook throws, or if it finishes without calling `runTest()`. A second `runTest()` call rejects.
+   * - The timeout applies to the time before `runTest()` is called, and again to the time after its promise resolves.
+   *   The time in between isn't counted.
+   *
+   * @example
+   * ```ts
+   * aroundEach(async runTest => {
+   *   await database.transaction(runTest);
+   * });
+   * ```
+   *
+   * @param fn the function to run around each test
+   * @param options the timeout in milliseconds. 0 means no timeout
+   */
+  export function aroundEach(
+    fn: (runTest: () => Promise<void>, context: TestContext, suite: TestSuite) => unknown | Promise<unknown>,
+    options?: HookOptions,
+  ): void;
+  /**
+   * Wraps all the tests of the file or `describe()` block in a function. The function does its setup, awaits
+   * `runSuite()`, then does its teardown.
+   *
+   * `runSuite()` runs the block's `beforeAll` hooks, its tests and nested blocks, and its `afterAll` hooks, in the
+   * async context `runSuite()` is called in. If the hook fails before it calls `runSuite()`, none of them run.
+   *
+   * Nesting, failures and the timeout work as in {@link aroundEach}. The hook doesn't run if every test in the block is skipped.
+   *
+   * @example
+   * ```ts
+   * aroundAll(async runSuite => {
+   *   await tracer.trace("suite", runSuite);
+   * });
+   * ```
+   *
+   * @param fn the function to run around the tests
+   * @param options the timeout in milliseconds. 0 means no timeout
+   */
+  export function aroundAll(
+    fn: (runSuite: () => Promise<void>, context: object, suite: TestSuite) => unknown | Promise<unknown>,
+    options?: HookOptions,
+  ): void;
+  /**
+   * Runs a function after the test finishes, once all `afterEach` hooks have completed.
+   *
+   * Can only be called inside a test, not in `describe` blocks.
+   *
+   * @example
+   * ```ts
+   * test("my test", () => {
+   *   onTestFinished(() => {
+   *     // This runs after all afterEach hooks
+   *     console.log("Test finished!");
+   *   });
+   * });
+   * ```
+   *
+   * @param fn the function to run
+   */
+  export function onTestFinished(
+    fn: (() => void | Promise<unknown>) | ((done: (err?: unknown) => void) => void),
+    options?: HookOptions,
+  ): void;
+  /**
+   * Sets the default timeout for all tests in the current file. A timeout set on an
+   * individual test overrides this value. The default timeout is 5000ms (5 seconds).
+   *
+   * @param milliseconds the default timeout in milliseconds
+   */
+  export function setDefaultTimeout(milliseconds: number): void;
+  export interface TestOptions {
+    /**
+     * Sets the timeout for the test in milliseconds.
+     *
+     * If the test does not complete within this time, it fails with:
+     * ```ts
+     * 'Timeout: test {name} timed out after 5000ms'
+     * ```
+     *
+     * @default 5000 // 5 seconds
+     */
+    timeout?: number;
+    /**
+     * Sets the number of times to retry the test if it fails.
+     *
+     * @default 0
+     */
+    retry?: number;
+    /**
+     * Sets the number of times to repeat the test, regardless of whether it passed or failed.
+     *
+     * @default 0
+     */
+    repeats?: number;
+  }
+
+  namespace __internal {
+    type IfNeverThenElse<T, Else> = [T] extends [never] ? Else : T;
+
+    type IsTuple<T> = T extends readonly unknown[]
+      ? number extends T["length"]
+        ? false // It's an array with unknown length, not a tuple
+        : true // It's an array with a fixed length (a tuple)
+      : false; // Not an array at all
+
+    /**
+     * Accepts `[1, 2, 3] | ["a", "b", "c"]` and returns `[1 | "a", 2 | "b", 3 | "c"]`
+     */
+    type Flatten<T, Copy extends T = T> = { [Key in keyof T]: Copy[Key] };
+  }
+
+  /**
+   * Runs a test.
+   *
+   * @example
+   * ```ts
+   * test("can check if using Bun", () => {
+   *   expect(Bun).toBeDefined();
+   * });
+   *
+   * test("can make a fetch() request", async () => {
+   *   const response = await fetch("https://example.com/");
+   *   expect(response.ok).toBe(true);
+   * });
+   *
+   * test("can set a timeout", async () => {
+   *   await Bun.sleep(100);
+   * }, 50); // or { timeout: 50 }
+   * ```
+   *
+   * @param label the label for the test
+   * @param fn the test function
+   * @param options the test timeout or options
+   *
+   * @category Testing
+   */
+  export interface Test<T extends ReadonlyArray<unknown>> {
+    // Must be first, or `options` typed as `any` matches the next overload's `fn`. `Parameters<>` uses the last one.
+    (
+      label: string,
+      fn: (
+        ...args: __internal.IsTuple<T> extends true
+          ? [...table: __internal.Flatten<T>, done: (err?: unknown) => void]
+          : T
+      ) => void | Promise<unknown>,
+      options: number | TestOptions,
+    ): void;
+    /**
+     * Runs a test, with the options before the test function.
+     *
+     * @example
+     * ```ts
+     * test("can retry", { retry: 3 }, () => {
+     *   expect(Math.random()).toBeLessThan(0.5);
+     * });
+     * ```
+     */
+    (
+      label: string,
+      options: number | TestOptions,
+      fn: (
+        ...args: __internal.IsTuple<T> extends true
+          ? [...table: __internal.Flatten<T>, done: (err?: unknown) => void]
+          : T
+      ) => void | Promise<unknown>,
+    ): void;
+    (
+      label: string,
+
+      fn: (
+        ...args: __internal.IsTuple<T> extends true
+          ? [...table: __internal.Flatten<T>, done: (err?: unknown) => void]
+          : T
+      ) => void | Promise<unknown>,
+
+      /**
+       * - If a `number`, sets the timeout for the test in milliseconds.
+       * - If an `object`, sets the options for the test.
+       *   - `timeout` sets the timeout for the test in milliseconds.
+       *   - `retry` sets the number of times to retry the test if it fails.
+       *   - `repeats` sets the number of times to repeat the test, regardless of whether it passed or failed.
+       */
+      options?: number | TestOptions,
+    ): void;
+    /**
+     * Skips all other tests, except this test.
+     */
+    only: Test<T>;
+    /**
+     * Skips this test.
+     */
+    skip: ((label: string) => void) & Test<T>;
+    /**
+     * Marks this test as to be written or to be fixed.
+     *
+     * These tests only run when the `--todo` flag is passed. With the flag,
+     * a `.todo` test that passes is marked as `fail` in the results: remove
+     * the `.todo` or check that the test is implemented correctly.
+     */
+    todo: ((label: string) => void) & Test<T>;
+    /**
+     * Marks this test as failing.
+     *
+     * Use `test.failing` for a test you expect to fail. The result is inverted:
+     * the test passes if it throws, and fails if it does not.
+     *
+     * `test.failing` is similar to {@link test.todo} except that it always
+     * runs, regardless of the `--todo` flag.
+     */
+    failing: Test<T>;
+    /**
+     * Marks this test as failing, like Vitest's `test.fails`.
+     *
+     * The test passes if any part of it fails: its callback, a `beforeEach`
+     * or `afterEach` hook, the timeout, or `expect.assertions()`.
+     * With {@link test.failing}, only an error from the callback counts.
+     */
+    fails: Test<T>;
+    /**
+     * Runs the test concurrently with other concurrent tests.
+     */
+    concurrent: Test<T>;
+    /**
+     * Forces the test to run serially (not in parallel),
+     * even when the --concurrent flag is used.
+     */
+    serial: Test<T>;
+    /**
+     * Forces the test to run serially (not in parallel).
+     * @alias serial
+     */
+    sequential: Test<T>;
+    /**
+     * Runs this test, if `condition` is true.
+     *
+     * This is the opposite of `test.skipIf()`.
+     *
+     * @param condition if the test should run
+     */
+    if(condition: boolean): Test<T>;
+    /**
+     * Runs this test, if `condition` is true.
+     * @alias if
+     */
+    runIf(condition: boolean): Test<T>;
+    /**
+     * Skips this test, if `condition` is true.
+     *
+     * @param condition if the test should be skipped
+     */
+    skipIf(condition: boolean): Test<T>;
+    /**
+     * Marks this test as to be written or to be fixed, if `condition` is true.
+     *
+     * @param condition if the test should be marked TODO
+     */
+    todoIf(condition: boolean): Test<T>;
+    /**
+     * Marks this test as failing, if `condition` is true.
+     *
+     * @param condition if the test should be marked as failing
+     */
+    failingIf(condition: boolean): Test<T>;
+    /**
+     * Runs the test concurrently with other concurrent tests, if `condition` is true.
+     *
+     * @param condition if the test should run concurrently
+     */
+    concurrentIf(condition: boolean): Test<T>;
+    /**
+     * Forces the test to run serially (not in parallel), if `condition` is true.
+     * This applies even when the --concurrent flag is used.
+     *
+     * @param condition if the test should run serially
+     */
+    serialIf(condition: boolean): Test<T>;
+    /**
+     * Returns a function that runs for each item in `table`.
+     *
+     * @param table Array of Arrays with the arguments that are passed into the test fn for each row.
+     */
+    each<T extends Readonly<[unknown, ...unknown[]]>>(table: readonly T[]): Test<T>;
+    each<T extends readonly unknown[]>(table: readonly T[]): Test<T>;
+    each<const T>(table: readonly T[]): Test<[T]>;
+    /**
+     * Takes the table as a tagged template. The first line names the columns, and each row is passed as an object.
+     *
+     * @example
+     * ```ts
+     * test.each`
+     *   a    | b    | sum
+     *   ${1} | ${2} | ${3}
+     * `("$a + $b = $sum", ({ a, b, sum }) => {
+     *   expect(a + b).toBe(sum);
+     * });
+     * ```
+     */
+    each(headings: TemplateStringsArray, ...values: any[]): Test<[row: any]>;
+    // Repeated because `Parameters<typeof test.each>` and `ReturnType<typeof test.each>` use the last overload.
+    each<const T>(table: readonly T[]): Test<[T]>;
+    /**
+     * Like `each()`, but an array row is passed as one argument instead of being spread,
+     * and the second argument is the {@link TestContext}.
+     *
+     * @example
+     * ```ts
+     * test.for([[1, 2, 3]])("%i + %i = %i", ([a, b, sum], { expect }) => {
+     *   expect(a + b).toBe(sum);
+     * });
+     * ```
+     */
+    for<const Row>(table: readonly Row[]): TestWithContext<object, [row: Row]>;
+    for(headings: TemplateStringsArray, ...values: any[]): TestWithContext<object, [row: any]>;
+    /**
+     * Returns a `test` whose callbacks receive the {@link TestContext} with `fixtures` added to it.
+     *
+     * A fixture is set up for the tests that destructure it, and for the returned `test`'s
+     * `beforeEach()` / `afterEach()` hooks that destructure it. It's torn down after the test.
+     *
+     * @example
+     * ```ts
+     * const test = base.extend<{ server: Server }>({
+     *   server: async ({}, use) => {
+     *     const server = Bun.serve({ port: 0, fetch: () => new Response("ok") });
+     *     await use(server);
+     *     await server.stop();
+     *   },
+     * });
+     *
+     * test("responds", async ({ server }) => {
+     *   expect(await (await fetch(server.url)).text()).toBe("ok");
+     * });
+     * ```
+     */
+    extend: ExtendTest<object>;
+    beforeAll: typeof beforeAll;
+    beforeEach: typeof beforeEach;
+    afterEach: typeof afterEach;
+    afterAll: typeof afterAll;
+    aroundEach: typeof aroundEach;
+    aroundAll: typeof aroundAll;
+    describe: Describe<[]>;
+    suite: Describe<[]>;
+  }
+
+  /**
+   * The object passed to `test.for()` callbacks and to the callbacks of a `test` made by `test.extend()`.
+   * Each test gets one object, and its hooks receive the same one.
+   */
+  export interface TestContext {
+    /** The running test. */
+    readonly task: TestTask;
+    /**
+     * An `expect` bound to this test. Its `expect.assertions()`, `expect.hasAssertions()` and snapshots
+     * belong to this test even when other tests run concurrently.
+     */
+    readonly expect: Expect;
+    /** Aborted when the test times out. */
+    readonly signal: AbortSignal;
+    /** Stops the test and reports it as skipped. */
+    skip(note?: string): never;
+    /** Stops the test and reports it as skipped, unless `condition` is `false`. */
+    skip(condition: boolean, note?: string): void;
+    /** Runs `fn` after the test, its `afterEach` hooks and its fixture teardown. The last one registered runs first. */
+    onTestFinished(fn: (context: TestContext) => void | Promise<unknown>, options?: HookOptions): void;
+    /** Like `onTestFinished()`, but only runs if the test failed. */
+    onTestFailed(fn: (context: TestContext) => void | Promise<unknown>, options?: HookOptions): void;
+    /** Adds an annotation to `task.annotations`. */
+    annotate(message: string, type?: string, attachment?: object): Promise<TestAnnotation>;
+    annotate(message: string, attachment?: object): Promise<TestAnnotation>;
+  }
+
+  export interface TestAnnotation {
+    message: string;
+    /** @default "notice" */
+    type: string;
+    attachment?: object;
+  }
+
+  export interface TestSuite {
+    type: "suite";
+    /** The `describe()` block's label, or the file's path relative to the working directory. */
+    name: string;
+    /** The file's name, the enclosing blocks' names and this block's name, joined by `" > "`. */
+    fullName: string;
+    mode: "run" | "skip" | "only" | "todo";
+    /** Free-form storage for anything you want to attach to the block. */
+    meta: Record<string, any>;
+    file: TestSuite & { filepath: string };
+    /** The enclosing block. */
+    suite?: TestSuite;
+  }
+
+  export interface TestTask extends Omit<TestSuite, "type"> {
+    type: "test";
+    id: string;
+    /** `fullName` without the file name. */
+    fullTestName: string;
+    timeout: number;
+    retry: number;
+    repeats: number;
+    fails?: true;
+    concurrent?: true;
+    annotations: TestAnnotation[];
+    result: {
+      state: "run" | "pass" | "fail" | "skip";
+      /** Errors thrown by the test, its hooks and its fixtures. */
+      errors?: unknown[];
+      retryCount: number;
+      repeatCount: number;
+      /** The note passed to `context.skip()`. */
+      note?: string;
+    };
+    context: TestContext;
+  }
+
+  export interface FixtureOptions {
+    /**
+     * Set up the fixture for every test, even tests that don't destructure it.
+     * @default false
+     */
+    auto?: boolean;
+    /**
+     * With `"file"` or `"worker"`, the fixture is set up once, for the first test that needs it, and torn down after
+     * the file's last test.
+     * @default "test"
+     */
+    scope?: "test" | "file" | "worker";
+  }
+
+  /**
+   * Sets up a fixture, passes it to `use()`, and tears it down after the promise returned by `use()` resolves.
+   * The first parameter must be an object destructuring pattern. It names the fixtures this one depends on.
+   */
+  export type FixtureFunction<Value, Context> = (
+    context: Context,
+    use: (value: Value) => Promise<void>,
+  ) => void | Promise<void>;
+
+  type Fixture<Value, Context> = ((...args: any[]) => any) extends Value
+    ? FixtureFunction<Value, Context>
+    : Value | FixtureFunction<Value, Context>;
+
+  export type Fixtures<Added, Context = object> = {
+    [Name in keyof Added]:
+      | Fixture<Added[Name], Omit<Added, Name> & Context & TestContext>
+      | [Fixture<Added[Name], Omit<Added, Name> & Context & TestContext>, FixtureOptions];
+  };
+
+  /**
+   * The type of `test.extend`.
+   */
+  export interface ExtendTest<Context> {
+    <Added extends Record<string, any> = object>(
+      fixtures: Fixtures<Added, Context>,
+    ): TestWithContext<Omit<Context, keyof Added> & Added>;
+    /**
+     * Adds one fixture. `value` is the fixture's value, or a function that returns it.
+     */
+    <Name extends string, Value>(
+      name: Name,
+      value:
+        | ((
+            context: Context & TestContext,
+            helpers: { onCleanup(fn: () => void | Promise<unknown>): void },
+          ) => Value | Promise<Value>)
+        | Value,
+    ): TestWithContext<Omit<Context, Name> & Record<Name, Value>>;
+    <Name extends string, Value>(
+      name: Name,
+      options: FixtureOptions,
+      value:
+        | ((
+            context: Context & TestContext,
+            helpers: { onCleanup(fn: () => void | Promise<unknown>): void },
+          ) => Value | Promise<Value>)
+        | Value,
+    ): TestWithContext<Omit<Context, Name> & Record<Name, Value>>;
+  }
+
+  type ContextHook<Context> = (
+    fn: (context: Context & TestContext) => unknown | Promise<unknown>,
+    options?: HookOptions,
+  ) => void;
+  type SuiteHook<Context> = (
+    fn: (context: Context, suite: TestSuite) => unknown | Promise<unknown>,
+    options?: HookOptions,
+  ) => void;
+  type AroundHook<Context> = (
+    fn: (run: () => Promise<void>, context: Context, suite: TestSuite) => unknown | Promise<unknown>,
+    options?: HookOptions,
+  ) => void;
+  type TestOfRows<Row extends ReadonlyArray<unknown>> = {
+    // Must be first, or `options` typed as `any` matches the next overload's `fn`. `Parameters<>` uses the last one.
+    (label: string, fn: (...args: Row) => void | Promise<unknown>, options: number | TestOptions): void;
+    (label: string, options: number | TestOptions, fn: (...args: Row) => void | Promise<unknown>): void;
+    (label: string, fn: (...args: Row) => void | Promise<unknown>, options?: number | TestOptions): void;
+  };
+
+  /**
+   * A `test` whose callbacks receive the {@link TestContext} instead of a `done` callback.
+   */
+  export interface TestWithContext<Context, Row extends ReadonlyArray<unknown> = []> {
+    // Must be first, or `options` typed as `any` matches the next overload's `fn`. `Parameters<>` uses the last one.
+    (
+      label: string,
+      fn: (...args: [...Row, context: Context & TestContext]) => void | Promise<unknown>,
+      options: number | TestOptions,
+    ): void;
+    (
+      label: string,
+      options: number | TestOptions,
+      fn: (...args: [...Row, context: Context & TestContext]) => void | Promise<unknown>,
+    ): void;
+    (
+      label: string,
+      fn: (...args: [...Row, context: Context & TestContext]) => void | Promise<unknown>,
+      options?: number | TestOptions,
+    ): void;
+    only: TestWithContext<Context, Row>;
+    skip: ((label: string) => void) & TestWithContext<Context, Row>;
+    todo: ((label: string) => void) & TestWithContext<Context, Row>;
+    failing: TestWithContext<Context, Row>;
+    fails: TestWithContext<Context, Row>;
+    concurrent: TestWithContext<Context, Row>;
+    serial: TestWithContext<Context, Row>;
+    sequential: TestWithContext<Context, Row>;
+    if(condition: boolean): TestWithContext<Context, Row>;
+    runIf(condition: boolean): TestWithContext<Context, Row>;
+    skipIf(condition: boolean): TestWithContext<Context, Row>;
+    todoIf(condition: boolean): TestWithContext<Context, Row>;
+    failingIf(condition: boolean): TestWithContext<Context, Row>;
+    concurrentIf(condition: boolean): TestWithContext<Context, Row>;
+    serialIf(condition: boolean): TestWithContext<Context, Row>;
+    /** Each row is spread over the callback's parameters, so the callback doesn't receive the context. */
+    each<T extends Readonly<[unknown, ...unknown[]]>>(table: readonly T[]): TestOfRows<T>;
+    each<T extends readonly unknown[]>(table: readonly T[]): TestOfRows<T>;
+    each<const T>(table: readonly T[]): TestOfRows<[row: T]>;
+    each(headings: TemplateStringsArray, ...values: any[]): TestOfRows<[row: any]>;
+    for<const T>(table: readonly T[]): TestWithContext<Context, [row: T]>;
+    for(headings: TemplateStringsArray, ...values: any[]): TestWithContext<Context, [row: any]>;
+    extend: ExtendTest<Context>;
+    /**
+     * Replaces fixtures for the tests in the `describe()` block it's called in, or in the file when called outside one.
+     */
+    override(fixtures: Partial<Fixtures<Context>>): this;
+    /** @deprecated Use `override()`. */
+    scoped(fixtures: Partial<Fixtures<Context>>): this;
+    /** The callback receives the `scope: "file"` or `"worker"` fixtures that it destructures, and the suite. */
+    beforeAll: SuiteHook<Context>;
+    afterAll: SuiteHook<Context>;
+    /** If the callback returns a function, that function runs after the `afterEach` hooks. */
+    beforeEach: ContextHook<Context>;
+    afterEach: ContextHook<Context>;
+    /** Like {@link aroundEach}. A fixture the callback destructures is torn down after the callback finishes. */
+    aroundEach: AroundHook<Context & TestContext>;
+    /** Like {@link aroundAll}. The callback receives the `scope: "file"` or `"worker"` fixtures that it destructures. */
+    aroundAll: AroundHook<Context>;
+    describe: Describe<[]>;
+    suite: Describe<[]>;
+  }
+  /**
+   * Runs a test.
+   *
+   * @example
+   * ```ts
+   * test("can check if using Bun", () => {
+   *   expect(Bun).toBeDefined();
+   * });
+   *
+   * test("can make a fetch() request", async () => {
+   *   const response = await fetch("https://example.com/");
+   *   expect(response.ok).toBe(true);
+   * });
+   * ```
+   *
+   * @param label the label for the test
+   * @param fn the test function
+   */
+  export const test: Test<[]>;
+  export { test as it, xtest as xit };
+
+  /**
+   * Skips a test.
+   *
+   * This is equivalent to calling `test.skip()`.
+   *
+   * @param label the label for the test
+   * @param fn the test function
+   */
+  export const xtest: Test<[]>;
+
+  /**
+   * Asserts that a value matches some criteria.
+   *
+   * @link https://jestjs.io/docs/expect#reference
+   * @example
+   * ```ts
+   * expect(1 + 1).toBe(2);
+   * expect([1,2,3]).toContain(2);
+   * expect(null).toBeNull();
+   * ```
+   *
+   * @param actual The actual (received) value
+   */
+  export const expect: Expect;
+
+  type ExpectNot = Omit<AsymmetricMatchers, keyof AsymmetricMatchersBuiltin> & AsymmetricMatchersBuiltinNegated;
+
+  export interface Expect extends AsymmetricMatchers {
+    // the `expect()` callable signature
+    /**
+     * @param actual the actual value
+     * @param customFailMessage an optional custom message to display if the test fails.
+     * */
+
+    (): Matchers<undefined>;
+    <T = unknown>(actual: T, customFailMessage?: string): Matchers<T>;
+    <T = unknown>(actual?: T, customFailMessage?: string): Matchers<T | undefined>;
+
+    /**
+     * Access to negated asymmetric matchers.
+     *
+     * @example
+     * expect("abc").toEqual(expect.stringContaining("abc")); // will pass
+     * expect("abc").toEqual(expect.not.stringContaining("abc")); // will fail
+     */
+    not: ExpectNot;
+
+    /**
+     * Create an asymmetric matcher for a promise resolved value.
+     *
+     * @example
+     * expect(Promise.resolve("value")).toEqual(expect.resolvesTo.stringContaining("value")); // will pass
+     * expect(Promise.reject("value")).toEqual(expect.resolvesTo.stringContaining("value")); // will fail
+     * expect("value").toEqual(expect.resolvesTo.stringContaining("value")); // will fail
+     */
+    resolvesTo: AsymmetricMatchers;
+
+    /**
+     * Create an asymmetric matcher for a promise rejected value.
+     *
+     * @example
+     * expect(Promise.reject("error")).toEqual(expect.rejectsTo.stringContaining("error")); // will pass
+     * expect(Promise.resolve("error")).toEqual(expect.rejectsTo.stringContaining("error")); // will fail
+     * expect("error").toEqual(expect.rejectsTo.stringContaining("error")); // will fail
+     */
+    rejectsTo: AsymmetricMatchers;
+
+    /**
+     * Register new custom matchers.
+     * @param matchers An object containing the matchers to register, where each key is the matcher name, and its value the implementation function.
+     * The function must satisfy: `(actualValue, ...matcherInstantiationArguments) => { pass: true|false, message: () => string }`
+     *
+     * @example
+     * expect.extend({
+     *     toBeWithinRange(actual, min, max) {
+     *         if (typeof actual !== 'number' || typeof min !== 'number' || typeof max !== 'number')
+     *             throw new Error('Invalid usage');
+     *         const pass = actual >= min && actual <= max;
+     *         return {
+     *             pass: pass,
+     *             message: () => `expected ${this.utils.printReceived(actual)} ` +
+     *                 (pass ? `not to be`: `to be`) + ` within range ${this.utils.printExpected(`${min} .. ${max}`)}`,
+     *         };
+     *     },
+     * });
+     *
+     * test('some test', () => {
+     *   expect(50).toBeWithinRange(0, 100); // will pass
+     *   expect(50).toBeWithinRange(100, 200); // will fail
+     *   expect(50).toBe(expect.toBeWithinRange(0, 100)); // will pass
+     *   expect(50).toBe(expect.not.toBeWithinRange(100, 200)); // will pass
+     * });
+     */
+    extend<M>(matchers: ExpectExtendMatchers<M>): void;
+
+    /**
+     * Throws an error if called.
+     *
+     * @param msg Optional message to display if the test fails
+     * @returns never
+     *
+     * @example
+     * ```ts
+     * import { expect, test } from "bun:test";
+     *
+     * test("!!abc!! is not a module", () => {
+     *  try {
+     *     require("!!abc!!");
+     *     expect.unreachable();
+     *  } catch(e) {
+     *     expect(e.name).not.toBe("UnreachableError");
+     *  }
+     * });
+     * ```
+     */
+    unreachable(msg?: string | Error): never;
+
+    /**
+     * Like `expect()`, but doesn't throw when a matcher fails. The failure is reported, the test keeps running,
+     * and it's marked as failed at the end.
+     *
+     * @example
+     * expect.soft(response.status).toBe(200);
+     * expect.soft(await response.text()).toBe("ok"); // checked even if the status is wrong
+     *
+     * @param actual the actual value
+     * @param customFailMessage an optional custom message to display if the test fails.
+     */
+    soft<T = unknown>(actual?: T, customFailMessage?: string): Matchers<T>;
+
+    /**
+     * Calls `fn`, awaits its result and runs the matcher on it. Retries until the matcher passes.
+     * The matcher returns a promise that rejects with the last failure once `timeout` is up.
+     *
+     * The wait uses the real clock, even with fake timers on. Each attempt advances the fake timers by `interval`.
+     *
+     * @example
+     * await expect.poll(() => document.querySelector(".ready")).not.toBeNull();
+     * await expect.poll(() => queue.length, { interval: 10, timeout: 500 }).toBe(0);
+     */
+    poll<T>(
+      fn: () => T,
+      options?: {
+        /**
+         * Milliseconds between attempts.
+         * @default 50
+         */
+        interval?: number;
+        /**
+         * Milliseconds before the matcher gives up and fails.
+         * @default 1000
+         */
+        timeout?: number;
+        /** A custom message to display if the matcher fails. */
+        message?: string;
+      },
+    ): Omit<
+      AsyncMatchers<Awaited<T>>,
+      | "resolves"
+      | "rejects"
+      | "toThrow"
+      | "toThrowError"
+      | "toMatchSnapshot"
+      | "toMatchInlineSnapshot"
+      | "toThrowErrorMatchingSnapshot"
+      | "toThrowErrorMatchingInlineSnapshot"
+    >;
+
+    /**
+     * Ensures that an assertion is made
+     */
+    hasAssertions(): void;
+
+    /**
+     * Ensures that a specific number of assertions are made
+     */
+    assertions(neededAssertions: number): void;
+
+    /**
+     * Registers functions that decide whether two values are equal. They're used by `toEqual()`,
+     * `toStrictEqual()`, `toMatchObject()`, `toHaveBeenCalledWith()` and every other
+     * matcher and asymmetric matcher that compares deeply.
+     *
+     * A tester returns `true` or `false`. It can also return `undefined` to pass the pair on
+     * to the next tester, and then to the built-in rules. Testers registered by a test file last
+     * until that file ends. Testers registered by a preload script apply to every file.
+     *
+     * @example
+     * expect.addEqualityTesters([
+     *   (a, b) => (a instanceof Volume && b instanceof Volume ? a.equals(b) : undefined),
+     * ]);
+     * expect(new Volume(1, "L")).toEqual(new Volume(1000, "mL"));
+     */
+    addEqualityTesters(testers: Tester[]): void;
+
+    /**
+     * Registers a serializer for the snapshot matchers. It prints every value that `serializer.test()`
+     * returns `true` for, anywhere in a snapshot. The most recently added serializer is tried first.
+     *
+     * A serializer added by a test file lasts until that file ends. One added by a preload script,
+     * or by a module that test files import, applies to every file after it.
+     *
+     * @example
+     * expect.addSnapshotSerializer({
+     *   test: value => value instanceof Money,
+     *   serialize: value => `${value.amount} ${value.currency}`,
+     * });
+     * expect({ price: new Money(5, "EUR") }).toMatchInlineSnapshot(`
+     *   {
+     *     "price": 5 EUR,
+     *   }
+     * `);
+     */
+    addSnapshotSerializer(serializer: SnapshotSerializer): void;
+
+    /**
+     * Returns `expect`'s state for the running test, plus anything passed to
+     * {@link Expect.setState}. Every call returns the same object, kept up to date.
+     */
+    getState(): ExpectState & Record<string, unknown>;
+
+    /**
+     * Merges `state` into the object that {@link Expect.getState} returns.
+     *
+     * `assertionCalls`, `expectedAssertionsNumber` and `isExpectingAssertions` are the
+     * counters behind `expect.assertions()` and `expect.hasAssertions()`.
+     * `currentTestName` and `testPath` can't be changed.
+     */
+    setState(state: Partial<ExpectState> & Record<string, unknown>): void;
+  }
+
+  export interface ExpectState {
+    /** The number of assertions the current test has made. */
+    assertionCalls: number;
+    /** The enclosing `describe` blocks' names and the current test's name, joined by a space. */
+    currentTestName?: string;
+    /** The number passed to `expect.assertions()`, if it was called in the current test. */
+    expectedAssertionsNumber: number | null;
+    /** Whether `expect.hasAssertions()` was called in the current test. */
+    isExpectingAssertions: boolean;
+    /** Always empty. */
+    suppressedErrors: Error[];
+    /** The absolute path of the current test file. */
+    testPath?: string;
+  }
+
+  /**
+   * Extend this interface with declaration merging to add type support for custom matchers.
+   * @template T Type of the actual value
+   *
+   * @example
+   * // my_modules.d.ts
+   * interface MyCustomMatchers {
+   *   toBeWithinRange(floor: number, ceiling: number): any;
+   * }
+   * declare module "bun:test" {
+   *   interface Matchers<T> extends MyCustomMatchers {}
+   *   interface AsymmetricMatchers extends MyCustomMatchers {}
+   * }
+   *
+   * @example
+   * // my_modules.d.ts (alternatively)
+   * declare module "bun:test" {
+   *   interface Matchers<T> {
+   *     toBeWithinRange(floor: number, ceiling: number): any;
+   *   }
+   *   interface AsymmetricMatchers {
+   *     toBeWithinRange(floor: number, ceiling: number): any;
+   *   }
+   * }
+   */
+  export interface Matchers<T = unknown> extends MatchersBuiltin<T> {}
+
+  /**
+   * Extend this interface with declaration merging to add type support for custom asymmetric matchers.
+   * @example
+   * // my_modules.d.ts
+   * interface MyCustomMatchers {
+   *   toBeWithinRange(floor: number, ceiling: number): any;
+   * }
+   * declare module "bun:test" {
+   *   interface Matchers<T> extends MyCustomMatchers {}
+   *   interface AsymmetricMatchers extends MyCustomMatchers {}
+   * }
+   *
+   * @example
+   * // my_modules.d.ts (alternatively)
+   * declare module "bun:test" {
+   *   interface Matchers<T> {
+   *     toBeWithinRange(floor: number, ceiling: number): any;
+   *   }
+   *   interface AsymmetricMatchers {
+   *     toBeWithinRange(floor: number, ceiling: number): any;
+   *   }
+   * }
+   */
+  export interface AsymmetricMatchers extends AsymmetricMatchersBuiltin {}
+
+  export interface AsymmetricMatchersBuiltin {
+    /**
+     * Matches anything that was created with the given constructor.
+     * Use it inside `toEqual` or `toBeCalledWith` instead of a literal value.
+     *
+     * @example
+     *
+     * function randocall(fn) {
+     *   return fn(Math.floor(Math.random() * 6 + 1));
+     * }
+     *
+     * test('randocall calls its callback with a number', () => {
+     *   const mock = jest.fn();
+     *   randocall(mock);
+     *   expect(mock).toBeCalledWith(expect.any(Number));
+     * });
+     */
+    any(constructor: ((...args: any[]) => any) | { new (...args: any[]): any }): AsymmetricMatcher;
+    /**
+     * Matches anything but null or undefined. Use it inside `toEqual` or `toBeCalledWith` instead
+     * of a literal value. For example, to check that a mock function is called with a
+     * non-null argument:
+     *
+     * @example
+     *
+     * test('map calls its argument with a non-null argument', () => {
+     *   const mock = jest.fn();
+     *   [1].map(x => mock(x));
+     *   expect(mock).toBeCalledWith(expect.anything());
+     * });
+     */
+    anything(): AsymmetricMatcher;
+    /**
+     * Matches any array made up entirely of elements in the provided array.
+     * Use it inside `toEqual` or `toBeCalledWith` instead of a literal value.
+     *
+     * Optionally, pass a type for the elements as a generic argument.
+     */
+    arrayContaining<E = any>(arr: readonly E[]): AsymmetricMatcher;
+    /**
+     * Matches any object that recursively matches the provided keys.
+     *
+     * Optionally, pass a type for the object as a generic argument.
+     * This ensures that the object contains the desired structure.
+     */
+    objectContaining(obj: object): AsymmetricMatcher;
+    /**
+     * Matches any received string that contains the exact expected string
+     */
+    stringContaining(str: string | String): AsymmetricMatcher;
+    /**
+     * Matches any received string that matches the regular expression.
+     *
+     * A string is the source of a regular expression, as in `new RegExp(regex)`. It is not searched
+     * for literally, and an invalid one throws a `SyntaxError`. To look for a literal string, use
+     * `expect.stringContaining`.
+     *
+     * @example
+     * expect({ id: "user-42" }).toEqual({ id: expect.stringMatching(/^user-\d+$/) });
+     * expect({ id: "user-42" }).toEqual({ id: expect.stringMatching("^user-\\d+$") });
+     */
+    stringMatching(regex: string | String | RegExp): AsymmetricMatcher;
+    /**
+     * Matches any received value for which `predicate` returns a truthy value.
+     * Use it inside `toEqual` or `toBeCalledWith` instead of a literal value.
+     *
+     * `message` describes the predicate. It has no effect on the match. It is printed after the
+     * predicate wherever the matcher is printed, such as in a failure message or a snapshot.
+     *
+     * @example
+     * const isOdd = (n: number) => n % 2 === 1;
+     * expect({ count: 3 }).toEqual({ count: expect.toSatisfy(isOdd) });
+     * expect({ count: 3 }).toEqual({ count: expect.toSatisfy(isOdd, "an odd number") });
+     */
+    toSatisfy(predicate: (value: any) => unknown, message?: string): AsymmetricMatcher;
+    /**
+     * Matches a number close to the provided value.
+     * Use it when comparing floating point numbers in object properties or array items.
+     * To compare a number directly, use `.toBeCloseTo` instead.
+     *
+     * The optional `numDigits` argument limits the number of digits to check after the decimal point.
+     * For the default value 2, the test criterion is `Math.abs(expected - received) < 0.005` (that is, `10 ** -2 / 2`).
+     */
+    closeTo(num: number, numDigits?: number): AsymmetricMatcher;
+  }
+
+  interface AsymmetricMatchersBuiltinNegated {
+    /**
+     * Create an asymmetric matcher that fails when the promise's resolved value matches the chained matcher.
+     *
+     * @example
+     * expect(Promise.resolve("value")).toEqual(expect.not.resolvesTo.stringContaining("value")); // will fail
+     * expect(Promise.reject("value")).toEqual(expect.not.resolvesTo.stringContaining("value")); // will pass
+     * expect("value").toEqual(expect.not.resolvesTo.stringContaining("value")); // will pass
+     */
+    resolvesTo: ExpectNot;
+
+    /**
+     * Create an asymmetric matcher that fails when the promise's rejected value matches the chained matcher.
+     *
+     * @example
+     * expect(Promise.reject("value")).toEqual(expect.not.rejectsTo.stringContaining("value")); // will fail
+     * expect(Promise.resolve("value")).toEqual(expect.not.rejectsTo.stringContaining("value")); // will pass
+     * expect("value").toEqual(expect.not.rejectsTo.stringContaining("value")); // will pass
+     */
+    rejectsTo: ExpectNot;
+
+    /**
+     * `expect.not.arrayContaining(array)` matches a received array which
+     * does not contain all of the elements in the expected array. That is,
+     * the expected array is not a subset of the received array. It is the
+     * inverse of `expect.arrayContaining`.
+     *
+     * Optionally, pass a type for the elements as a generic argument.
+     */
+    arrayContaining<E = any>(arr: readonly E[]): AsymmetricMatcher;
+
+    /**
+     * `expect.not.objectContaining(object)` matches any received object
+     * that does not recursively match the expected properties. That is, the
+     * expected object is not a subset of the received object. Therefore,
+     * it matches a received object which contains properties that are not
+     * in the expected object. It is the inverse of `expect.objectContaining`.
+     *
+     * Optionally, pass a type for the object as a generic argument.
+     * This ensures that the object contains the desired structure.
+     */
+    objectContaining(obj: object): AsymmetricMatcher;
+
+    /**
+     * `expect.not.stringContaining(string)` matches the received string
+     * that does not contain the exact expected string. It is the inverse of
+     * `expect.stringContaining`.
+     */
+    stringContaining(str: string | String): AsymmetricMatcher;
+
+    /**
+     * `expect.not.stringMatching(string | regexp)` matches the received
+     * string that does not match the expected regexp. It is the inverse of
+     * `expect.stringMatching`.
+     */
+    stringMatching(str: string | String | RegExp): AsymmetricMatcher;
+
+    /**
+     * `expect.not.toSatisfy(predicate)` matches any received value for which
+     * `predicate` returns a falsy value. It is the inverse of `expect.toSatisfy`.
+     */
+    toSatisfy(predicate: (value: any) => unknown, message?: string): AsymmetricMatcher;
+
+    /**
+     * `expect.not.closeTo` matches a number not close to the provided value.
+     * Use it when comparing floating point numbers in object properties or array items.
+     * It is the inverse of `expect.closeTo`.
+     */
+    closeTo(num: number, numDigits?: number): AsymmetricMatcher;
+  }
+
+  /**
+   * The matchers available after `.resolves` and `.rejects`. Each one returns a promise that fulfills if the matcher
+   * passes and rejects with the failure if it doesn't.
+   */
+  export type AsyncMatchers<T = unknown> = MatchersBuiltin<T, Promise<void>> & {
+    [K in Exclude<keyof Matchers<T>, keyof MatchersBuiltin>]: Matchers<T>[K] extends (...args: infer Args) => unknown
+      ? (...args: Args) => Promise<void>
+      : Matchers<T>[K];
+    // `infer Args` only sees a custom matcher's last overload, without its type parameters. The rest come from here.
+  } & Matchers<T>;
+
+  export interface MatchersBuiltin<T = unknown, R = void> {
+    /**
+     * Negates the result of a subsequent assertion.
+     *
+     * @example
+     * expect(1).not.toBe(0);
+     * expect(null).not.toBeNull();
+     *
+     * @example
+     * expect(42).toEqual(42); // will pass
+     * expect(42).not.toEqual(42); // will fail
+     */
+    not: [R] extends [void] ? Matchers<unknown> : AsyncMatchers<unknown>;
+
+    /**
+     * Expects the value to be a promise that resolves, or a function that returns one.
+     *
+     * @example
+     * await expect(Promise.resolve(1)).resolves.toBe(1);
+     */
+    resolves: AsyncMatchers<Awaited<T extends (...args: any[]) => infer Returned ? Returned : T>>;
+
+    /**
+     * Expects the value to be a promise that rejects, or a function that returns one.
+     *
+     * @example
+     * await expect(Promise.reject("error")).rejects.toBe("error");
+     */
+    rejects: AsyncMatchers<unknown>;
+
+    /**
+     * Assertion which passes.
+     *
+     * @link https://jest-extended.jestcommunity.dev/docs/matchers/pass
+     * @example
+     * expect().pass();
+     * expect().pass("message is optional");
+     * expect().not.pass();
+     * expect().not.pass("hi");
+     *
+     * @param message the message to display if the test fails (optional)
+     */
+    pass: (message?: string) => R;
+
+    /**
+     * Assertion which fails.
+     *
+     * @link https://jest-extended.jestcommunity.dev/docs/matchers/fail
+     * @example
+     * expect().fail();
+     * expect().fail("message is optional");
+     * expect().not.fail();
+     * expect().not.fail("hi");
+     */
+    fail: (message?: string) => R;
+
+    /**
+     * Asserts that a value equals what is expected.
+     *
+     * - For non-primitive values, like objects and arrays,
+     * use `toEqual()` instead.
+     * - For floating-point numbers, use `toBeCloseTo()` instead.
+     *
+     * @example
+     * expect(100 + 23).toBe(123);
+     * expect("d" + "og").toBe("dog");
+     * expect([123]).toBe([123]); // fail, use toEqual()
+     * expect(3 + 0.14).toBe(3.14); // fail, use toBeCloseTo()
+     *
+     * // TypeScript errors:
+     * expect("hello").toBe(3.14); // typescript error + fail
+     * expect("hello").toBe<number>(3.14); // no typescript error, but still fails
+     *
+     * @param expected the expected value
+     */
+    toBe(expected: T): R;
+    toBe<X = T>(expected: NoInfer<X>): R;
+
+    /**
+     * Asserts that a number is odd.
+     *
+     * @link https://jest-extended.jestcommunity.dev/docs/matchers/number/#tobeodd
+     * @example
+     * expect(1).toBeOdd();
+     * expect(2).not.toBeOdd();
+     */
+    toBeOdd(): R;
+
+    /**
+     * Asserts that a number is even.
+     *
+     * @link https://jest-extended.jestcommunity.dev/docs/matchers/number/#tobeeven
+     * @example
+     * expect(2).toBeEven();
+     * expect(1).not.toBeEven();
+     */
+    toBeEven(): R;
+
+    /**
+     * Asserts that a value is close to the expected value, within floating point precision.
+     *
+     * For example, the following fails because arithmetic on decimal (base 10)
+     * values often has rounding errors in limited precision binary (base 2) representation.
+     *
+     * @example
+     * expect(0.2 + 0.1).toBe(0.3); // fails
+     *
+     * Use `toBeCloseTo` to compare floating point numbers for approximate equality.
+     *
+     * @example
+     * expect(0.2 + 0.1).toBeCloseTo(0.3, 5); // passes
+     *
+     * @param expected the expected value
+     * @param numDigits the number of digits to check after the decimal point. Default is `2`
+     */
+    toBeCloseTo(expected: number, numDigits?: number): R;
+
+    /**
+     * Asserts that a value is deeply equal to what is expected.
+     *
+     * @example
+     * expect(100 + 23).toBe(123);
+     * expect("d" + "og").toBe("dog");
+     * expect([456]).toEqual([456]);
+     * expect({ value: 1 }).toEqual({ value: 1 });
+     *
+     * @param expected the expected value
+     */
+    toEqual(expected: T): R;
+    toEqual<X = T>(expected: NoInfer<X>): R;
+
+    /**
+     * Asserts that a value is deeply and strictly equal to
+     * what is expected.
+     *
+     * There are two key differences from `toEqual()`:
+     * 1. It checks that the class is the same.
+     * 2. It checks that `undefined` values match as well.
+     *
+     * @example
+     * class Dog {
+     *   type = "dog";
+     * }
+     * const actual = new Dog();
+     * expect(actual).toStrictEqual(new Dog());
+     * expect(actual).toStrictEqual({ type: "dog" }); // fail
+     *
+     * @example
+     * const actual = { value: 1, name: undefined };
+     * expect(actual).toEqual({ value: 1 });
+     * expect(actual).toStrictEqual({ value: 1 }); // fail
+     *
+     * @param expected the expected value
+     */
+    toStrictEqual(expected: T): R;
+    toStrictEqual<X = T>(expected: NoInfer<X>): R;
+
+    /**
+     * Asserts that the value is deeply equal to an element in the expected array.
+     *
+     * The value must be an array or iterable, which includes strings.
+     *
+     * @example
+     * expect(1).toBeOneOf([1,2,3]);
+     * expect("foo").toBeOneOf(["foo", "bar"]);
+     * expect(true).toBeOneOf(new Set([true]));
+     *
+     * @param expected the expected value
+     */
+    toBeOneOf(expected: Iterable<T>): R;
+    toBeOneOf<X = T>(expected: NoInfer<Iterable<X>>): R;
+
+    /**
+     * Asserts that a value contains what is expected.
+     *
+     * The value must be an array or iterable, which
+     * includes strings.
+     *
+     * @example
+     * expect([1, 2, 3]).toContain(1);
+     * expect(new Set([true])).toContain(true);
+     * expect("hello").toContain("o");
+     *
+     * @param expected the expected value
+     */
+    toContain(expected: T extends Iterable<infer U> ? U : T): R;
+    toContain<X = T>(expected: NoInfer<X extends Iterable<infer U> ? U : X>): R;
+
+    /**
+     * Asserts that an `object` contains a key.
+     *
+     * The value must be an object.
+     *
+     * @example
+     * expect({ a: 'foo', b: 'bar', c: 'baz' }).toContainKey('a');
+     * expect({ a: 'foo', b: 'bar', c: 'baz' }).toContainKey('b');
+     * expect({ a: 'foo', b: 'bar', c: 'baz' }).toContainKey('c');
+     * expect({ a: 'foo', b: 'bar', c: 'baz' }).not.toContainKey('d');
+     *
+     * @param expected the expected value
+     */
+    toContainKey(expected: __internal.IfNeverThenElse<keyof T, PropertyKey>): R;
+    toContainKey<X = T>(expected: __internal.IfNeverThenElse<NoInfer<keyof X>, PropertyKey>): R;
+
+    /**
+     * Asserts that an `object` contains all the provided keys.
+     *
+     * The value must be an object.
+     *
+     * @example
+     * expect({ a: 'hello', b: 'world' }).toContainAllKeys(['a','b']);
+     * expect({ a: 'hello', b: 'world' }).toContainAllKeys(['b','a']);
+     * expect({ 1: 'hello', b: 'world' }).toContainAllKeys([1,'b']);
+     * expect({ a: 'hello', b: 'world' }).not.toContainAllKeys(['c']);
+     * expect({ a: 'hello', b: 'world' }).not.toContainAllKeys(['a']);
+     *
+     * @param expected the expected value
+     */
+    toContainAllKeys(expected: Array<__internal.IfNeverThenElse<keyof T, PropertyKey>>): R;
+    toContainAllKeys<X = T>(expected: Array<__internal.IfNeverThenElse<NoInfer<keyof X>, PropertyKey>>): R;
+
+    /**
+     * Asserts that an `object` contains at least one of the provided keys.
+     *
+     * The value must be an object.
+     *
+     * @example
+     * expect({ a: 'hello', b: 'world' }).toContainAnyKeys(['a']);
+     * expect({ a: 'hello', b: 'world' }).toContainAnyKeys(['b']);
+     * expect({ a: 'hello', b: 'world' }).toContainAnyKeys(['b', 'c']);
+     * expect({ a: 'hello', b: 'world' }).not.toContainAnyKeys(['c']);
+     *
+     * @param expected the expected value
+     */
+    toContainAnyKeys(expected: Array<__internal.IfNeverThenElse<keyof T, PropertyKey>>): R;
+    toContainAnyKeys<X = T>(expected: Array<__internal.IfNeverThenElse<NoInfer<keyof X>, PropertyKey>>): R;
+
+    /**
+     * Asserts that an `object` contains the provided value.
+     *
+     * This check is deep: it looks through child properties to find the
+     * expected value.
+     *
+     * The input value must be an object.
+     *
+     * @example
+     * const shallow = { hello: "world" };
+     * const deep = { message: shallow };
+     * const deepArray = { message: [shallow] };
+     * const o = { a: "foo", b: [1, "hello", true], c: "baz" };
+     *
+     * expect(shallow).toContainValue("world");
+     * expect({ foo: false }).toContainValue(false);
+     * expect(deep).toContainValue({ hello: "world" });
+     * expect(deepArray).toContainValue([{ hello: "world" }]);
+     *
+     * expect(o).toContainValue("foo", "barr");
+     * expect(o).toContainValue([1, "hello", true]);
+     * expect(o).not.toContainValue("qux");
+     *
+     * // NOT
+     * expect(shallow).not.toContainValue("foo");
+     * expect(deep).not.toContainValue({ foo: "bar" });
+     * expect(deepArray).not.toContainValue([{ foo: "bar" }]);
+     *
+     * @param expected the expected value
+     */
+    // Contributor note: In theory we could type this better but it would be a
+    // slow union to compute...
+    toContainValue(expected: unknown): R;
+
+    /**
+     * Asserts that an `object` contains the provided values.
+     *
+     * This is the same as {@link toContainValue}, but accepts an array of
+     * values instead.
+     *
+     * The value must be an object.
+     *
+     * @example
+     * const o = { a: 'foo', b: 'bar', c: 'baz' };
+     * expect(o).toContainValues(['foo']);
+     * expect(o).toContainValues(['baz', 'bar']);
+     * expect(o).not.toContainValues(['qux', 'foo']);
+     * @param expected the expected value
+     */
+    toContainValues(expected: Array<unknown>): R;
+
+    /**
+     * Asserts that an `object` contains all the provided values.
+     *
+     * The value must be an object.
+     *
+     * @example
+     * const o = { a: 'foo', b: 'bar', c: 'baz' };
+     * expect(o).toContainAllValues(['foo', 'bar', 'baz']);
+     * expect(o).toContainAllValues(['baz', 'bar', 'foo']);
+     * expect(o).not.toContainAllValues(['bar', 'foo']);
+     * @param expected the expected value
+     */
+    toContainAllValues(expected: Array<unknown>): R;
+
+    /**
+     * Asserts that an `object` contains any of the provided values.
+     *
+     * The value must be an object.
+     *
+     * @example
+     * const o = { a: 'foo', b: 'bar', c: 'baz' };
+     * expect(o).toContainAnyValues(['qux', 'foo']);
+     * expect(o).toContainAnyValues(['qux', 'bar']);
+     * expect(o).toContainAnyValues(['qux', 'baz']);
+     * expect(o).not.toContainAnyValues(['qux']);
+     * @param expected the expected value
+     */
+    toContainAnyValues(expected: Array<unknown>): R;
+
+    /**
+     * Asserts that an `object` contains all the provided keys.
+     *
+     * @example
+     * expect({ a: 'foo', b: 'bar', c: 'baz' }).toContainKeys(['a', 'b']);
+     * expect({ a: 'foo', b: 'bar', c: 'baz' }).toContainKeys(['a', 'b', 'c']);
+     * expect({ a: 'foo', b: 'bar', c: 'baz' }).not.toContainKeys(['a', 'b', 'e']);
+     *
+     * @param expected the expected value
+     */
+    toContainKeys(expected: Array<__internal.IfNeverThenElse<keyof T, PropertyKey>>): R;
+    toContainKeys<X = T>(expected: Array<__internal.IfNeverThenElse<NoInfer<keyof X>, PropertyKey>>): R;
+
+    /**
+     * Asserts that a value contains and equals what is expected.
+     *
+     * This matcher performs a deep equality check on array members,
+     * rather than checking for object identity.
+     *
+     * @example
+     * expect([{ a: 1 }]).toContainEqual({ a: 1 });
+     * expect([{ a: 1 }]).not.toContainEqual({ a: 2 });
+     *
+     * @param expected the expected value
+     */
+    toContainEqual(expected: T extends Iterable<infer U> ? U : T): R;
+    toContainEqual<X = T>(expected: NoInfer<X extends Iterable<infer U> ? U : X>): R;
+
+    /**
+     * Asserts that a value has a `.length` property
+     * that is equal to the expected length.
+     *
+     * @example
+     * expect([]).toHaveLength(0);
+     * expect("hello").toHaveLength(5);
+     *
+     * @param length the expected length
+     */
+    toHaveLength(length: number): R;
+
+    /**
+     * Asserts that a value has a property with the
+     * expected name, and value if provided.
+     *
+     * @example
+     * expect(new Set()).toHaveProperty("size");
+     * expect(new Uint8Array()).toHaveProperty("byteLength", 0);
+     * expect({ kitchen: { area: 20 }}).toHaveProperty("kitchen.area", 20);
+     * expect({ kitchen: { area: 20 }}).toHaveProperty(["kitchen", "area"], 20);
+     *
+     * @param keyPath the expected property name or path, or an index
+     * @param value the expected property value, if provided
+     */
+    toHaveProperty(keyPath: string | number | Array<string | number>, value?: unknown): R;
+
+    /**
+     * Asserts that a value is "truthy".
+     *
+     * To assert that a value equals `true`, use `toBe(true)` instead.
+     *
+     * @link https://developer.mozilla.org/en-US/docs/Glossary/Truthy
+     * @example
+     * expect(true).toBeTruthy();
+     * expect(1).toBeTruthy();
+     * expect({}).toBeTruthy();
+     */
+    toBeTruthy(): R;
+
+    /**
+     * Asserts that a value is "falsy".
+     *
+     * To assert that a value equals `false`, use `toBe(false)` instead.
+     *
+     * @link https://developer.mozilla.org/en-US/docs/Glossary/Falsy
+     * @example
+     * expect(false).toBeFalsy();
+     * expect(0).toBeFalsy();
+     * expect("").toBeFalsy();
+     */
+    toBeFalsy(): R;
+
+    /**
+     * Asserts that a value is defined (that is, not `undefined`).
+     *
+     * @example
+     * expect(true).toBeDefined();
+     * expect(undefined).toBeDefined(); // fail
+     */
+    toBeDefined(): R;
+
+    /**
+     * Asserts that a value is an instance of the given class or constructor.
+     *
+     * @example
+     * expect([]).toBeInstanceOf(Array);
+     * expect(null).toBeInstanceOf(Array); // fail
+     */
+    toBeInstanceOf(value: unknown): R;
+
+    /**
+     * Asserts that a value is `undefined`.
+     *
+     * @example
+     * expect(undefined).toBeUndefined();
+     * expect(null).toBeUndefined(); // fail
+     */
+    toBeUndefined(): R;
+
+    /**
+     * Asserts that a value is `null`.
+     *
+     * @example
+     * expect(null).toBeNull();
+     * expect(undefined).toBeNull(); // fail
+     */
+    toBeNull(): R;
+
+    /**
+     * Asserts that a value is `NaN`.
+     *
+     * Same as using `Number.isNaN()`.
+     *
+     * @example
+     * expect(NaN).toBeNaN();
+     * expect(Infinity).toBeNaN(); // fail
+     * expect("notanumber").toBeNaN(); // fail
+     */
+    toBeNaN(): R;
+
+    /**
+     * Asserts that a value is a `number` and is greater than the expected value.
+     *
+     * @example
+     * expect(1).toBeGreaterThan(0);
+     * expect(3.14).toBeGreaterThan(3);
+     * expect(9).toBeGreaterThan(9); // fail
+     *
+     * @param expected the expected number
+     */
+    toBeGreaterThan(expected: number | bigint): R;
+
+    /**
+     * Asserts that a value is a `number` and is greater than or equal to the expected value.
+     *
+     * @example
+     * expect(1).toBeGreaterThanOrEqual(0);
+     * expect(3.14).toBeGreaterThanOrEqual(3);
+     * expect(9).toBeGreaterThanOrEqual(9);
+     *
+     * @param expected the expected number
+     */
+    toBeGreaterThanOrEqual(expected: number | bigint): R;
+
+    /**
+     * Asserts that a value is a `number` and is less than the expected value.
+     *
+     * @example
+     * expect(-1).toBeLessThan(0);
+     * expect(3).toBeLessThan(3.14);
+     * expect(9).toBeLessThan(9); // fail
+     *
+     * @param expected the expected number
+     */
+    toBeLessThan(expected: number | bigint): R;
+
+    /**
+     * Asserts that a value is a `number` and is less than or equal to the expected value.
+     *
+     * @example
+     * expect(-1).toBeLessThanOrEqual(0);
+     * expect(3).toBeLessThanOrEqual(3.14);
+     * expect(9).toBeLessThanOrEqual(9);
+     *
+     * @param expected the expected number
+     */
+    toBeLessThanOrEqual(expected: number | bigint): R;
+
+    /**
+     * Asserts that a function throws an error.
+     *
+     * - If expected is a `string` or `RegExp`, it checks the `message` property.
+     * - If expected is an `Error` object, it checks the `name` and `message` properties.
+     * - If expected is an `Error` constructor, it checks the class of the `Error`.
+     * - If expected is not provided, it checks that anything was thrown.
+     *
+     * @example
+     * function fail() {
+     *   throw new Error("Oops!");
+     * }
+     * expect(fail).toThrow("Oops!");
+     * expect(fail).toThrow(/oops/i);
+     * expect(fail).toThrow(Error);
+     * expect(fail).toThrow();
+     *
+     * @param expected the expected error, error message, or error pattern
+     */
+    toThrow(expected?: unknown): R;
+
+    /**
+     * Asserts that a function throws an error.
+     *
+     * - If expected is a `string` or `RegExp`, it checks the `message` property.
+     * - If expected is an `Error` object, it checks the `name` and `message` properties.
+     * - If expected is an `Error` constructor, it checks the class of the `Error`.
+     * - If expected is not provided, it checks that anything was thrown.
+     *
+     * @example
+     * function fail() {
+     *   throw new Error("Oops!");
+     * }
+     * expect(fail).toThrowError("Oops!");
+     * expect(fail).toThrowError(/oops/i);
+     * expect(fail).toThrowError(Error);
+     * expect(fail).toThrowError();
+     *
+     * @param expected the expected error, error message, or error pattern
+     * @alias toThrow
+     */
+    toThrowError(expected?: unknown): R;
+
+    /**
+     * Asserts that a value matches a regular expression or includes a substring.
+     *
+     * @example
+     * expect("dog").toMatch(/dog/);
+     * expect("dog").toMatch("og");
+     *
+     * @param expected the expected substring or pattern.
+     */
+    toMatch(expected: string | RegExp): R;
+
+    /**
+     * Asserts that a value matches the most recent snapshot.
+     *
+     * @example
+     * expect([1, 2, 3]).toMatchSnapshot('hint message');
+     * @param hint Hint used to identify the snapshot in the snapshot file.
+     */
+    toMatchSnapshot(hint?: string): R;
+
+    /**
+     * Asserts that a value matches the most recent snapshot.
+     *
+     * @example
+     * expect([1, 2, 3]).toMatchSnapshot();
+     * expect({ a: 1, b: 2 }).toMatchSnapshot({ a: 1 });
+     * expect({ c: new Date() }).toMatchSnapshot({ c: expect.any(Date) });
+     *
+     * @param propertyMatchers Object containing properties to match against the value.
+     * @param hint Hint used to identify the snapshot in the snapshot file.
+     */
+    toMatchSnapshot(propertyMatchers?: object, hint?: string): R;
+
+    /**
+     * Asserts that a value matches the most recent inline snapshot.
+     *
+     * @example
+     * expect("Hello").toMatchInlineSnapshot();
+     * expect("Hello").toMatchInlineSnapshot(`"Hello"`);
+     *
+     * @param value The latest automatically-updated snapshot value.
+     */
+    toMatchInlineSnapshot(value?: string): R;
+
+    /**
+     * Asserts that a value matches the most recent inline snapshot.
+     *
+     * @example
+     * expect({ c: new Date() }).toMatchInlineSnapshot({ c: expect.any(Date) });
+     * expect({ c: new Date() }).toMatchInlineSnapshot({ c: expect.any(Date) }, `
+     * {
+     *   "v": Any<Date>,
+     * }
+     * `);
+     *
+     * @param propertyMatchers Object containing properties to match against the value.
+     * @param value The latest automatically-updated snapshot value.
+     */
+    toMatchInlineSnapshot(propertyMatchers?: object, value?: string): R;
+
+    /**
+     * Asserts that a value matches the contents of its own snapshot file. A string is compared as is.
+     * Any other value is first printed the way a snapshot prints it.
+     *
+     * If the file doesn't exist, it's created, except in CI. `--update-snapshots` rewrites a file that differs.
+     *
+     * @example
+     * await expect(render(page)).toMatchFileSnapshot("./snapshots/page.html");
+     *
+     * @param path The file's path, relative to the test file.
+     * @param hint Hint used to number the snapshot among the test's other snapshots.
+     */
+    toMatchFileSnapshot(path: string, hint?: string): Promise<void>;
+
+    /**
+     * Asserts that a function throws an error matching the most recent snapshot.
+     *
+     * @example
+     * function fail() {
+     *   throw new Error("Oops!");
+     * }
+     * expect(fail).toThrowErrorMatchingSnapshot();
+     * expect(fail).toThrowErrorMatchingSnapshot("This one should say Oops!");
+     *
+     * @param hint Hint used to identify the snapshot in the snapshot file.
+     */
+    toThrowErrorMatchingSnapshot(hint?: string): R;
+
+    /**
+     * Asserts that a function throws an error matching the most recent snapshot.
+     *
+     * @example
+     * function fail() {
+     *   throw new Error("Oops!");
+     * }
+     * expect(fail).toThrowErrorMatchingInlineSnapshot();
+     * expect(fail).toThrowErrorMatchingInlineSnapshot(`"Oops!"`);
+     *
+     * @param value The latest automatically-updated snapshot value.
+     */
+    toThrowErrorMatchingInlineSnapshot(value?: string): R;
+
+    /**
+     * Asserts that an object matches a subset of properties.
+     *
+     * @example
+     * expect({ a: 1, b: 2 }).toMatchObject({ b: 2 });
+     * expect({ c: new Date(), d: 2 }).toMatchObject({ d: 2 });
+     *
+     * @param subset Subset of properties to match with.
+     */
+    toMatchObject(subset: object): R;
+
+    /**
+     * Asserts that a value is empty.
+     *
+     * @example
+     * expect("").toBeEmpty();
+     * expect([]).toBeEmpty();
+     * expect({}).toBeEmpty();
+     * expect(new Set()).toBeEmpty();
+     */
+    toBeEmpty(): R;
+
+    /**
+     * Asserts that a value is an empty `object`.
+     *
+     * @example
+     * expect({}).toBeEmptyObject();
+     * expect({ a: 'hello' }).not.toBeEmptyObject();
+     */
+    toBeEmptyObject(): R;
+
+    /**
+     * Asserts that a value is `null` or `undefined`.
+     *
+     * @example
+     * expect(null).toBeNil();
+     * expect(undefined).toBeNil();
+     */
+    toBeNil(): R;
+
+    /**
+     * Asserts that a value is an `array`.
+     *
+     * @link https://jest-extended.jestcommunity.dev/docs/matchers/array/#tobearray
+     * @example
+     * expect([1]).toBeArray();
+     * expect(new Array(1)).toBeArray();
+     * expect({}).not.toBeArray();
+     */
+    toBeArray(): R;
+
+    /**
+     * Asserts that a value is an `array` of a certain length.
+     *
+     * @link https://jest-extended.jestcommunity.dev/docs/matchers/array/#tobearrayofsize
+     * @example
+     * expect([]).toBeArrayOfSize(0);
+     * expect([1]).toBeArrayOfSize(1);
+     * expect(new Array(1)).toBeArrayOfSize(1);
+     * expect({}).not.toBeArrayOfSize(0);
+     */
+    toBeArrayOfSize(size: number): R;
+
+    /**
+     * Asserts that a value is a `boolean`.
+     *
+     * @example
+     * expect(true).toBeBoolean();
+     * expect(false).toBeBoolean();
+     * expect(null).not.toBeBoolean();
+     * expect(0).not.toBeBoolean();
+     */
+    toBeBoolean(): R;
+
+    /**
+     * Asserts that a value is `true`.
+     *
+     * @example
+     * expect(true).toBeTrue();
+     * expect(false).not.toBeTrue();
+     * expect(1).not.toBeTrue();
+     */
+    toBeTrue(): R;
+
+    /**
+     * Asserts that a value matches a specific type.
+     *
+     * @link https://vitest.dev/api/expect.html#tobetypeof
+     * @example
+     * expect(1).toBeTypeOf("number");
+     * expect("hello").toBeTypeOf("string");
+     * expect([]).not.toBeTypeOf("boolean");
+     */
+    toBeTypeOf(type: "bigint" | "boolean" | "function" | "number" | "object" | "string" | "symbol" | "undefined"): R;
+
+    /**
+     * Asserts that a value is `false`.
+     *
+     * @example
+     * expect(false).toBeFalse();
+     * expect(true).not.toBeFalse();
+     * expect(0).not.toBeFalse();
+     */
+    toBeFalse(): R;
+
+    /**
+     * Asserts that a value is a `number`.
+     *
+     * @example
+     * expect(1).toBeNumber();
+     * expect(3.14).toBeNumber();
+     * expect(NaN).toBeNumber();
+     * expect(BigInt(1)).not.toBeNumber();
+     */
+    toBeNumber(): R;
+
+    /**
+     * Asserts that a value is a `number`, and is an integer.
+     *
+     * @example
+     * expect(1).toBeInteger();
+     * expect(3.14).not.toBeInteger();
+     * expect(NaN).not.toBeInteger();
+     */
+    toBeInteger(): R;
+
+    /**
+     * Asserts that a value is an `object`.
+     *
+     * @example
+     * expect({}).toBeObject();
+     * expect("notAnObject").not.toBeObject();
+     * expect(NaN).not.toBeObject();
+     */
+    toBeObject(): R;
+
+    /**
+     * Asserts that a value is a `number`, and is not `NaN` or `Infinity`.
+     *
+     * @example
+     * expect(1).toBeFinite();
+     * expect(3.14).toBeFinite();
+     * expect(NaN).not.toBeFinite();
+     * expect(Infinity).not.toBeFinite();
+     */
+    toBeFinite(): R;
+
+    /**
+     * Asserts that a value is a positive `number`.
+     *
+     * @example
+     * expect(1).toBePositive();
+     * expect(-3.14).not.toBePositive();
+     * expect(NaN).not.toBePositive();
+     */
+    toBePositive(): R;
+
+    /**
+     * Asserts that a value is a negative `number`.
+     *
+     * @example
+     * expect(-3.14).toBeNegative();
+     * expect(1).not.toBeNegative();
+     * expect(NaN).not.toBeNegative();
+     */
+    toBeNegative(): R;
+
+    /**
+     * Asserts that a value is a number between a start and end value.
+     *
+     * @param start the start number (inclusive)
+     * @param end the end number (exclusive)
+     */
+    toBeWithin(start: number, end: number): R;
+
+    /**
+     * Asserts that a value is equal to the expected string, ignoring any whitespace.
+     *
+     * @example
+     * expect(" foo ").toEqualIgnoringWhitespace("foo");
+     * expect("bar").toEqualIgnoringWhitespace(" bar ");
+     *
+     * @param expected the expected string
+     */
+    toEqualIgnoringWhitespace(expected: string): R;
+
+    /**
+     * Asserts that a value is a `symbol`.
+     *
+     * @example
+     * expect(Symbol("foo")).toBeSymbol();
+     * expect("foo").not.toBeSymbol();
+     */
+    toBeSymbol(): R;
+
+    /**
+     * Asserts that a value is a `function`.
+     *
+     * @example
+     * expect(() => {}).toBeFunction();
+     */
+    toBeFunction(): R;
+
+    /**
+     * Asserts that a value is a `Date` object.
+     *
+     * To check if a date is valid, use `toBeValidDate()` instead.
+     *
+     * @example
+     * expect(new Date()).toBeDate();
+     * expect(new Date(null)).toBeDate();
+     * expect("2020-03-01").not.toBeDate();
+     */
+    toBeDate(): R;
+
+    /**
+     * Asserts that a value is a valid `Date` object.
+     *
+     * @example
+     * expect(new Date()).toBeValidDate();
+     * expect(new Date(null)).not.toBeValidDate();
+     * expect("2020-03-01").not.toBeValidDate();
+     */
+    toBeValidDate(): R;
+
+    /**
+     * Asserts that a value is a `string`.
+     *
+     * @example
+     * expect("foo").toBeString();
+     * expect(new String("bar")).toBeString();
+     * expect(123).not.toBeString();
+     */
+    toBeString(): R;
+
+    /**
+     * Asserts that a value includes a `string`.
+     *
+     * For non-string values, use `toContain()` instead.
+     *
+     * @param expected the expected substring
+     */
+    toInclude(expected: string): R;
+
+    /**
+     * Asserts that a value includes a `string` the given number of times.
+     * @param expected the expected substring
+     * @param times the number of times the substring should occur
+     */
+    toIncludeRepeated(expected: string, times: number): R;
+
+    /**
+     * Asserts that a value satisfies a custom condition.
+     * @param predicate a function that receives the value passed to `expect` and returns a boolean
+     * @example
+     * expect(1).toSatisfy((val) => val > 0);
+     * expect("foo").toSatisfy((val) => val === "foo");
+     * expect("bar").not.toSatisfy((val) => val === "bun");
+     * @link https://vitest.dev/api/expect.html#tosatisfy
+     * @link https://jest-extended.jestcommunity.dev/docs/matchers/toSatisfy
+     */
+    toSatisfy(predicate: (value: T) => boolean): R;
+
+    /**
+     * Asserts that a value starts with a `string`.
+     *
+     * @param expected the string to start with
+     */
+    toStartWith(expected: string): R;
+
+    /**
+     * Asserts that a value ends with a `string`.
+     *
+     * @param expected the string to end with
+     */
+    toEndWith(expected: string): R;
+
+    /**
+     * Ensures that a mock function has returned successfully at least once.
+     *
+     * An unfulfilled promise counts as a failure, as does a thrown error.
+     */
+    toHaveReturned(): R;
+
+    /**
+     * Ensures that a mock function has returned successfully `times` times.
+     *
+     * An unfulfilled promise counts as a failure, as does a thrown error.
+     */
+    toHaveReturnedTimes(times: number): R;
+
+    /**
+     * Ensures that a mock function has returned a specific value.
+     * This matcher uses deep equality, like toEqual(), and supports asymmetric matchers.
+     */
+    toHaveReturnedWith(expected: unknown): R;
+
+    /**
+     * Ensures that a mock function has returned a specific value on its last invocation.
+     * This matcher uses deep equality, like toEqual(), and supports asymmetric matchers.
+     */
+    toHaveLastReturnedWith(expected: unknown): R;
+
+    /**
+     * Ensures that a mock function has returned a specific value on the nth invocation.
+     * This matcher uses deep equality, like toEqual(), and supports asymmetric matchers.
+     * @param n The 1-based index of the function call
+     * @param expected The expected return value
+     */
+    toHaveNthReturnedWith(n: number, expected: unknown): R;
+
+    /**
+     * Ensures that a mock function is called.
+     */
+    toHaveBeenCalled(): R;
+
+    /**
+     * Ensures that a mock function is called.
+     * @alias toHaveBeenCalled
+     */
+    toBeCalled(): R;
+
+    /**
+     * Ensures that a mock function is called exactly once.
+     */
+    toHaveBeenCalledOnce(): void;
+
+    /**
+     * Ensures that a mock function is called an exact number of times.
+     */
+    toHaveBeenCalledTimes(expected: number): R;
+
+    /**
+     * Ensures that a mock function is called an exact number of times.
+     * @alias toHaveBeenCalledTimes
+     */
+    toBeCalledTimes(expected: number): R;
+
+    /**
+     * Ensure that a mock function is called with specific arguments.
+     */
+    toHaveBeenCalledWith(...expected: unknown[]): R;
+
+    /**
+     * Ensure that a mock function is called with specific arguments.
+     * @alias toHaveBeenCalledWith
+     */
+    toBeCalledWith(...expected: unknown[]): R;
+
+    /**
+     * Ensure that a mock function is called with specific arguments for the last call.
+     */
+    toHaveBeenLastCalledWith(...expected: unknown[]): R;
+
+    /**
+     * Ensure that a mock function is called with specific arguments for the last call.
+     * @alias toHaveBeenLastCalledWith
+     */
+    lastCalledWith(...expected: unknown[]): R;
+
+    /**
+     * Ensure that a mock function is called with specific arguments for the nth call.
+     */
+    toHaveBeenNthCalledWith(n: number, ...expected: unknown[]): R;
+
+    /**
+     * Ensure that a mock function is called with specific arguments for the nth call.
+     * @alias toHaveBeenNthCalledWith
+     */
+    nthCalledWith(n: number, ...expected: unknown[]): R;
+
+    /**
+     * Ensure that a mock function is called exactly once, with specific arguments.
+     */
+    toHaveBeenCalledExactlyOnceWith(...expected: unknown[]): R;
+
+    /**
+     * Ensure that a mock function's first call came before `mock`'s first call.
+     * @param mock The mock function to compare with
+     * @param failIfNoFirstInvocation Whether to fail when the received mock function was never called. Defaults to `true`.
+     */
+    toHaveBeenCalledBefore(mock: Mock<(...args: any[]) => any>, failIfNoFirstInvocation?: boolean): R;
+
+    /**
+     * Ensure that a mock function's first call came after `mock`'s first call.
+     * @param mock The mock function to compare with
+     * @param failIfNoFirstInvocation Whether to fail when `mock` was never called. Defaults to `true`.
+     */
+    toHaveBeenCalledAfter(mock: Mock<(...args: any[]) => any>, failIfNoFirstInvocation?: boolean): R;
+
+    /**
+     * Ensures that a promise returned by a mock function has resolved at least once.
+     *
+     * A return value that isn't a promise counts as resolved. A thrown error counts as rejected.
+     */
+    toHaveResolved(): R;
+
+    /**
+     * Ensures that the promises returned by a mock function have resolved `times` times.
+     */
+    toHaveResolvedTimes(times: number): R;
+
+    /**
+     * Ensures that a promise returned by a mock function has resolved with a specific value.
+     * This matcher uses deep equality, like toEqual(), and supports asymmetric matchers.
+     */
+    toHaveResolvedWith(expected: unknown): R;
+
+    /**
+     * Ensures that the promise returned by a mock function's last call has resolved with a specific value.
+     * This matcher uses deep equality, like toEqual(), and supports asymmetric matchers.
+     */
+    toHaveLastResolvedWith(expected: unknown): R;
+
+    /**
+     * Ensures that the promise returned by a mock function's nth call has resolved with a specific value.
+     * This matcher uses deep equality, like toEqual(), and supports asymmetric matchers.
+     * @param n The 1-based index of the function call
+     * @param expected The expected resolved value
+     */
+    toHaveNthResolvedWith(n: number, expected: unknown): R;
+  }
+
+  /**
+   * An asymmetric matcher returned by a static `expect` method such as `expect.anything()` or `expect.stringContaining("...")`.
+   */
+  // Defined as an alias of `any` so that it does not trigger any type mismatch
+  export type AsymmetricMatcher = any;
+
+  export interface MatcherResult {
+    pass: boolean;
+    message?: string | (() => string);
+  }
+
+  export type CustomMatcher<E, P extends any[]> = (
+    this: MatcherContext,
+    expected: E,
+    ...matcherArguments: P
+  ) => MatcherResult | Promise<MatcherResult>;
+
+  /** All non-builtin matchers and asymmetric matchers that have been type-registered through declaration merging */
+  export type CustomMatchersDetected = Omit<Matchers<unknown>, keyof MatchersBuiltin<unknown>> &
+    Omit<AsymmetricMatchers, keyof AsymmetricMatchersBuiltin>;
+
+  /**
+   * If a matcher's type has been defined through declaration merging, enforces it.
+   * Otherwise enforces the generic custom matcher signature.
+   */
+  export type ExpectExtendMatchers<M> = {
+    [k in keyof M]: k extends keyof CustomMatchersDetected
+      ? CustomMatcher<unknown, Parameters<CustomMatchersDetected[k]>>
+      : CustomMatcher<unknown, any[]>;
+  };
+
+  /** Prints a value nested inside the one a {@link SnapshotSerializer} is printing. */
+  export type SnapshotPrinter = (
+    value: unknown,
+    config: SnapshotSerializerConfig,
+    indentation: string,
+    depth: number,
+    refs: unknown[],
+  ) => string;
+
+  /** The `pretty-format` options that snapshots are printed with. */
+  export interface SnapshotSerializerConfig {
+    /** The string each extra level adds to `indentation`. */
+    indent: string;
+    /** Printed between two items. */
+    spacingInner: string;
+    /** Printed after an opening bracket and before a closing bracket. */
+    spacingOuter: string;
+    min: boolean;
+    plugins: SnapshotSerializer[];
+    [option: string]: unknown;
+  }
+
+  /** A `pretty-format` plugin for {@link Expect.addSnapshotSerializer}. Either of the two plugin interfaces works. */
+  export type SnapshotSerializer = { test(value: any): boolean } & (
+    | {
+        serialize(
+          value: any,
+          config: SnapshotSerializerConfig,
+          indentation: string,
+          depth: number,
+          refs: unknown[],
+          printer: SnapshotPrinter,
+        ): string;
+      }
+    | {
+        print(value: any, print: (value: unknown) => string, indent: (text: string) => string): string;
+      }
+  );
+
+  /** Custom equality tester */
+  export type Tester = (this: TesterContext, a: any, b: any, customTesters: Tester[]) => boolean | undefined;
+
+  export type EqualsFunction = (
+    a: unknown,
+    b: unknown,
+    /** The custom testers to use. Testers from `expect.addEqualityTesters()` are only used if you pass them here. */
+    customTesters?: Array<Tester>,
+    /** Compare like `toStrictEqual()` instead of `toEqual()`. */
+    strictCheck?: boolean,
+  ) => boolean;
+
+  export interface TesterContext {
+    equals: EqualsFunction;
+  }
+
+  interface MatcherState extends ExpectState {
+    //currentConcurrentTestName?: () => string | undefined;
+    //error?: Error;
+    //expand: boolean;
+    //expectedAssertionsNumberError?: Error;
+    //isExpectingAssertionsError?: Error;
+    isNot: boolean;
+    //numPassingAsserts: number;
+    promise: string;
+  }
+
+  type MatcherHintColor = (arg: string) => string; // subset of Chalk type
+
+  interface MatcherUtils {
+    /** The testers registered with `expect.addEqualityTesters()`. Pass them on to `equals`. */
+    customTesters: Array<Tester>;
+    //dontThrow(): void; // (internally used by jest snapshot)
+    equals: EqualsFunction;
+    utils: Readonly<{
+      stringify(value: unknown): string;
+      printReceived(value: unknown): string;
+      printExpected(value: unknown): string;
+      /**
+       * Returns the lines that differ between two values, or between two strings.
+       *
+       * Returns `null` for two numbers, two bigints, two booleans, or an asymmetric matcher.
+       *
+       * @param options accepted for compatibility with Jest, but ignored
+       */
+      diff(expected: unknown, received: unknown, options?: object): string | null;
+      /** Returns two lines. The first has `name` and `value`'s type. The second has `name` and `print(value)`. */
+      printWithType<T>(name: string, value: T, print: (value: T) => string): string;
+      /** Colors text like an expected value. The text isn't quoted. */
+      EXPECTED_COLOR(...text: unknown[]): string;
+      /** Colors text like a received value. The text isn't quoted. */
+      RECEIVED_COLOR(...text: unknown[]): string;
+      /**
+       * Returns the first line of a failure message, such as `expect(received).toBeFoo(expected)`.
+       *
+       * @param received the text inside `expect()`'s parentheses
+       * @param expected the text inside the matcher's parentheses, or `""` for none
+       */
+      matcherHint(
+        matcherName: string,
+        received?: unknown,
+        expected?: unknown,
+        options?: {
+          isNot?: boolean;
+          promise?: string;
+          isDirectExpectCall?: boolean; // (internal)
+          comment?: string;
+          expectedColor?: MatcherHintColor;
+          receivedColor?: MatcherHintColor;
+          secondArgument?: string;
+          secondArgumentColor?: MatcherHintColor;
+        },
+      ): string;
+      //iterableEquality: Tester;
+      //subsetEquality: Tester;
+      // ...
+    }>;
+  }
+
+  type MatcherContext = MatcherUtils & MatcherState;
+
+  namespace JestMock {
+    /**
+     * Copyright (c) Meta Platforms, Inc. and affiliates.
+     *
+     * This source code is licensed under the MIT license found in the
+     * LICENSE file in the root directory of this source tree.
+     */
+    export interface ClassLike {
+      new (...args: any): any;
+    }
+
+    export type ConstructorLikeKeys<T> = keyof {
+      [K in keyof T as Required<T>[K] extends ClassLike ? K : never]: T[K];
+    };
+
+    // export const fn: <T extends FunctionLike = UnknownFunction>(
+    //   implementation?: T | undefined,
+    // ) => Mock<T>;
+
+    export type FunctionLike = (...args: any) => any;
+
+    export type MethodLikeKeys<T> = keyof {
+      [K in keyof T as Required<T>[K] extends FunctionLike ? K : never]: T[K];
+    };
+
+    export interface Mock<T extends (...args: any[]) => any> extends MockInstance<T> {
+      new (...args: Parameters<T>): ReturnType<T>;
+      (...args: Parameters<T>): ReturnType<T>;
+    }
+
+    /**
+     * All what the internal typings need is to be sure that we have any-function.
+     * `FunctionLike` type ensures that and helps to constrain the type as well.
+     * The default of `UnknownFunction` makes sure that `any`s do not leak to the
+     * user side. For instance, calling `fn()` without implementation will return
+     * a mock of `(...args: Array<unknown>) => unknown` type. If implementation
+     * is provided, its typings are inferred correctly.
+     */
+    // export interface Mock<T extends FunctionLike = UnknownFunction>
+    //   extends Function,
+    //     MockInstance<T> {
+    //   new (...args: Parameters<T>): ReturnType<T>;
+    //   (...args: Parameters<T>): ReturnType<T>;
+    // }
+
+    // export type Mocked<T> = T extends ClassLike
+    //   ? MockedClass<T>
+    //   : T extends FunctionLike
+    //   ? MockedFunction<T>
+    //   : T extends object
+    //   ? MockedObject<T>
+    //   : T;
+
+    // export const mocked: {
+    //   <T extends object>(
+    //     source: T,
+    //     options?: {
+    //       shallow: false;
+    //     },
+    //   ): Mocked<T>;
+    //   <T_1 extends object>(
+    //     source: T_1,
+    //     options: {
+    //       shallow: true;
+    //     },
+    //   ): MockedShallow<T_1>;
+    // };
+
+    // export type MockedClass<T extends ClassLike> = MockInstance<
+    //   (...args: ConstructorParameters<T>) => Mocked<InstanceType<T>>
+    // > &
+    //   MockedObject<T>;
+
+    // export type MockedFunction<T extends FunctionLike> = MockInstance<T> &
+    //   MockedObject<T>;
+
+    // type MockedFunctionShallow<T extends FunctionLike> = MockInstance<T> & T;
+
+    // export type MockedObject<T extends object> = {
+    //   [K in keyof T]: T[K] extends ClassLike
+    //     ? MockedClass<T[K]>
+    //     : T[K] extends FunctionLike
+    //     ? MockedFunction<T[K]>
+    //     : T[K] extends object
+    //     ? MockedObject<T[K]>
+    //     : T[K];
+    // } & T;
+
+    // type MockedObjectShallow<T extends object> = {
+    //   [K in keyof T]: T[K] extends ClassLike
+    //     ? MockedClass<T[K]>
+    //     : T[K] extends FunctionLike
+    //     ? MockedFunctionShallow<T[K]>
+    //     : T[K];
+    // } & T;
+
+    // export type MockedShallow<T> = T extends ClassLike
+    //   ? MockedClass<T>
+    //   : T extends FunctionLike
+    //   ? MockedFunctionShallow<T>
+    //   : T extends object
+    //   ? MockedObjectShallow<T>
+    //   : T;
+
+    // export type MockFunctionMetadata<
+    //   T = unknown,
+    //   MetadataType = MockMetadataType,
+    // > = MockMetadata<T, MetadataType>;
+
+    // export type MockFunctionMetadataType = MockMetadataType;
+
+    type MockFunctionResult<T extends FunctionLike = UnknownFunction> =
+      MockFunctionResultIncomplete | MockFunctionResultReturn<T> | MockFunctionResultThrow;
+
+    interface MockFunctionResultIncomplete {
+      type: "incomplete";
+      /**
+       * Result of a single call to a mock function that has not yet completed.
+       * This occurs if you test the result from within the mock function itself,
+       * or from within a function that was called by the mock.
+       */
+      value: undefined;
+    }
+
+    interface MockFunctionResultReturn<T extends FunctionLike = UnknownFunction> {
+      type: "return";
+      /**
+       * Result of a single call to a mock function that returned.
+       */
+      value: ReturnType<T>;
+    }
+
+    interface MockFunctionResultThrow {
+      type: "throw";
+      /**
+       * Result of a single call to a mock function that threw.
+       */
+      value: unknown;
+    }
+
+    interface MockFunctionState<T extends FunctionLike = FunctionLike> {
+      /**
+       * List of the call arguments of all calls that have been made to the mock.
+       */
+      calls: Array<Parameters<T>>;
+      /**
+       * List of all the object instances that have been instantiated from the mock.
+       */
+      instances: Array<ReturnType<T>>;
+      /**
+       * List of all the function contexts that have been applied to calls to the mock.
+       */
+      contexts: Array<ThisParameterType<T>>;
+      /**
+       * List of the call order indexes of the mock. Invocation order is indexed
+       * across all mocks in a test file, starting at `1`.
+       */
+      invocationCallOrder: number[];
+      /**
+       * Call arguments of the last call made to the mock, or `undefined` if the
+       * mock has not been called.
+       */
+      lastCall?: Parameters<T>;
+      /**
+       * List of the results of all calls that have been made to the mock.
+       */
+      results: Array<MockFunctionResult<T>>;
+      /**
+       * The settled result of each call so far. A returned promise is `"incomplete"` while it's pending, then
+       * `"fulfilled"` or `"rejected"`. Each read returns a new array.
+       */
+      readonly settledResults: Array<
+        | { type: "incomplete"; value: undefined }
+        | { type: "fulfilled"; value: Awaited<ReturnType<T>> }
+        | { type: "rejected"; value: unknown }
+      >;
+    }
+
+    export interface MockInstance<T extends FunctionLike = UnknownFunction> {
+      _isMockFunction: true;
+      _protoImpl: Function;
+      /**
+       * Returns the mock's implementation, or `undefined` if it has none.
+       *
+       * After `mockReturnValue()`, `mockResolvedValue()`, `mockRejectedValue()`, `mockReturnThis()` or
+       * `mockThrow()`, the implementation is a function that does what that method set up. Calling it
+       * doesn't count as a call of the mock.
+       *
+       * A `mockImplementationOnce()` function that is still waiting for its call is returned first. On a
+       * mock made with `vi`, so is a function for a waiting `mockReturnValueOnce()`,
+       * `mockResolvedValueOnce()`, `mockRejectedValueOnce()` or `mockThrowOnce()`.
+       */
+      getMockImplementation(): T | undefined;
+      getMockName(): string;
+      mock: MockFunctionState<T>;
+      mockClear(): this;
+      mockReset(): this;
+      mockRestore(): void;
+      mockImplementation(fn: T): this;
+      mockImplementationOnce(fn: T): this;
+      withImplementation(fn: T, callback: () => Promise<unknown>): Promise<void>;
+      withImplementation(fn: T, callback: () => void): void;
+      mockName(name: string): this;
+      mockReturnThis(): this;
+      mockReturnValue(value: ReturnType<T>): this;
+      mockReturnValueOnce(value: ReturnType<T>): this;
+      mockResolvedValue(value: ResolveType<T>): this;
+      mockResolvedValueOnce(value: ResolveType<T>): this;
+      mockRejectedValue(value: RejectType<T>): this;
+      mockRejectedValueOnce(value: RejectType<T>): this;
+      mockThrow(value: unknown): this;
+      mockThrowOnce(value: unknown): this;
+      [Symbol.dispose](): void;
+    }
+
+    // export type MockMetadata<T, MetadataType = MockMetadataType> = {
+    //   ref?: number;
+    //   members?: Record<string, MockMetadata<T>>;
+    //   mockImpl?: T;
+    //   name?: string;
+    //   refID?: number;
+    //   type?: MetadataType;
+    //   value?: T;
+    //   length?: number;
+    // };
+
+    // export type MockMetadataType =
+    //   | "object"
+    //   | "array"
+    //   | "regexp"
+    //   | "function"
+    //   | "constant"
+    //   | "collection"
+    //   | "null"
+    //   | "undefined";
+
+    // export class ModuleMocker {
+    //   private readonly _environmentGlobal;
+    //   private _mockState;
+    //   private _mockConfigRegistry;
+    //   private _spyState;
+    //   private _invocationCallCounter;
+    //   /**
+    //    * @see README.md
+    //    * @param global Global object of the test environment, used to create
+    //    * mocks
+    //    */
+    //   constructor(global: typeof globalThis);
+    //   private _getSlots;
+    //   private _ensureMockConfig;
+    //   private _ensureMockState;
+    //   private _defaultMockConfig;
+    //   private _defaultMockState;
+    //   private _makeComponent;
+    //   private _createMockFunction;
+    //   private _generateMock;
+    //   /**
+    //    * Check whether the given property of an object has been already replaced.
+    //    */
+    //   private _findReplacedProperty;
+    //   /**
+    //    * @see README.md
+    //    * @param metadata Metadata for the mock in the schema returned by the
+    //    * getMetadata method of this module.
+    //    */
+    //   generateFromMetadata<T>(metadata: MockMetadata<T>): Mocked<T>;
+    //   /**
+    //    * @see README.md
+    //    * @param component The component for which to retrieve metadata.
+    //    */
+    //   getMetadata<T = unknown>(
+    //     component: T,
+    //     _refs?: Map<T, number>,
+    //   ): MockMetadata<T> | null;
+    //   isMockFunction<T extends FunctionLike = UnknownFunction>(
+    //     fn: MockInstance<T>,
+    //   ): fn is MockInstance<T>;
+    //   isMockFunction<P extends Array<unknown>, R>(
+    //     fn: (...args: P) => R,
+    //   ): fn is Mock<(...args: P) => R>;
+    //   isMockFunction(fn: unknown): fn is Mock<UnknownFunction>;
+    //   fn<T extends FunctionLike = UnknownFunction>(implementation?: T): Mock<T>;
+    //   private _attachMockImplementation;
+    //   spyOn<
+    //     T extends object,
+    //     K extends PropertyLikeKeys<T>,
+    //     A extends "get" | "set",
+    //   >(
+    //     object: T,
+    //     methodKey: K,
+    //     accessType: A,
+    //   ): A extends "get"
+    //     ? SpiedGetter<T[K]>
+    //     : A extends "set"
+    //     ? SpiedSetter<T[K]>
+    //     : never;
+    //   spyOn<
+    //     T extends object,
+    //     K extends ConstructorLikeKeys<T> | MethodLikeKeys<T>,
+    //     V extends Required<T>[K],
+    //   >(
+    //     object: T,
+    //     methodKey: K,
+    //   ): V extends ClassLike | FunctionLike ? Spied<V> : never;
+    //   private _spyOnProperty;
+    //   replaceProperty<
+    //     T extends object,
+    //     K extends PropertyLikeKeys<T>,
+    //     V extends T[K],
+    //   >(object: T, propertyKey: K, value: V): Replaced<T[K]>;
+    //   clearAllMocks(): void;
+    //   resetAllMocks(): void;
+    //   restoreAllMocks(): void;
+    //   private _typeOf;
+    //   mocked<T extends object>(
+    //     source: T,
+    //     options?: {
+    //       shallow: false;
+    //     },
+    //   ): Mocked<T>;
+    //   mocked<T extends object>(
+    //     source: T,
+    //     options: {
+    //       shallow: true;
+    //     },
+    //   ): MockedShallow<T>;
+    // }
+
+    export type PropertyLikeKeys<T> = Exclude<keyof T, ConstructorLikeKeys<T> | MethodLikeKeys<T>>;
+
+    export type RejectType<T extends FunctionLike> = ReturnType<T> extends PromiseLike<any> ? unknown : never;
+
+    export interface Replaced<T = unknown> {
+      /**
+       * Restores the property to the value it had when it was mocked.
+       */
+      restore(): void;
+      /**
+       * Changes the value of the property.
+       */
+      replaceValue(value: T): this;
+    }
+
+    export function replaceProperty<
+      T extends object,
+      K_2 extends Exclude<
+        keyof T,
+        | keyof {
+            [K in keyof T as Required<T>[K] extends ClassLike ? K : never]: T[K];
+          }
+        | keyof {
+            [K_1 in keyof T as Required<T>[K_1] extends FunctionLike ? K_1 : never]: T[K_1];
+          }
+      >,
+      V extends T[K_2],
+    >(object: T, propertyKey: K_2, value: V): Replaced<T[K_2]>;
+
+    export type ResolveType<T extends FunctionLike> = ReturnType<T> extends PromiseLike<infer U> ? U : never;
+
+    export type Spied<T extends ClassLike | FunctionLike> = T extends ClassLike
+      ? SpiedClass<T>
+      : T extends FunctionLike
+        ? SpiedFunction<T>
+        : never;
+
+    export type SpiedClass<T extends ClassLike = UnknownClass> = MockInstance<
+      (...args: ConstructorParameters<T>) => InstanceType<T>
+    >;
+
+    export type SpiedFunction<T extends FunctionLike = UnknownFunction> = MockInstance<
+      (...args: Parameters<T>) => ReturnType<T>
+    >;
+
+    export type SpiedGetter<T> = MockInstance<() => T>;
+
+    export type SpiedSetter<T> = MockInstance<(arg: T) => void>;
+
+    export interface SpyInstance<T extends FunctionLike = UnknownFunction> extends MockInstance<T> {}
+
+    export const spyOn: {
+      <
+        T extends object,
+        K_2 extends Exclude<
+          keyof T,
+          | keyof {
+              [K in keyof T as Required<T>[K] extends ClassLike ? K : never]: T[K];
+            }
+          | keyof {
+              [K_1 in keyof T as Required<T>[K_1] extends FunctionLike ? K_1 : never]: T[K_1];
+            }
+        >,
+        V extends Required<T>[K_2],
+        A extends "set" | "get",
+      >(
+        object: T,
+        methodKey: K_2,
+        accessType: A,
+      ): A extends "get" ? SpiedGetter<V> : A extends "set" ? SpiedSetter<V> : never;
+      <
+        T_1 extends object,
+        K_5 extends
+          | keyof {
+              [K_3 in keyof T_1 as Required<T_1>[K_3] extends ClassLike ? K_3 : never]: T_1[K_3];
+            }
+          | keyof {
+              [K_4 in keyof T_1 as Required<T_1>[K_4] extends FunctionLike ? K_4 : never]: T_1[K_4];
+            },
+        V_1 extends Required<T_1>[K_5],
+      >(
+        object: T_1,
+        methodKey: K_5,
+      ): V_1 extends ClassLike | FunctionLike ? Spied<V_1> : never;
+    };
+
+    export interface UnknownClass {
+      new (...args: unknown[]): unknown;
+    }
+
+    export type UnknownFunction = (...args: unknown[]) => unknown;
+  }
+
+  export const expectTypeOf: typeof import("./vendor/expect-type").expectTypeOf;
+}

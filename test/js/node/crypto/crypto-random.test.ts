@@ -1,0 +1,496 @@
+import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { checkPrime, checkPrimeSync, randomBytes, randomFill, randomFillSync, randomInt, randomUUID } from "crypto";
+import { statSync } from "fs";
+import { bunEnv, bunExe, isLinux, isMacOS, isMusl, tempDir } from "harness";
+import { join } from "path";
+
+describe("arguments are validated as in Node", () => {
+  it("a proxy of a function is a callback", async () => {
+    const called = (call: (callback: (err: Error | null) => void) => void) =>
+      new Promise<void>((resolve, reject) => call(new Proxy(err => (err ? reject(err) : resolve()), {})));
+    await called(callback => randomBytes(4, callback));
+    await called(callback => randomInt(5, callback));
+    await called(callback => randomInt(1, 5, callback));
+    await called(callback => randomFill(new Uint8Array(4), callback));
+    await called(callback => randomFill(new Uint8Array(4), 0, callback));
+    await called(callback => randomFill(new Uint8Array(4), 0, 1, callback));
+  });
+
+  it("randomUUID refuses a proxy of an array", () => {
+    expect(() => randomUUID(new Proxy([], {}))).toThrow(expect.objectContaining({ code: "ERR_INVALID_ARG_TYPE" }));
+  });
+
+  it("randomUUID and randomFill report their arguments", () => {
+    // @ts-expect-error
+    expect(() => randomUUID(5)).toThrow('The "options" argument must be of type object. Received type number (5)');
+    // @ts-expect-error
+    expect(() => randomUUID({ disableEntropyCache: 1 })).toThrow(
+      'The "options.disableEntropyCache" property must be of type boolean. Received type number (1)',
+    );
+    // @ts-expect-error
+    expect(() => randomFillSync(5)).toThrow(
+      'The "buf" argument must be an instance of ArrayBuffer or ArrayBufferView. Received type number (5)',
+    );
+  });
+});
+
+describe("randomInt args validation", () => {
+  it("default min is 0 so max should be greater than 0", () => {
+    expect(() => randomInt(-1)).toThrow(RangeError);
+    expect(() => randomInt(0)).toThrow(RangeError);
+  });
+  it("max should be >= min", () => {
+    expect(() => randomInt(1, 0)).toThrow(RangeError);
+    expect(() => randomInt(10, 5)).toThrow(RangeError);
+  });
+
+  it("we allow negative numbers", () => {
+    expect(() => randomInt(-2, -1)).not.toThrow(RangeError);
+  });
+
+  it("max/min should not be greater than Number.MAX_SAFE_INTEGER or less than Number.MIN_SAFE_INTEGER", () => {
+    expect(() => randomInt(Number.MAX_SAFE_INTEGER + 1)).toThrow(TypeError);
+    expect(() => randomInt(-Number.MAX_SAFE_INTEGER - 1, -Number.MAX_SAFE_INTEGER + 1)).toThrow(TypeError);
+  });
+
+  it("max - min should be <= 281474976710655", () => {
+    expect(() => randomInt(-2, Number.MAX_SAFE_INTEGER)).toThrow(RangeError);
+    expect(() => randomInt(-Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER)).toThrow(RangeError);
+  });
+
+  it("accept large negative numbers", () => {
+    expect(() => randomInt(-Number.MAX_SAFE_INTEGER, -Number.MAX_SAFE_INTEGER + 1)).not.toThrow(RangeError);
+  });
+
+  it("should return undefined if called with callback", async () => {
+    const { resolve, promise } = Promise.withResolvers();
+
+    expect(
+      randomInt(1, 2, (err, num) => {
+        expect(err).toBeUndefined();
+        expect(num).toBe(1);
+        resolve();
+      }),
+    ).toBeUndefined();
+
+    await promise;
+  });
+});
+
+describe("randomBytes", () => {
+  it("error should be null", async () => {
+    const { resolve, promise } = Promise.withResolvers();
+
+    randomBytes(10, (err, buf) => {
+      expect(err).toBeNull();
+      expect(buf).toBeInstanceOf(Buffer);
+      resolve();
+    });
+
+    await promise;
+  });
+
+  // BoringSSL's RNG registers a pthread_atfork handler on first use and abort()s if that
+  // fails. macOS caps a process's atfork table (~680 entries on arm64); mimalloc once
+  // registered its fork handlers on every mi_heap_new (one per transpiled module) instead
+  // of once per process, so a program that imported ~700 modules and then asked for random
+  // bytes died with SIGABRT. Other libcs grow the table dynamically, so only Darwin bites.
+  it.skipIf(!isMacOS)("still works after transpiling hundreds of modules (atfork table not exhausted)", async () => {
+    const files: Record<string, string> = {};
+    let entry = "";
+    for (let i = 0; i < 800; i++) {
+      files[`m/m${i}.ts`] = `export const v${i}: number = ${i};\n`;
+      entry += `import "./m/m${i}.ts";\n`;
+    }
+    entry += `import { randomBytes } from "node:crypto";\nconsole.log("randomBytes", randomBytes(4).length);\n`;
+    files["entry.ts"] = entry;
+    using dir = tempDir("crypto-random-atfork", files);
+
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "entry.ts"],
+      cwd: String(dir),
+      // Each fresh transpile creates a mimalloc heap; a cache hit would skip that.
+      env: { ...bunEnv, BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0" },
+      stdout: "pipe",
+      stderr: "inherit",
+    });
+    const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+    expect(stdout).toBe("randomBytes 4\n");
+    expect(proc.signalCode).toBeNull();
+    expect(exitCode).toBe(0);
+  });
+});
+
+describe("randomFill bounds checking", () => {
+  // f32 can only represent integers exactly up to 2**24 (16777216). Previously the
+  // bounds check in assertSize cast the u32 offset to f32 before adding, so an offset
+  // of 16777217 rounded down to 16777216 and `size + offset > length` passed when the
+  // true sum exceeded the buffer length, leading to a heap write past the end.
+  //
+  // Without the fix this path writes out of bounds: debug panics on the slice bounds
+  // check and release writes past the allocation. Run in a subprocess so the test
+  // runner survives and records a clean failure either way.
+  it("randomFillSync rejects size + offset > length when offset exceeds 2**24", async () => {
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `const { randomFillSync } = require("crypto");
+         const length = 2 ** 24 + 2; // 16777218
+         const offset = 2 ** 24 + 1; // 16777217 -> rounds to 16777216 as f32
+         const size = 2;             // offset + size = 16777219 > 16777218
+         try {
+           randomFillSync(new ArrayBuffer(length), offset, size);
+           console.log("NO_THROW");
+         } catch (e) {
+           console.log(e.code);
+         }`,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+    expect(stdout.trim()).toBe("ERR_OUT_OF_RANGE");
+    expect(exitCode).toBe(0);
+  });
+
+  it("randomFillSync still accepts size + offset == length at the f32 precision boundary", () => {
+    const length = 2 ** 24 + 2;
+    const offset = 2 ** 24 + 1;
+    const size = 1; // offset + size = 16777218 == length, should be fine
+    const buf = new Uint8Array(length);
+    expect(() => randomFillSync(buf, offset, size)).not.toThrow();
+  });
+
+  it("randomFill (async) rejects size + offset > length when offset exceeds 2**24", async () => {
+    // Validation errors are thrown synchronously even for the async API. Without the
+    // fix the check passes and the threadpool writes past the end of the buffer, so
+    // run in a subprocess.
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `const { randomFill } = require("crypto");
+         try {
+           randomFill(new ArrayBuffer(2 ** 24 + 2), 2 ** 24 + 1, 2, () => {});
+           console.log("NO_THROW");
+         } catch (e) {
+           console.log(e.code);
+         }`,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout] = await Promise.all([proc.stdout.text(), proc.exited]);
+    expect(stdout.trim()).toBe("ERR_OUT_OF_RANGE");
+  });
+
+  it("randomFill (async) still accepts size + offset == length at the f32 precision boundary", async () => {
+    const length = 2 ** 24 + 2;
+    const offset = 2 ** 24 + 1;
+    const size = 1;
+    const buf = new Uint8Array(length);
+    const { promise, resolve } = Promise.withResolvers<Error | null>();
+    randomFill(buf, offset, size, err => resolve(err));
+    expect(await promise).toBeNull();
+  });
+});
+
+describe("randomFill default size with multi-byte typed arrays", () => {
+  // In the 3-arg form `randomFill(buf, offset, cb)`, the default size was computed
+  // as `buf.len - offset` where `buf.len` is the element count but `offset` had
+  // already been scaled to a byte offset by assertOffset. For element_size > 1 this
+  // either underflowed (panic in debug) or under-filled the buffer.
+  it("randomFill(Float64Array, offset, cb) does not underflow when byte offset > element count", async () => {
+    // Without the fix this underflows usize and panics in debug, so run in a subprocess.
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `const { randomFill } = require("crypto");
+         // 80 bytes, 10 elements; offset 2 elements = 16 bytes.
+         // Previously computed default size as 10 - 16 -> usize underflow.
+         randomFill(new Float64Array(10), 2, (err, buf) => {
+           if (err) return console.log("ERR:" + err.code);
+           console.log("OK", buf[0], buf[1]);
+         });`,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+    expect(stdout.trim()).toBe("OK 0 0");
+    expect(exitCode).toBe(0);
+  });
+
+  it("randomFill passes the buffer (not 0) to the callback when size is 0", async () => {
+    const buf = new Uint8Array(0);
+    const { promise, resolve } = Promise.withResolvers<[Error | null, unknown]>();
+    randomFill(buf, (err, b) => resolve([err, b]));
+    const [err, b] = await promise;
+    expect(err).toBeNull();
+    expect(b).toBe(buf);
+  });
+
+  it("randomFill(Float64Array, offset, cb) fills to the end of the buffer", async () => {
+    // Run several times since each byte has a 1/256 chance of being 0 anyway.
+    let tailFilled = false;
+    for (let i = 0; i < 8 && !tailFilled; i++) {
+      const buf = new Float64Array(100); // 800 bytes
+      const { promise, resolve } = Promise.withResolvers<Error | null>();
+      randomFill(buf, 1, err => resolve(err));
+      expect(await promise).toBeNull();
+      // Previously only bytes 8..744 were filled; bytes 744..800 stayed zero.
+      const bytes = new Uint8Array(buf.buffer);
+      if (bytes.subarray(744, 800).some(b => b !== 0)) tailFilled = true;
+    }
+    expect(tailFilled).toBe(true);
+  });
+});
+
+it("randomFill never reports success for bytes it didn't write", async () => {
+  const fill = (view: Uint8Array, change: () => void, offset = 0) => {
+    const { promise, resolve } = Promise.withResolvers<NodeJS.ErrnoException | null>();
+    randomFill(view, offset, err => resolve(err));
+    change();
+    return promise;
+  };
+  const zeros = Buffer.alloc(32);
+
+  const memory = new WebAssembly.Memory({ initial: 1, maximum: 2 });
+  expect(await fill(new Uint8Array(memory.buffer, 64, 32), () => memory.grow(1))).toBeNull();
+  expect(Buffer.from(memory.buffer, 64, 32)).not.toEqual(zeros);
+  expect(Buffer.from(memory.buffer, 32, 32)).toEqual(zeros);
+  expect(Buffer.from(memory.buffer, 96, 32)).toEqual(zeros);
+
+  const resizable = new ArrayBuffer(64, { maxByteLength: 64 });
+  expect(await fill(new Uint8Array(resizable), () => resizable.resize(32))).toBeNull();
+  expect(Buffer.from(resizable)).not.toEqual(zeros);
+
+  for (const offset of [32, 48]) {
+    const trimmed = new ArrayBuffer(64, { maxByteLength: 64 });
+    expect((await fill(new Uint8Array(trimmed), () => trimmed.resize(32), offset))?.code).toBe(
+      "ERR_CRYPTO_OPERATION_FAILED",
+    );
+  }
+
+  const outOfBounds = new ArrayBuffer(64, { maxByteLength: 64 });
+  expect((await fill(new Uint8Array(outOfBounds, 0, 64), () => outOfBounds.resize(32)))?.code).toBe(
+    "ERR_CRYPTO_OPERATION_FAILED",
+  );
+
+  const transferred = new ArrayBuffer(32);
+  expect((await fill(new Uint8Array(transferred), () => transferred.transfer()))?.code).toBe(
+    "ERR_CRYPTO_OPERATION_FAILED",
+  );
+});
+
+describe("checkPrime candidate handling", () => {
+  it("checkPrimeSync uses the candidate bytes provided at call time", () => {
+    expect(checkPrimeSync(Buffer.from([7]), { checks: 1 })).toBe(true);
+    expect(checkPrimeSync(Buffer.from([9]), { checks: 1 })).toBe(false);
+
+    const candidate = Buffer.from([7]);
+    let checksReads = 0;
+    const result = checkPrimeSync(candidate, {
+      get checks() {
+        checksReads++;
+        candidate[0] = 9;
+        return 1;
+      },
+    });
+    expect(checksReads).toBe(1);
+    expect(result).toBe(true);
+  });
+
+  it("checkPrime uses the candidate bytes provided at call time", async () => {
+    const candidate = Buffer.from([7]);
+    let checksReads = 0;
+    const { promise, resolve, reject } = Promise.withResolvers<boolean>();
+    checkPrime(
+      candidate,
+      {
+        get checks() {
+          checksReads++;
+          candidate[0] = 9;
+          return 1;
+        },
+      },
+      (err, result) => (err ? reject(err) : resolve(result)),
+    );
+    const result = await promise;
+    expect(checksReads).toBe(1);
+    expect(result).toBe(true);
+  });
+});
+
+// crypto.random* must use the BoringSSL userspace DRBG, not a kernel syscall
+// per call. The Rust port initially routed these through bun_core::csprng,
+// which on Linux calls libc getrandom(2) every time, incurring a syscall per
+// randomInt()/randomBytes()/randomFillSync() call where the Zig build (and
+// Node) incur zero after DRBG seeding.
+//
+// Verified by interposing libc getrandom via LD_PRELOAD and counting calls.
+// Linux/glibc only: musl may inline getrandom as a raw syscall, Windows/macOS
+// use different entropy syscalls, and the fix is platform-independent (same
+// BoringSSL RAND_bytes on every target).
+const cc = Bun.which("cc") || Bun.which("gcc") || Bun.which("clang");
+describe.concurrent.skipIf(!isLinux || isMusl || !cc)(
+  "crypto.random* uses a userspace DRBG (no getrandom per call)",
+  () => {
+    const N = 5000;
+    // BoringSSL seeds its thread-local CTR-DRBG once from the OS and thereafter
+    // runs in userspace. Allow a small budget for process startup, JSC, worker
+    // threads, etc.; the regression produced >= N calls.
+    const MAX_GETRANDOM_CALLS = 200;
+    // On Linux release builds Bun terminates via quick_exit(3), which skips
+    // __attribute__((destructor)) and atexit handlers, so every call is
+    // recorded in a file as it happens: one appended byte per call, so the
+    // file size is the count. An append is atomic and async-signal-safe.
+    //
+    // BoringSSL seeds its DRBG with syscall(SYS_getrandom, ...), not the libc
+    // wrapper. Those calls go to GETRANDOM_SYSCALL_COUNT_FILE.
+    const interposerSrc = `
+      #define _GNU_SOURCE
+      #include <stdarg.h>
+      #include <stdlib.h>
+      #include <dlfcn.h>
+      #include <fcntl.h>
+      #include <unistd.h>
+      #include <sys/syscall.h>
+      #include <sys/types.h>
+      static int out_fd = -1;
+      static int syscall_out_fd = -1;
+      static ssize_t (*real_getrandom)(void *, size_t, unsigned int) = 0;
+      static long (*real_syscall)(long, ...) = 0;
+      static int open_count_file(const char *env_name) {
+        const char *path = getenv(env_name);
+        return path ? open(path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644) : -1;
+      }
+      static void count_call(int fd) {
+        if (fd >= 0 && write(fd, "x", 1) != 1) abort();
+      }
+      __attribute__((constructor)) static void init(void) {
+        out_fd = open_count_file("GETRANDOM_COUNT_FILE");
+        syscall_out_fd = open_count_file("GETRANDOM_SYSCALL_COUNT_FILE");
+      }
+      ssize_t getrandom(void *buf, size_t buflen, unsigned int flags) {
+        if (!real_getrandom)
+          real_getrandom = (ssize_t (*)(void *, size_t, unsigned int))dlsym(RTLD_NEXT, "getrandom");
+        count_call(out_fd);
+        return real_getrandom(buf, buflen, flags);
+      }
+      long syscall(long number, ...) {
+        va_list ap;
+        va_start(ap, number);
+        long a[6];
+        for (int i = 0; i < 6; i++) a[i] = va_arg(ap, long);
+        va_end(ap);
+        if (!real_syscall)
+          real_syscall = (long (*)(long, ...))dlsym(RTLD_NEXT, "syscall");
+        if (number == SYS_getrandom) count_call(syscall_out_fd);
+        return real_syscall(number, a[0], a[1], a[2], a[3], a[4], a[5]);
+      }
+    `;
+
+    let so: string;
+    let dirPath: string;
+    let disposeDir: Disposable;
+    beforeAll(async () => {
+      const dir = tempDir("crypto-getrandom", { "interpose.c": interposerSrc });
+      disposeDir = dir;
+      dirPath = String(dir);
+      so = join(dirPath, "interpose.so");
+      await using ccProc = Bun.spawn({
+        cmd: [cc!, "-shared", "-fPIC", "-O2", "-o", so, join(dirPath, "interpose.c"), "-ldl"],
+        env: bunEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [, ccStderr, ccExit] = await Promise.all([ccProc.stdout.text(), ccProc.stderr.text(), ccProc.exited]);
+      if (ccExit !== 0) throw new Error("cc failed: " + ccStderr);
+    });
+    afterAll(() => disposeDir?.[Symbol.dispose]());
+
+    async function countGetrandom(name: string, script: string): Promise<number> {
+      const countFile = join(dirPath, `count-${name}.txt`);
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "-e", script],
+        env: { ...bunEnv, LD_PRELOAD: so, GETRANDOM_COUNT_FILE: countFile },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect({ stdout: stdout.trim(), exitCode, stderr }).toMatchObject({ stdout: "ok", exitCode: 0 });
+      return statSync(countFile).size;
+    }
+
+    it.each([
+      ["randomInt", `const c=require("crypto");for(let i=0;i<${N};i++)c.randomInt(0,1000);console.log("ok")`],
+      ["randomBytes", `const c=require("crypto");for(let i=0;i<${N};i++)c.randomBytes(8);console.log("ok")`],
+      [
+        "randomFillSync",
+        `const c=require("crypto");const b=new Uint8Array(8);for(let i=0;i<${N};i++)c.randomFillSync(b);console.log("ok")`,
+      ],
+      [
+        "randomUUID-disableEntropyCache",
+        `const c=require("crypto");for(let i=0;i<${N};i++)c.randomUUID({disableEntropyCache:true});console.log("ok")`,
+      ],
+      [
+        "getRandomValues-large",
+        `const b=new Uint8Array(1024);for(let i=0;i<${N};i++)crypto.getRandomValues(b);console.log("ok")`,
+      ],
+    ])("%s does not call getrandom(2) per iteration", async (name, script) => {
+      const calls = await countGetrandom(name, script);
+      expect(calls).toBeLessThan(MAX_GETRANDOM_CALLS);
+    });
+
+    // randomInt() must take its samples from the VM's entropy cache, not make a
+    // RAND_bytes call (about 0.5 µs) per sample. BoringSSL reseeds its DRBG with
+    // syscall(SYS_getrandom) every 4096 RAND_bytes calls (kReseedInterval), so
+    // the reseeds during a loop count those calls.
+    it("randomInt does not call RAND_bytes per iteration", async () => {
+      const RESEED_INTERVAL = 4096;
+      const script = `
+        const { statSync } = require("fs");
+        const c = require("crypto");
+        const reseeds = () => statSync(process.env.GETRANDOM_SYSCALL_COUNT_FILE).size;
+        const reseedsDuring = (n, fn) => {
+          const before = reseeds();
+          for (let i = 0; i < n; i++) fn();
+          return reseeds() - before;
+        };
+        console.log(
+          reseedsDuring(${4 * RESEED_INTERVAL}, () => c.randomUUID({ disableEntropyCache: true })),
+          reseedsDuring(${32 * RESEED_INTERVAL}, () => c.randomInt(1000)),
+        );
+      `;
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "-e", script],
+        env: {
+          ...bunEnv,
+          LD_PRELOAD: so,
+          GETRANDOM_SYSCALL_COUNT_FILE: join(dirPath, "syscall-count-randomInt.txt"),
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect({ stdout: stdout.trim(), exitCode, stderr }).toMatchObject({
+        stdout: expect.stringMatching(/^\d+ \d+$/),
+        exitCode: 0,
+      });
+      const [control, reseeds] = stdout.trim().split(" ").map(Number);
+      // randomUUID({ disableEntropyCache: true }) makes one RAND_bytes call
+      // per iteration, so it must reseed 4 times. Fewer means the interposer
+      // does not see the reseeds, and the check below proves nothing.
+      expect(control).toBeGreaterThanOrEqual(4);
+      // One RAND_bytes call per iteration reseeds 32 times. A thread that
+      // starts during the loop seeds its own DRBG, so allow a few.
+      expect(reseeds).toBeLessThan(8);
+    });
+  },
+);

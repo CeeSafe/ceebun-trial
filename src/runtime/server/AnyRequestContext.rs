@@ -1,0 +1,257 @@
+//! A generic wrapper for the HTTP(s) Server `RequestContext`s.
+//! Only really exists because of `NewServer()` and `NewRequestContext()` generics.
+
+use core::ffi::{c_uint, c_void};
+
+use bun_uws as uws;
+
+use crate::webcore::CookieMap;
+
+pub(crate) use super::request_context::AdditionalOnAbortCallback;
+use super::request_context::RequestContext;
+use super::{DebugHTTPSServer, DebugHTTPServer, HTTPSServer, HTTPServer};
+
+// The eight monomorphizations of `NewRequestContext` (ssl × debug × mux),
+// where mux = HTTP/2 or HTTP/3 (see `request_context::Req`).
+type HttpCtx = RequestContext<HTTPServer, false, false, false>;
+type HttpsCtx = RequestContext<HTTPSServer, true, false, false>;
+type DebugHttpCtx = RequestContext<DebugHTTPServer, false, true, false>;
+type DebugHttpsCtx = RequestContext<DebugHTTPSServer, true, true, false>;
+type HttpMuxCtx = RequestContext<HTTPServer, false, false, true>;
+type HttpsMuxCtx = RequestContext<HTTPSServer, true, false, true>;
+type DebugHttpMuxCtx = RequestContext<DebugHTTPServer, false, true, true>;
+type DebugHttpsMuxCtx = RequestContext<DebugHTTPSServer, true, true, true>;
+
+// The `bun_ptr::impl_tagged_ptr_union!` macro hits the orphan rule from
+// outside `bun_ptr`, so store `(tag: u8, ptr: *mut ())` as two fields.
+// A tagged-pointer pack would be 8 bytes instead of 16. AnyRequestContext is
+// stored inside `webcore::Request` (one per in-flight request); if profiling
+// flags the extra 8 bytes, move the impl_tagged_ptr_union! invocation into
+// `bun_ptr` for these eight types.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CtxTag {
+    None = 0,
+    Http,
+    Https,
+    DebugHttp,
+    DebugHttps,
+    HttpMux,
+    HttpsMux,
+    DebugHttpMux,
+    DebugHttpsMux,
+}
+
+#[derive(Copy, Clone)]
+pub struct AnyRequestContext {
+    pub(crate) tag: CtxTag,
+    pub ptr: *mut (),
+}
+
+impl AnyRequestContext {
+    pub(crate) const NULL: Self = Self {
+        tag: CtxTag::None,
+        ptr: core::ptr::null_mut(),
+    };
+}
+
+/// Internal: maps each `RequestContext` monomorphization to its tag so
+/// `AnyRequestContext::init` is generic over the eight types without `TypeList`.
+pub trait CtxKind {
+    const TAG: CtxTag;
+}
+
+const fn ctx_tag_for(ssl: bool, dbg: bool, mux: bool) -> CtxTag {
+    match (ssl, dbg, mux) {
+        (false, false, false) => CtxTag::Http,
+        (true, false, false) => CtxTag::Https,
+        (false, true, false) => CtxTag::DebugHttp,
+        (true, true, false) => CtxTag::DebugHttps,
+        (false, false, true) => CtxTag::HttpMux,
+        (true, false, true) => CtxTag::HttpsMux,
+        (false, true, true) => CtxTag::DebugHttpMux,
+        (true, true, true) => CtxTag::DebugHttpsMux,
+    }
+}
+
+// Blanket impl over the const-generic params so any `Ctx: RequestCtx` (which
+// is always a `RequestContext<_, SSL, DBG, MUX>`) also satisfies `CtxKind`
+// without callers having to spell the eight concrete types.
+impl<ThisServer, const SSL: bool, const DBG: bool, const MUX: bool> CtxKind
+    for RequestContext<ThisServer, SSL, DBG, MUX>
+{
+    const TAG: CtxTag = ctx_tag_for(SSL, DBG, MUX);
+}
+
+impl AnyRequestContext {
+    pub(crate) fn init<T: CtxKind>(request_ctx: *const T) -> Self {
+        Self {
+            tag: T::TAG,
+            ptr: request_ctx as *mut (),
+        }
+    }
+}
+
+/// Dispatch `$body` to the concrete RequestContext type behind the tagged
+/// pointer. The pointer types only differ in their const-generic parameters
+/// (ssl/debug/mux), so every method body is identical — this collapses what
+/// used to be hand-written switch arms per accessor.
+///
+/// Rust closures cannot be generic over
+/// `T`, so a macro is the closest structural equivalent.
+macro_rules! dispatch {
+    ($self:expr, $default:expr, |$T:ident, $ctx:ident| $body:expr) => {{
+        let this = $self;
+        macro_rules! arm {
+            ($Ty:ty) => {{
+                // SAFETY: tag matched; ptr is non-null and live for the
+                // duration of the dispatch arm. `RequestContext` is
+                // interior-mutable, so a shared reborrow suffices.
+                let $ctx = unsafe { &*this.ptr.cast::<$Ty>() };
+                type $T = $Ty;
+                let _ = core::marker::PhantomData::<$T>;
+                $body
+            }};
+        }
+        match this.tag {
+            CtxTag::None => $default,
+            CtxTag::Http => arm!(HttpCtx),
+            CtxTag::Https => arm!(HttpsCtx),
+            CtxTag::DebugHttp => arm!(DebugHttpCtx),
+            CtxTag::DebugHttps => arm!(DebugHttpsCtx),
+            CtxTag::HttpMux => arm!(HttpMuxCtx),
+            CtxTag::HttpsMux => arm!(HttpsMuxCtx),
+            CtxTag::DebugHttpMux => arm!(DebugHttpMuxCtx),
+            CtxTag::DebugHttpsMux => arm!(DebugHttpsMuxCtx),
+        }
+    }};
+    // Raw-pointer variant: hands the typed `*mut T` to `$body`. For `end_chunk`,
+    // which adopts the pipe's ref through that pointer and may release the
+    // context in its own frame.
+    ($self:expr, $default:expr, ptr |$T:ident, $ptr:ident| $body:expr) => {{
+        let this = $self;
+        macro_rules! arm {
+            ($Ty:ty) => {{
+                type $T = $Ty;
+                let $ptr = this.ptr.cast::<$T>();
+                $body
+            }};
+        }
+        match this.tag {
+            CtxTag::None => $default,
+            CtxTag::Http => arm!(HttpCtx),
+            CtxTag::Https => arm!(HttpsCtx),
+            CtxTag::DebugHttp => arm!(DebugHttpCtx),
+            CtxTag::DebugHttps => arm!(DebugHttpsCtx),
+            CtxTag::HttpMux => arm!(HttpMuxCtx),
+            CtxTag::HttpsMux => arm!(HttpsMuxCtx),
+            CtxTag::DebugHttpMux => arm!(DebugHttpMuxCtx),
+            CtxTag::DebugHttpsMux => arm!(DebugHttpsMuxCtx),
+        }
+    }};
+}
+
+impl AnyRequestContext {
+    pub(crate) fn set_additional_on_abort_callback(self, cb: Option<AdditionalOnAbortCallback>) {
+        dispatch!(self, (), |_T, ctx| {
+            if let Some(old) = ctx.additional_on_abort.replace(cb) {
+                debug_assert!(false, "additional_on_abort set twice");
+                old.deref();
+            }
+        })
+    }
+
+    pub(crate) fn memory_cost(self) -> usize {
+        dispatch!(self, 0, |_T, ctx| ctx.memory_cost())
+    }
+
+    pub fn get<T: CtxKind>(self) -> Option<*mut T> {
+        if self.tag == T::TAG {
+            Some(self.ptr.cast::<T>())
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn set_timeout(self, seconds: c_uint) -> bool {
+        dispatch!(self, false, |_T, ctx| ctx.set_timeout(seconds))
+    }
+
+    pub(crate) fn set_cookies(self, cookie_map: Option<*mut CookieMap>) {
+        dispatch!(self, (), |_T, ctx| ctx.set_cookies(cookie_map))
+    }
+
+    pub(crate) fn get_remote_socket_info(self) -> Option<uws::SocketAddress> {
+        dispatch!(self, None, |_T, ctx| ctx.get_remote_socket_info())
+    }
+
+    pub(crate) fn detach_request(self) {
+        dispatch!(self, (), |_T, ctx| {
+            ctx.req.set(None);
+        })
+    }
+
+    /// Wont actually set anything if `self` is `.none`
+    pub(crate) fn set_request(self, req: *mut uws::Request) {
+        dispatch!(self, (), |T, ctx| {
+            if T::IS_MUX {
+                // HTTP/2 and HTTP/3 populate url/headers eagerly
+                return;
+            }
+            // `Req<_,_> = c_void` (erased handle). For non-mux the underlying
+            // type is always `uws::Request`, so the cast is purely nominal.
+            ctx.req.set(Some(req.cast::<c_void>()));
+        })
+    }
+
+    pub(crate) fn get_request(self) -> Option<*mut uws::Request> {
+        dispatch!(self, None, |T, ctx| {
+            if T::IS_MUX {
+                // url/headers already on the Request
+                return None;
+            }
+            ctx.req.get().map(|p| p.cast::<uws::Request>())
+        })
+    }
+
+    pub fn ref_(self) {
+        dispatch!(self, (), |_T, ctx| ctx.ref_())
+    }
+
+    pub(crate) fn set_signal_aborted(self, reason: crate::server::jsc::CommonAbortReason) {
+        dispatch!(self, (), |_T, ctx| ctx.set_signal_aborted(reason))
+    }
+
+    /// Address of the server that received this request. `None` once detached.
+    pub(crate) fn server_ptr(self) -> Option<*const ()> {
+        dispatch!(self, None, |_T, ctx| {
+            ctx.server
+                .get()
+                .map(|server| server.as_const_ptr().cast::<()>())
+        })
+    }
+
+    pub fn deref(self) {
+        dispatch!(self, (), |_T, ctx| ctx.deref())
+    }
+
+    pub(crate) fn end_with_internal_server_error(self) {
+        dispatch!(self, (), |_T, ctx| ctx.end_with_internal_server_error())
+    }
+
+    pub fn on_request_body_stream_drained(self) {
+        dispatch!(self, (), |_T, ctx| ctx.on_request_body_stream_drained())
+    }
+
+    pub fn write_chunk(
+        self,
+        data: &crate::webcore::streams::Result,
+    ) -> crate::webcore::streams::Writable {
+        dispatch!(self, crate::webcore::streams::Writable::Done, |_T, ctx| ctx
+            .write_chunk(data))
+    }
+
+    pub fn end_chunk(self, err: Option<&crate::webcore::streams::StreamError>) {
+        dispatch!(self, (), ptr | T, ptr | T::end_chunk(ptr, err))
+    }
+}
