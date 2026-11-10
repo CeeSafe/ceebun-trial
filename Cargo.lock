@@ -537,8 +537,6 @@ dependencies = [
 name = "bun_csrf"
 version = "0.0.0"
 dependencies = [
- "bun_base64",
- "bun_boringssl_sys",
  "bun_core",
  "bun_sha_hmac",
  "strum",

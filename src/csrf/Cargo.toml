@@ -11,7 +11,5 @@ workspace = true
 
 [dependencies]
 strum.workspace = true
-bun_base64.workspace = true
 bun_core.workspace = true
 bun_sha_hmac.workspace = true
-bun_boringssl_sys.workspace = true
