@@ -9,20 +9,9 @@ const SECRET1: u64 = 0xe7037ed1a0b428db;
 const SECRET2: u64 = 0x8ebc6af09c88c6e3;
 const SECRET3: u64 = 0x589965cc75374cc3;
 
-/// The high 64 bits of `a * b`. CeeSafe has no 128-bit integer (Rust: `(a as u128) * (b as u128) >> 64`), so the
-/// product is built from 32-bit halves; none of the sums can overflow.
-fn mulHigh(a: u64, b: u64) -> u64 {
-    let al = a & 0xFFFF_FFFF;
-    let ah = a >> 32;
-    let bl = b & 0xFFFF_FFFF;
-    let bh = b >> 32;
-    let ll = al * bl;
-    let lh = al * bh;
-    let hl = ah * bl;
-    let hh = ah * bh;
-    let mid = (ll >> 32) + (lh & 0xFFFF_FFFF) + (hl & 0xFFFF_FFFF);
-    return hh + (lh >> 32) + (hl >> 32) + (mid >> 32);
-}
+/// The high 64 bits of `a * b` (Rust: `(a as u128) * (b as u128) >> 64`): one multiply instruction, whatever the C
+/// compiler (CeeSafe ADR 0092).
+fn mulHigh(a: u64, b: u64) -> u64 => a.mulHigh(b);
 
 /// `Wyhash::mix`: the low half of `a * b` xor the high half.
 fn mix(a: u64, b: u64) -> u64 => a.wrappingMul(b) ^ mulHigh(a, b);

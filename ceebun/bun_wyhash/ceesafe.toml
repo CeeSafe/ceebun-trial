@@ -2,4 +2,4 @@
 name = "bun_wyhash"
 version = "0.1.0"
 kind = "library"
-ceesafec = ">=0.31.0"
+ceesafec = ">=0.32.0"
