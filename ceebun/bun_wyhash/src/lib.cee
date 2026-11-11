@@ -1,0 +1,132 @@
+// A port of the one-shot path of `Wyhash` in src/wyhash/lib.rs: the wyhash final4 variant (48-byte rounds, 4
+// secrets), used by `Bun.hash()`, `RuntimeTranspilerCache` and the router.
+//
+// Rust's version reads through raw pointers (`read_unaligned`) to avoid bounds checks. This one is safe code: every
+// read is `readLE` on a slice.
+
+const SECRET0: u64 = 0xa0761d6478bd642f;
+const SECRET1: u64 = 0xe7037ed1a0b428db;
+const SECRET2: u64 = 0x8ebc6af09c88c6e3;
+const SECRET3: u64 = 0x589965cc75374cc3;
+
+/// The high 64 bits of `a * b`. CeeSafe has no 128-bit integer (Rust: `(a as u128) * (b as u128) >> 64`), so the
+/// product is built from 32-bit halves; none of the sums can overflow.
+fn mulHigh(a: u64, b: u64) -> u64 {
+    let al = a & 0xFFFF_FFFF;
+    let ah = a >> 32;
+    let bl = b & 0xFFFF_FFFF;
+    let bh = b >> 32;
+    let ll = al * bl;
+    let lh = al * bh;
+    let hl = ah * bl;
+    let hh = ah * bh;
+    let mid = (ll >> 32) + (lh & 0xFFFF_FFFF) + (hl & 0xFFFF_FFFF);
+    return hh + (lh >> 32) + (hl >> 32) + (mid >> 32);
+}
+
+/// `Wyhash::mix`: the low half of `a * b` xor the high half.
+fn mix(a: u64, b: u64) -> u64 => a.wrappingMul(b) ^ mulHigh(a, b);
+
+/// `Wyhash::read4`.
+fn read4(input: Slice<u8>, at: usize) -> u64 => input.readLE<u32>(at) as u64;
+
+/// `Wyhash::read8`.
+fn read8(input: Slice<u8>, at: usize) -> u64 => input.readLE<u64>(at);
+
+/// Four bytes at `at`, little-endian, with no bounds check: what Rust's `read4` is (`read_unaligned`).
+/// Safety: the caller proves `at + 4 <= input.length`.
+unsafe fn read4Unchecked(input: Slice<u8>, at: usize) -> u64 =>
+    Slice.fromRaw(input.ptr.add(at), 4).readLE<u32>(0) as u64;
+
+/// `small_key` for 4 to 16 bytes, as Rust writes it: the four reads are inside the key, which the branch that calls
+/// this proves once.
+/// Safety: `length >= 4`; `quarter` is 0 or 4, and 4 only when `length >= 8`, so every read ends at or before
+/// `length`.
+fn smallKeyUnchecked(input: Slice<u8>, seed0: u64) -> u64 {
+    let length = input.length;
+    let end = length.wrappingSub(4);
+    let quarter = (length >> 3) << 2;
+    let a = unsafe { (read4Unchecked(input, 0) << 32) | read4Unchecked(input, quarter) };
+    let b = unsafe { (read4Unchecked(input, end) << 32) | read4Unchecked(input, end.wrappingSub(quarter)) };
+    return finish(a, b, seed0, length);
+}
+
+/// `final2`.
+fn finish(a0: u64, b0: u64, s0: u64, length: usize) -> u64 {
+    let a = a0 ^ SECRET1;
+    let b = b0 ^ s0;
+    return mix(a.wrappingMul(b) ^ SECRET0 ^ (length as u64), mulHigh(a, b) ^ SECRET1);
+}
+
+/// `Wyhash::hash` with Rust's unchecked reads for keys of 4 to 16 bytes; everything else is `hash`.
+public fn hashUnchecked(seed: u64, input: Slice<u8>) -> u64 {
+    if (input.length >= 4 && input.length <= 16) {
+        return smallKeyUnchecked(input, seed ^ mix(seed ^ SECRET0, SECRET1));
+    }
+    return hash(seed, input);
+}
+
+/// `Wyhash::hash`.
+public fn hash(seed: u64, input: Slice<u8>) -> u64 {
+    let length = input.length;
+    let s = seed ^ mix(seed ^ SECRET0, SECRET1);
+    var s0 = s;
+    var a: u64 = 0;
+    var b: u64 = 0;
+
+    if (length <= 16) {
+        // `small_key`
+        if (length >= 4) {
+            let end = length - 4;
+            let quarter = (length >> 3) << 2;
+            a = (read4(input, 0) << 32) | read4(input, quarter);
+            b = (read4(input, end) << 32) | read4(input, end - quarter);
+        } else if (length != 0) {
+            a = ((input[0] as u64) << 16) | ((input[length >> 1] as u64) << 8) | (input[length - 1] as u64);
+        }
+    } else {
+        var i: usize = 0;
+        if (length >= 48) {
+            var s1 = s;
+            var s2 = s;
+            let bound = length - 48;
+            while (i < bound) {
+                // One bounds check per round: the block's length is then known for its six reads.
+                let block = input[i..i + 48];
+                s0 = mix(read8(block, 0) ^ SECRET1, read8(block, 8) ^ s0);
+                s1 = mix(read8(block, 16) ^ SECRET2, read8(block, 24) ^ s1);
+                s2 = mix(read8(block, 32) ^ SECRET3, read8(block, 40) ^ s2);
+                i += 48;
+            }
+            // `final0`
+            s0 ^= s1 ^ s2;
+        }
+        // `final1`
+        while (i + 16 < length) {
+            let pair = input[i..i + 16];
+            s0 = mix(read8(pair, 0) ^ SECRET1, read8(pair, 8) ^ s0);
+            i += 16;
+        }
+        let last = input[length - 16..length];
+        a = read8(last, 0);
+        b = read8(last, 8);
+    }
+
+    // `final2`
+    a ^= SECRET1;
+    b ^= s0;
+    let low = a.wrappingMul(b);
+    let high = mulHigh(a, b);
+    return mix(low ^ SECRET0 ^ (length as u64), high ^ SECRET1);
+}
+
+/// `bun_wyhash::Wyhash::hash` for the Rust shim.
+/// Safety: Rust passes the pointer and length of a live slice.
+@export("bun_wyhash__hash")
+fn hashC(seed: u64, input: *u8, length: usize) -> u64 => hash(seed, unsafe { Slice.fromRaw(input, length) });
+
+/// The same with `hashUnchecked`.
+/// Safety: Rust passes the pointer and length of a live slice.
+@export("bun_wyhash__hash_unchecked")
+fn hashUncheckedC(seed: u64, input: *u8, length: usize) -> u64 =>
+    hashUnchecked(seed, unsafe { Slice.fromRaw(input, length) });
