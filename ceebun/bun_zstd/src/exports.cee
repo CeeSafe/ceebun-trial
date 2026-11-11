@@ -1,0 +1,244 @@
+// The C ABI that the Rust shim (src/zstd/lib.rs) calls.
+//
+// Slices are lent for the call as pointer and length. A `Vec<u8>` changes sides (CeeSafe ADR 0090 §2.3): the shim
+// takes the caller's `Vec` apart, this side takes the block with `Vector.fromForeign`, works on it as a `Vector<u8>`
+// (growing it through the allocator both sides share) and gives it back with `Vector.intoForeign`; a new vector is
+// given the same way. That needs the allocator `ceebun_init` gives CeeSafe to be Rust's `#[global_allocator]`
+// (ceebun/host/ceebun_host.c).
+
+/// `ZstdError` as the shim's `error_from_code` reads it; 0 is success.
+fn errorCode(e: ZstdError) -> u8 => match (e) {
+    ZstdError.OutOfMemory => 1,
+    ZstdError.InvalidZstdData => 2,
+    ZstdError.DecompressionFailed => 3,
+    ZstdError.ZstdFailedToCreateInstance => 4,
+    ZstdError.ZstdDecompressionError => 5,
+    ZstdError.ShortRead => 6,
+};
+
+/// `Option<i32>` as the shim passes it.
+fn levelFromRust(hasLevel: bool, level: i32) -> i32? {
+    if (hasLevel) {
+        return level;
+    }
+    return null;
+}
+
+/// Takes the `Vec<u8>` whose parts the three pointers hold.
+/// Safety: the pointers are live; the parts are a block of the shared allocator with `length` initialised bytes, or
+/// capacity 0, and Rust has given the block up until `giveVector` writes parts back.
+unsafe fn takeVector(pointer: *mut *mut u8, length: *mut usize, capacity: *mut usize) -> Vector<u8> {
+    return Vector.fromForeign(pointer.read(), length.read(), capacity.read());
+}
+
+/// Gives `v` to Rust: writes its parts, which Rust owns from here. A vector that never allocated has capacity 0 and
+/// a null pointer.
+/// Safety: the pointers are live, and Rust rebuilds a `Vec<u8>` from the parts or, for capacity 0, makes an empty one.
+unsafe fn giveVector(v: Vector<u8>, pointer: *mut *mut u8, length: *mut usize, capacity: *mut usize) {
+    let parts = Vector.intoForeign(v);
+    pointer.write(parts.pointer);
+    length.write(parts.length);
+    capacity.write(parts.capacity);
+}
+
+/// `ZstdResult` for the shim: the size, with `error` null; or 0, with `error` the name from `ZSTD_getErrorName`.
+/// Safety: `error` is a live local of the shim.
+unsafe fn giveResult(result: ZstdResult, error: *mut *CChar) -> usize {
+    match (result) {
+        ZstdResult.Success(size) => {
+            error.write(0 as *CChar);
+            return size;
+        }
+        ZstdResult.Err(name) => {
+            error.write(name);
+            return 0;
+        }
+    }
+}
+
+/// `bun_zstd::compress`.
+/// Safety: Rust passes `dest` and `src` as the pointer and length of live slices, `dest` writable and touched by
+/// nothing else during the call; `error` is a live local.
+@export("bun_zstd__compress")
+fn compressC(
+    dest: *mut u8,
+    destLen: usize,
+    src: *u8,
+    srcLen: usize,
+    hasLevel: bool,
+    level: i32,
+    error: *mut *CChar,
+) -> usize {
+    let result = compress(
+        unsafe { SliceMut.fromRaw(dest, destLen) },
+        unsafe { Slice.fromRaw(src, srcLen) },
+        levelFromRust(hasLevel, level),
+    );
+    return unsafe { giveResult(result, error) };
+}
+
+/// `bun_zstd::compress_bound`.
+@export("bun_zstd__compress_bound")
+fn compressBoundC(srcSize: usize) -> usize => compressBound(srcSize);
+
+/// `bun_zstd::compress_append`: `out` is taken and given back; it does not grow.
+/// Safety: `takeVector`'s for the three pointers; `src` is a live slice; `error` is a live local.
+@export("bun_zstd__compress_append")
+fn compressAppendC(
+    pointer: *mut *mut u8,
+    length: *mut usize,
+    capacity: *mut usize,
+    src: *u8,
+    srcLen: usize,
+    hasLevel: bool,
+    level: i32,
+    error: *mut *CChar,
+) -> usize {
+    var out = unsafe { takeVector(pointer, length, capacity) };
+    let result = compressAppend(mut out, unsafe { Slice.fromRaw(src, srcLen) }, levelFromRust(hasLevel, level));
+    unsafe { giveVector(out, pointer, length, capacity); }
+    return unsafe { giveResult(result, error) };
+}
+
+/// `bun_zstd::is_error`.
+@export("bun_zstd__is_error")
+fn isErrorC(code: usize) -> bool => isError(code);
+
+/// `bun_zstd::get_decompressed_size`.
+/// Safety: `src` is a live slice.
+@export("bun_zstd__get_decompressed_size")
+fn getDecompressedSizeC(src: *u8, srcLen: usize) -> usize => getDecompressedSize(unsafe { Slice.fromRaw(src, srcLen) });
+
+/// A new vector for the shim, or the error's code with the three pointers untouched.
+/// Safety: `giveVector`'s.
+unsafe fn giveNew(
+    result: Result<Vector<u8>, ZstdError>,
+    pointer: *mut *mut u8,
+    length: *mut usize,
+    capacity: *mut usize,
+) -> u8 {
+    match (result) {
+        Ok(v) => {
+            giveVector(v, pointer, length, capacity);
+            return 0;
+        }
+        Err(e) => {
+            return errorCode(e);
+        }
+    }
+}
+
+/// `bun_zstd::decompress_alloc`: on 0 the three pointers hold the parts of the output, which Rust owns.
+/// Safety: `src` is a live slice; the three pointers are live locals.
+@export("bun_zstd__decompress_alloc")
+fn decompressAllocC(src: *u8, srcLen: usize, pointer: *mut *mut u8, length: *mut usize, capacity: *mut usize) -> u8 {
+    let result = decompressAlloc(unsafe { Slice.fromRaw(src, srcLen) });
+    return unsafe { giveNew(result, pointer, length, capacity) };
+}
+
+/// `bun_zstd::decompress_alloc_with_prefix`: as `bun_zstd__decompress_alloc`.
+/// Safety: `src` and `prefix` are live slices; the three pointers are live locals.
+@export("bun_zstd__decompress_alloc_with_prefix")
+fn decompressAllocWithPrefixC(
+    src: *u8,
+    srcLen: usize,
+    prefix: *u8,
+    prefixLen: usize,
+    pointer: *mut *mut u8,
+    length: *mut usize,
+    capacity: *mut usize,
+) -> u8 {
+    let result = decompressAllocWithPrefix(
+        unsafe { Slice.fromRaw(src, srcLen) },
+        unsafe { Slice.fromRaw(prefix, prefixLen) },
+    );
+    return unsafe { giveNew(result, pointer, length, capacity) };
+}
+
+/// `bun_zstd::inflate_embedded` and, with `nul`, `inflate_embedded_nul`: the parts of the inflated bytes, which Rust
+/// owns and boxes. An invalid frame panics, as Rust's `expect` does.
+/// Safety: `compressed` is a live slice; the three pointers are live locals.
+@export("bun_zstd__inflate_embedded")
+fn inflateEmbeddedC(
+    compressed: *u8,
+    compressedLen: usize,
+    nul: bool,
+    pointer: *mut *mut u8,
+    length: *mut usize,
+    capacity: *mut usize,
+) {
+    let bytes = unsafe { Slice.fromRaw(compressed, compressedLen) };
+    let inflated = if (nul) inflateEmbeddedNul(bytes) else inflateEmbedded(bytes);
+    unsafe { giveVector(inflated, pointer, length, capacity); }
+}
+
+/// `StreamingDecoder::new`: the decoder in a box that Rust holds by its address until `bun_zstd__StreamingDecoder__drop`;
+/// or null, with the error's code in `error`. Rust's decoder is not boxed; the box that cannot be allocated is
+/// `OutOfMemory`.
+/// Safety: `error` is a live local.
+@export("bun_zstd__StreamingDecoder__new")
+fn streamingDecoderNewC(error: *mut u8) -> *mut void {
+    match (StreamingDecoder.create()) {
+        Ok(decoder) => {
+            match (Box.create(decoder)) {
+                Ok(boxed) => {
+                    return Box.intoRaw(boxed) as *mut void;
+                }
+                Err(_) => {
+                    unsafe { error.write(errorCode(ZstdError.OutOfMemory)); }
+                    return 0 as *mut void;
+                }
+            }
+        }
+        Err(e) => {
+            unsafe { error.write(errorCode(e)); }
+            return 0 as *mut void;
+        }
+    }
+}
+
+/// `StreamingDecoder::is_inflating`.
+/// Safety: `decoder` came from `bun_zstd__StreamingDecoder__new`, is not dropped, and Rust holds `&self`.
+@export("bun_zstd__StreamingDecoder__is_inflating")
+fn streamingDecoderIsInflatingC(decoder: *void) -> bool {
+    let d = unsafe { Ptr.toBorrow(decoder as *StreamingDecoder) };
+    return d.isInflating();
+}
+
+/// `StreamingDecoder::decompress`: `out` is taken and given back, on every path. On 0, `consumed` holds the input
+/// bytes consumed.
+/// Safety: `decoder` came from `bun_zstd__StreamingDecoder__new`, is not dropped, and Rust holds `&mut self`; `input`
+/// is a live slice; `takeVector`'s for the three pointers; `consumed` is a live local.
+@export("bun_zstd__StreamingDecoder__decompress")
+fn streamingDecoderDecompressC(
+    decoder: *mut void,
+    input: *u8,
+    inputLen: usize,
+    pointer: *mut *mut u8,
+    length: *mut usize,
+    capacity: *mut usize,
+    maxOutput: usize,
+    isDone: bool,
+    consumed: *mut usize,
+) -> u8 {
+    let d = unsafe { Ptr.toBorrowMut(decoder as *mut StreamingDecoder) };
+    var out = unsafe { takeVector(pointer, length, capacity) };
+    let result = d.decompress(unsafe { Slice.fromRaw(input, inputLen) }, mut out, maxOutput, isDone);
+    unsafe { giveVector(out, pointer, length, capacity); }
+    match (result) {
+        Ok(n) => {
+            unsafe { consumed.write(n); }
+            return 0;
+        }
+        Err(e) => {
+            return errorCode(e);
+        }
+    }
+}
+
+/// `Drop for StreamingDecoder`.
+/// Safety: `decoder` came from `bun_zstd__StreamingDecoder__new` and this is its one drop.
+@export("bun_zstd__StreamingDecoder__drop")
+fn streamingDecoderDropC(decoder: *mut void) {
+    let boxed: Box<StreamingDecoder> = unsafe { Box.fromRaw(decoder as *mut StreamingDecoder) };
+}

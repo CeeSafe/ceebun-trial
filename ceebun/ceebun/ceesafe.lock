@@ -1,0 +1,21 @@
+# Written by ceesafec fetch (spec/tooling.md §4.3). Commit it with ceesafe.toml.
+
+[[package]]
+name = "bun_boringssl_sys"
+source = "path+../bun_boringssl_sys"
+
+[[package]]
+name = "bun_core"
+source = "path+../bun_core"
+
+[[package]]
+name = "bun_csrf"
+source = "path+../bun_csrf"
+
+[[package]]
+name = "bun_sha_hmac"
+source = "path+../bun_sha_hmac"
+
+[[package]]
+name = "bun_zstd"
+source = "path+../bun_zstd"

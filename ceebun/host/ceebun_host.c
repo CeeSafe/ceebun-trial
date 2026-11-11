@@ -5,15 +5,18 @@
 //   CeeSafe's reason, message, file, line and column.
 // - The allocator CeeSafe uses is the one Rust's `#[global_allocator]` is (`src/runtime/bin_entry/mod.rs`): mimalloc,
 //   or the C library's under ASAN (CEEBUN_MIMALLOC, from scripts/build/ceesafe.ts, is set exactly when `bun_asan` is
-//   not). The two sides then share one heap, but their blocks are not interchangeable (ADR 0088 §2.5): each side
-//   frees what it allocated through its own code, so a block CeeSafe hands out comes back through an export, and
-//   Rust never calls `mi_free` on it. A CeeSafe buffer adopted as a Rust `Vec` is left to a later CeeSafe ADR.
+//   not). The two sides then share one heap. Their blocks are still not interchangeable in general (ADR 0088 §2.5):
+//   each side frees what it allocated through its own code. The exception is a `Vec<u8>`'s buffer (CeeSafe ADR 0090):
+//   `bun_zstd` takes Rust's with `Vector.fromForeign` and gives one with `Vector.intoForeign`, so Rust frees and
+//   grows blocks CeeSafe allocated, and CeeSafe Rust's. That holds because both allocators free by address alone
+//   and reallocate a block whatever layout it was allocated with, and because `ceebun_realloc` returns a 16-aligned
+//   block for the less-aligned one a small `Vec<u8>` has.
 // - Debug builds (CEEBUN_READ_ENVIRONMENT, from scripts/build/ceesafe.ts) also read CEESAFE_ALLOC_REPORT and
 //   CEESAFE_FAIL_ALLOC_AT, for allocation reports and failure sweeps inside Bun. A release `bun` does not: every
 //   child process inherits the environment, and a stray CEESAFE_FAIL_ALLOC_AT would fail allocations in every `bun`
 //   a test or a script spawns.
-// - The exports are re-declared below as the Rust shims declare them (`src/csrf/lib.rs`). Next to the declarations
-//   ceesafec generates (`ceesafe_exports.h`), a CeeSafe export whose C type changes from this copy (parameter count,
+// - The exports are re-declared below as the Rust shims declare them (`src/csrf/lib.rs`, `src/zstd/lib.rs`). Next to
+//   the declarations ceesafec generates (`ceesafe_exports.h`), a CeeSafe export whose C type changes from this copy (parameter count,
 //   return type, constness, `bool`, an integer type distinct on this target) is a compile error. It does not see a
 //   change made to the Rust shim alone, a reordering of parameters of one type, or enum values: the Rust shim and
 //   this copy are kept in step by hand, until `--emit rust` (ADR 0088 stage C).
@@ -38,6 +41,29 @@ size_t bun_csrf__generate(const uint8_t *secret, size_t secret_len, const uint8_
 bool bun_csrf__verify(const uint8_t *token, size_t token_len, const uint8_t *secret, size_t secret_len,
                       const uint8_t *session_id, size_t session_id_len, uint64_t max_age_ms, uint8_t encoding,
                       uint8_t algorithm);
+
+// src/zstd/lib.rs: `has_level` and `level` are an `Option<i32>`; `pointer`, `length` and `capacity` are the parts of
+// a `Vec<u8>` that changes sides; a `uint8_t` result is 0 or a `ZstdError`.
+size_t bun_zstd__compress(uint8_t *dest, size_t dest_len, const uint8_t *src, size_t src_len, bool has_level,
+                          int32_t level, const char **error);
+size_t bun_zstd__compress_bound(size_t src_size);
+size_t bun_zstd__compress_append(uint8_t **pointer, size_t *length, size_t *capacity, const uint8_t *src,
+                                 size_t src_len, bool has_level, int32_t level, const char **error);
+bool bun_zstd__is_error(size_t code);
+size_t bun_zstd__get_decompressed_size(const uint8_t *src, size_t src_len);
+uint8_t bun_zstd__decompress_alloc(const uint8_t *src, size_t src_len, uint8_t **pointer, size_t *length,
+                                   size_t *capacity);
+uint8_t bun_zstd__decompress_alloc_with_prefix(const uint8_t *src, size_t src_len, const uint8_t *prefix,
+                                               size_t prefix_len, uint8_t **pointer, size_t *length,
+                                               size_t *capacity);
+void bun_zstd__inflate_embedded(const uint8_t *compressed, size_t compressed_len, bool nul, uint8_t **pointer,
+                                size_t *length, size_t *capacity);
+void *bun_zstd__StreamingDecoder__new(uint8_t *error);
+bool bun_zstd__StreamingDecoder__is_inflating(const void *decoder);
+uint8_t bun_zstd__StreamingDecoder__decompress(void *decoder, const uint8_t *input, size_t input_len,
+                                               uint8_t **pointer, size_t *length, size_t *capacity,
+                                               size_t max_output, bool is_done, size_t *consumed);
+void bun_zstd__StreamingDecoder__drop(void *decoder);
 
 // ─── The panic hook ───
 

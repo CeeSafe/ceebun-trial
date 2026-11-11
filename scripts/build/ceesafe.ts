@@ -27,12 +27,12 @@ import type { ResolvedDep } from "./source.ts";
 import { toolIdentityFile } from "./tools.ts";
 
 /** The umbrella root package: one archive per binary (ADR 0088 §2.1). */
-const root = "bun_csrf";
+const root = "ceebun";
 
 function ceesafec(): string {
   const found = process.env.CEESAFEC ?? Bun.which("ceesafec");
   assert(found !== null && found !== undefined, "ceesafec not found", {
-    hint: "Set CEESAFEC to the CeeSafe compiler (ceesafec 0.29.0 or later), or put it on the PATH.",
+    hint: "Set CEESAFEC to the CeeSafe compiler (ceesafec 0.31.0 or later: bun_zstd needs ADR 0090), or put it on the PATH.",
   });
   return found;
 }
