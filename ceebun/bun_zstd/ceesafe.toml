@@ -2,8 +2,8 @@
 name = "bun_zstd"
 version = "0.1.0"
 kind = "library"
-# Needs ADR 0090 (Vector.fromForeign, setLength): ceesafec 0.31.0, until its release a build of branch impl/0090.
-ceesafec = ">=0.30.0"
+# ADR 0090 (Vector.fromForeign, setLength) is in ceesafec 0.31.0.
+ceesafec = ">=0.31.0"
 
 [dependencies]
 bun_core = { path = "../bun_core" }
