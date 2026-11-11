@@ -1,3 +1,10 @@
+> **This is not Bun.** It is the CeeBun trial: Bun's `main` at commit `89452d2ac137` (2026-11-10) with two crates,
+> `bun_csrf` and `bun_zstd`, replaced by [CeeSafe](https://github.com/CeeSafe/CeeSafe) code under `ceebun/`. It is a
+> proof of concept, not a product, and is not affiliated with or endorsed by Oven. Bun is MIT licensed
+> ([LICENSE.md](LICENSE.md)); for Bun itself go to <https://github.com/oven-sh/bun>. The reports are in
+> [CeeSafe/CeeBun](https://github.com/CeeSafe/CeeBun) (`analysis/trials/`). Builds of this tree send no crash reports
+> to bun.report. The rest of this file is Bun's own README.
+
 <p align="center">
   <a href="https://bun.com"><img src="https://github.com/user-attachments/assets/50282090-adfd-4ddb-9e27-c30753c6b161" alt="Logo" height=170></a>
 </p>

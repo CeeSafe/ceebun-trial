@@ -2994,6 +2994,9 @@ mod draft {
         Ok(())
     }
 
+    /// CeeBun: a trial build with crates swapped for CeeSafe, not a build of Bun's.
+    const CEEBUN_TRIAL: bool = true;
+
     fn is_reporting_enabled() -> bool {
         if SUPPRESS_REPORTING.load(Ordering::Relaxed) {
             return false;
@@ -3007,6 +3010,12 @@ mod draft {
         // Environment variable to specifically enable or disable reporting
         if let Some(enable_crash_reporting) = env_var::BUN_ENABLE_CRASH_REPORTING::get() {
             return enable_crash_reporting;
+        }
+
+        // CeeBun: this is not a build of Bun's, so its crashes are not Oven's to receive. Nothing is sent to
+        // bun.report unless one of the two variables above asks for it.
+        if CEEBUN_TRIAL {
+            return false;
         }
 
         // A hardened build starts no other program and opens no connection that nobody asked for.
