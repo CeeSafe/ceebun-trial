@@ -1,0 +1,552 @@
+// A port of src/zstd/lib.rs: one-shot and streaming zstd over the copy of the zstd library linked into Bun.
+//
+// Rust's `Vec<u8>` is a `Vector<u8>` here. Where Rust writes into `spare_capacity_mut()` and commits with
+// `bun_core::vec::commit_spare`, this writes through the view's pointer above the length and commits with `setLength`
+// (CeeSafe ADR 0090 §2.2).
+
+// ─── FFI bindings ─────────────────────────────────────────────────────────
+// Rust's `pub mod c` stays in the Rust crate for the crates that call zstd directly (`NativeZstd`); these are the
+// functions this file calls. `ZSTD_DStream`, `ZSTD_DCtx` and `ZSTD_CCtx` are opaque, so their pointers are `*mut void`.
+
+/// `ZSTD_inBuffer`.
+@repr(C)
+struct ZstdInBuffer {
+    src: *void;
+    size: usize;
+    pos: usize;
+}
+
+/// `ZSTD_outBuffer`.
+@repr(C)
+struct ZstdOutBuffer {
+    dst: *mut void;
+    size: usize;
+    pos: usize;
+}
+
+/// `ZSTD_ErrorCode` (zstd_errors.h): the one value this file tests.
+const ZSTD_error_memory_allocation: u32 = 64;
+
+extern "C" {
+    fn ZSTD_compress(dst: *mut void, dstCapacity: usize, src: *void, srcSize: usize, compressionLevel: i32) -> usize;
+    fn ZSTD_compressBound(srcSize: usize) -> usize;
+    fn ZSTD_decompress(dst: *mut void, dstCapacity: usize, src: *void, compressedSize: usize) -> usize;
+    fn ZSTD_isError(code: usize) -> u32;
+    fn ZSTD_getErrorName(code: usize) -> *CChar;
+    fn ZSTD_defaultCLevel() -> i32;
+
+    fn ZSTD_createDStream() -> *mut void;
+    fn ZSTD_freeDStream(zds: *mut void) -> usize;
+    fn ZSTD_initDStream(zds: *mut void) -> usize;
+    fn ZSTD_decompressStream(zds: *mut void, output: *mut ZstdOutBuffer, input: *mut ZstdInBuffer) -> usize;
+
+    // `src` should point to the start of a series of ZSTD encoded and/or skippable frames, and `srcSize` must be the
+    // exact size of this series. Returns the decompressed size of all data in all successive frames,
+    // ZSTD_CONTENTSIZE_UNKNOWN if it cannot be determined, ZSTD_CONTENTSIZE_ERROR if an error occurred. If the source
+    // is untrusted, the decompressed size could be wrong or intentionally modified.
+    fn ZSTD_findDecompressedSize(src: *void, srcSize: usize) -> u64;
+
+    fn ZSTD_createDCtx() -> *mut void;
+    fn ZSTD_freeDCtx(dctx: *mut void) -> usize;
+    // References `prefix` as the raw content dictionary of the next frame only. It is not copied, so it has to
+    // outlive the decompression of that frame.
+    fn ZSTD_DCtx_refPrefix(dctx: *mut void, prefix: *void, prefixSize: usize) -> usize;
+    fn ZSTD_decompressDCtx(dctx: *mut void, dst: *mut void, dstCapacity: usize, src: *void, srcSize: usize) -> usize;
+    fn ZSTD_getErrorCode(functionResult: usize) -> u32;
+}
+
+// -----------------------------------
+
+/// Rust's `Result` (CeeSafe's own `Result` has that name).
+public enum ZstdResult {
+    Success(usize),
+    /// Always assigned from `ZSTD_getErrorName`: a static, zero-terminated C string.
+    Err(*CChar),
+}
+
+public enum ZstdError {
+    /// The output, or the decoder state the frame's window size dictates, could not be allocated.
+    OutOfMemory,
+    InvalidZstdData,
+    DecompressionFailed,
+    ZstdFailedToCreateInstance,
+    ZstdDecompressionError,
+    ShortRead,
+}
+
+/// `ZstdError::for_decompression`: the error for a failed (`ZSTD_isError`) decompression call; `other` is the
+/// non-allocation failure.
+/// Safety: `ZSTD_getErrorCode` is a pure function of its argument.
+fn forDecompression(rc: usize, other: ZstdError) -> ZstdError {
+    if (unsafe { ZSTD_getErrorCode(rc) } == ZSTD_error_memory_allocation) {
+        return ZstdError.OutOfMemory;
+    }
+    return other;
+}
+
+/// `level.unwrap_or_else(|| c::ZSTD_defaultCLevel())`.
+/// Safety: `ZSTD_defaultCLevel` takes nothing and returns a constant.
+fn levelOrDefault(level: i32?) -> i32 => match (level) {
+    Some(l) => l,
+    null => unsafe { ZSTD_defaultCLevel() },
+};
+
+/// ZSTD_compress(): compresses `src` content as a single zstd compressed frame into already allocated `dest`.
+/// Providing `dest.length >= compressBound(src.length)` guarantees that zstd will have enough space to successfully
+/// compress the data. Returns the compressed size written into `dest`, or the error's name.
+/// Safety: `dest` and `src` are live for their lengths; `ZSTD_compress` reads `src` and writes at most `dest.length`
+/// bytes of `dest`. `ZSTD_getErrorName` returns a static string.
+public fn compress(dest: SliceMut<u8>, src: Slice<u8>, level: i32?) -> ZstdResult {
+    let result = unsafe { ZSTD_compress(
+        dest.ptr as *mut void,
+        dest.length,
+        src.ptr as *void,
+        src.length,
+        levelOrDefault(level),
+    ) };
+    if (isError(result)) {
+        return ZstdResult.Err(unsafe { ZSTD_getErrorName(result) });
+    }
+    return ZstdResult.Success(result);
+}
+
+/// Safety: `ZSTD_compressBound` is a pure function of its argument.
+public fn compressBound(srcSize: usize) -> usize => unsafe { ZSTD_compressBound(srcSize) };
+
+/// `compress` into `out`'s spare capacity (append mode). On success `out.length` is advanced by the compressed size.
+/// Callers must ensure `out.capacity - out.length >= compressBound(src.length)` to guarantee success.
+/// Safety: the spare capacity is `out.capacity - out.length` writable bytes from the view's pointer plus the length,
+/// and `ZSTD_compress` writes at most that many; `setLength` covers exactly the `rc` bytes it initialised.
+public fn compressAppend(out: borrow mut Vector<u8>, src: Slice<u8>, level: i32?) -> ZstdResult {
+    let at = out.length;
+    let room = out.capacity - at;
+    let rc = unsafe { ZSTD_compress(
+        out.viewMut().ptr.add(at) as *mut void,
+        room,
+        src.ptr as *void,
+        src.length,
+        levelOrDefault(level),
+    ) };
+    if (isError(rc)) {
+        return ZstdResult.Err(unsafe { ZSTD_getErrorName(rc) });
+    }
+    unsafe { out.setLength(at + rc); }
+    return ZstdResult.Success(rc);
+}
+
+/// `ZSTD_isError`: true when a `size_t` return value (including from `compressBound`, see zstd.h:
+/// "ZSTD_compressBound() itself can fail, if `srcSize >= ZSTD_MAX_INPUT_SIZE`") is an error code rather than a size.
+/// Error codes are near `usize`'s maximum, so treating one as a size requests an absurd allocation.
+/// Safety: `ZSTD_isError` is a pure function of its argument.
+public fn isError(code: usize) -> bool => unsafe { ZSTD_isError(code) } != 0;
+
+/// `ZSTD_decompress` into `out`'s spare capacity, which is the output bound; commits the bytes written.
+/// Safety: as `compressAppend`; `ZSTD_decompress` writes at most `room` bytes.
+fn decompressAppend(out: borrow mut Vector<u8>, src: Slice<u8>) -> Result<void, ZstdError> {
+    let at = out.length;
+    let room = out.capacity - at;
+    let rc = unsafe { ZSTD_decompress(out.viewMut().ptr.add(at) as *mut void, room, src.ptr as *void, src.length) };
+    if (isError(rc)) {
+        return Err(forDecompression(rc, ZstdError.DecompressionFailed));
+    }
+    unsafe { out.setLength(at + rc); }
+    return Ok();
+}
+
+/// `0ULL - 1`.
+const ZSTD_CONTENTSIZE_UNKNOWN: usize = 0xFFFF_FFFF_FFFF_FFFF;
+/// `0ULL - 2`.
+const ZSTD_CONTENTSIZE_ERROR: usize = 0xFFFF_FFFF_FFFF_FFFE;
+/// 16MB safety limit.
+const MAX_PREALLOCATE_SIZE: usize = 16 * 1024 * 1024;
+
+/// `Vec::new()` then `try_reserve_exact(capacity)`.
+fn withCapacity(capacity: usize) -> Result<Vector<u8>, ZstdError> => match (Vector<u8>.withCapacity(capacity)) {
+    Ok(v) => Ok(v),
+    Err(_) => Err(ZstdError.OutOfMemory),
+};
+
+/// Decompress data, automatically allocating the output buffer.
+/// Handles both frames with known and unknown content sizes.
+/// For safety, if the reported decompressed size exceeds 16MB, streaming decompression is used instead.
+/// Output allocations fail with `ZstdError.OutOfMemory` instead of aborting.
+public fn decompressAlloc(src: Slice<u8>) -> Result<Vector<u8>, ZstdError> {
+    let size = getDecompressedSize(src);
+
+    if (size == ZSTD_CONTENTSIZE_ERROR) {
+        return Err(ZstdError.InvalidZstdData);
+    }
+
+    // Use streaming decompression if:
+    // 1. Content size is unknown, OR
+    // 2. Reported size exceeds safety limit (to prevent malicious inputs claiming huge sizes)
+    if (size == ZSTD_CONTENTSIZE_UNKNOWN || size > MAX_PREALLOCATE_SIZE) {
+        let initialCapacity = if (size == ZSTD_CONTENTSIZE_UNKNOWN)
+        // A frame's output is rarely smaller than its input.
+        src.length.max(STREAMING_OUTPUT_STEP).min(MAX_PREALLOCATE_SIZE)
+            else
+            // The header size is untrusted: reserve no more than the fast path below would.
+            MAX_PREALLOCATE_SIZE;
+        var list = withCapacity(initialCapacity)?;
+        var reader = ZstdReaderArrayList.init(src)?;
+        reader.readAll(mut list, true)?;
+        return Ok(list);
+    }
+
+    // Fast path: size is known and within reasonable limits
+    var output = withCapacity(size)?;
+    decompressAppend(mut output, src)?;
+    return Ok(output);
+}
+
+/// Decompresses one frame that was compressed with `prefix` as its raw content dictionary, which is referenced and
+/// not copied. The size has to be in the header of the frame, and at most 16 MB.
+/// Safety: `dctx` is live until it is freed below. `prefix`, `src` and the spare capacity are live for their lengths
+/// and outlive the calls, and at most `room` bytes are written; `setLength` covers exactly the `rc` bytes zstd
+/// initialised.
+public fn decompressAllocWithPrefix(src: Slice<u8>, prefix: Slice<u8>) -> Result<Vector<u8>, ZstdError> {
+    let size = getDecompressedSize(src);
+    // Also if it is unknown or invalid, which are the two largest values.
+    if (size > MAX_PREALLOCATE_SIZE) {
+        return Err(ZstdError.InvalidZstdData);
+    }
+    var output = withCapacity(size)?;
+    let dctx = unsafe { ZSTD_createDCtx() };
+    if (dctx.isNull()) {
+        return Err(ZstdError.OutOfMemory);
+    }
+    let room = output.capacity;
+    var rc = unsafe { ZSTD_DCtx_refPrefix(dctx, prefix.ptr as *void, prefix.length) };
+    if (!isError(rc)) {
+        rc = unsafe { ZSTD_decompressDCtx(
+            dctx,
+            output.viewMut().ptr as *mut void,
+            room,
+            src.ptr as *void,
+            src.length,
+        ) };
+    }
+    let _ = unsafe { ZSTD_freeDCtx(dctx) };
+    if (isError(rc)) {
+        return Err(forDecompression(rc, ZstdError.DecompressionFailed));
+    }
+    unsafe { output.setLength(rc); }
+    return Ok(output);
+}
+
+/// Safety: `src` is live for `src.length` bytes.
+public fn getDecompressedSize(src: Slice<u8>) -> usize =>
+    unsafe { ZSTD_findDecompressedSize(src.ptr as *void, src.length) } as usize;
+
+/// Minimum spare output capacity offered to `ZSTD_decompressStream` per call.
+const STREAMING_OUTPUT_STEP: usize = 4096;
+
+/// The largest `usize`: "unbounded" for the output caps.
+const USIZE_MAX: usize = 0xFFFF_FFFF_FFFF_FFFF;
+
+/// Rust's struct keeps `list_ptr: &mut Vec<u8>`; here the list is `readAll`'s parameter, as `StreamingDecoder` takes
+/// its output.
+struct ZstdReaderArrayList<region a> {
+    input: Slice<a, u8>;
+    zstd: *mut void;
+    state: bun_core.CompressState;
+    totalIn: usize;
+    /// Decompression-bomb guard: `readAll` errors instead of growing the output past this many bytes. Defaults to
+    /// unbounded.
+    maxOutputSize: usize;
+
+    /// Safety: `zstd` is a freshly created non-null DStream.
+    fn init(input: Slice<a, u8>) -> Result<ZstdReaderArrayList<a>, ZstdError> {
+        let zstd = unsafe { ZSTD_createDStream() };
+        if (zstd.isNull()) {
+            return Err(ZstdError.ZstdFailedToCreateInstance);
+        }
+        let _ = unsafe { ZSTD_initDStream(zstd) };
+        return Ok(ZstdReaderArrayList {
+            input: input,
+            zstd: zstd,
+            state: bun_core.CompressState.Uninitialized,
+            totalIn: 0,
+            maxOutputSize: USIZE_MAX,
+        });
+    }
+
+    /// Safety: `zstd` was created by `ZSTD_createDStream` and has not been freed (guarded by `state != End`).
+    fn end(borrow mut this) {
+        if (this.state != bun_core.CompressState.End) {
+            let _ = unsafe { ZSTD_freeDStream(this.zstd) };
+            this.state = bun_core.CompressState.End;
+        }
+    }
+
+    /// Safety: `zstd` is a valid DStream (`state != End`); the buffers point into the live input and into the list's
+    /// spare capacity with their sizes, and `setLength` covers exactly the bytes `ZSTD_decompressStream` wrote.
+    fn readAll(borrow mut this, list: borrow mut Vector<u8>, isDone: bool) -> Result<void, ZstdError> {
+        if (this.state == bun_core.CompressState.End || this.state == bun_core.CompressState.Error) {
+            return Ok();
+        }
+
+        while (this.state == bun_core.CompressState.Uninitialized || this.state == bun_core.CompressState.Inflating) {
+            let nextIn = this.input[this.totalIn..];
+
+            // If we have no input to process
+            if (nextIn.length == 0) {
+                if (isDone) {
+                    // If we're in the middle of inflating and stream is done, it's truncated
+                    if (this.state == bun_core.CompressState.Inflating) {
+                        this.state = bun_core.CompressState.Error;
+                        return Err(ZstdError.ZstdDecompressionError);
+                    }
+                    // No more input and stream is done, we can end
+                    this.end();
+                }
+                return Ok();
+            }
+
+            // Decompression-bomb guard: clamp the output space handed to a single ZSTD_decompressStream call so one
+            // call can never write past the cap.
+            let remainingOutput = this.maxOutputSize.saturatingSub(list.length);
+            if (remainingOutput == 0) {
+                this.state = bun_core.CompressState.Error;
+                return Err(ZstdError.ZstdDecompressionError);
+            }
+
+            if (list.reserve(STREAMING_OUTPUT_STEP).isErr()) {
+                this.state = bun_core.CompressState.Error;
+                return Err(ZstdError.OutOfMemory);
+            }
+            let at = list.length;
+            var inBuf = ZstdInBuffer { src: nextIn.ptr as *void, size: nextIn.length, pos: 0 };
+            var outBuf = ZstdOutBuffer {
+                dst: unsafe { list.viewMut().ptr.add(at) } as *mut void,
+                size: (list.capacity - at).min(remainingOutput),
+                pos: 0,
+            };
+
+            let rc = unsafe { ZSTD_decompressStream(
+                this.zstd,
+                borrow mut outBuf as *mut ZstdOutBuffer,
+                borrow mut inBuf as *mut ZstdInBuffer,
+            ) };
+            if (isError(rc)) {
+                this.state = bun_core.CompressState.Error;
+                return Err(forDecompression(rc, ZstdError.ZstdDecompressionError));
+            }
+
+            let bytesWritten = outBuf.pos;
+            let bytesRead = inBuf.pos;
+            unsafe { list.setLength(at + bytesWritten); }
+            this.totalIn += bytesRead;
+
+            if (rc == 0) {
+                // Frame is complete
+                this.state = bun_core.CompressState.Uninitialized; // Reset state since frame is complete
+
+                // Check if there's more input (multiple frames)
+                if (this.totalIn >= this.input.length) {
+                    // We've consumed all available input
+                    if (isDone) {
+                        // No more data coming, we can end the stream
+                        this.end();
+                        return Ok();
+                    }
+                    // Frame is complete and no more input available right now.
+                    // Just return normally - the caller can provide more data later if they have it.
+                    return Ok();
+                }
+                // More input available, reset for the next frame
+                // ZSTD_initDStream() safely resets the stream state without needing cleanup
+                // It's designed to be called multiple times on the same DStream object
+                let _ = unsafe { ZSTD_initDStream(this.zstd) };
+                continue;
+            }
+
+            // If rc > 0, decompressor needs more data
+            if (rc > 0) {
+                this.state = bun_core.CompressState.Inflating;
+            }
+
+            if (bytesRead == nextIn.length) {
+                // We've consumed all available input
+                if (bytesWritten > 0) {
+                    // We wrote some output, continue to see if we need more output space
+                    continue;
+                }
+
+                if (isDone) {
+                    // Stream is truncated - we're at EOF but need more data
+                    this.state = bun_core.CompressState.Error;
+                    return Err(ZstdError.ZstdDecompressionError);
+                }
+                // Not at EOF - we can retry with more data
+                return Err(ZstdError.ShortRead);
+            }
+        }
+        return Ok();
+    }
+
+    drop {
+        this.end();
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// StreamingDecoder
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Streaming zstd decoder that owns only the `ZSTD_DStream`. Unlike `ZstdReaderArrayList` it stores no input:
+/// input and output are passed to `decompress` per call, so callers can hold the decoder across multiple body chunks.
+public struct StreamingDecoder {
+    /// Never null.
+    stream: *mut void;
+    state: bun_core.CompressState;
+    /// Decompression-bomb guard: `decompress` errors instead of growing the output past this many bytes. Defaults to
+    /// unbounded.
+    maxOutputSize: usize;
+    /// zstd filled its last window and may hold more. `maxOutput` can end a call there.
+    outputFull: bool;
+
+    /// Safety: `stream` is a freshly created non-null DStream.
+    public fn create() -> Result<StreamingDecoder, ZstdError> {
+        let stream = unsafe { ZSTD_createDStream() };
+        if (stream.isNull()) {
+            return Err(ZstdError.ZstdFailedToCreateInstance);
+        }
+        let _ = unsafe { ZSTD_initDStream(stream) };
+        return Ok(StreamingDecoder {
+            stream: stream,
+            state: bun_core.CompressState.Uninitialized,
+            maxOutputSize: USIZE_MAX,
+            outputFull: false,
+        });
+    }
+
+    public fn isInflating(borrow this) -> bool => this.state == bun_core.CompressState.Inflating;
+
+    /// Append decompressed bytes to `out` (growing in 4096-byte steps) until `input` is consumed or `out.length`
+    /// reaches `maxOutput`. Returns the input bytes consumed. Returns `ShortRead` when more input is required and
+    /// `isDone` is false.
+    /// Safety: `stream` is a valid DStream (not freed); the buffers point into the live input and into `out`'s spare
+    /// capacity with their sizes, and `setLength` covers exactly the bytes zstd wrote.
+    public fn decompress(
+        borrow mut this,
+        input: Slice<u8>,
+        out: borrow mut Vector<u8>,
+        maxOutput: usize,
+        isDone: bool,
+    ) -> Result<usize, ZstdError> {
+        if (this.state == bun_core.CompressState.End || this.state == bun_core.CompressState.Error) {
+            return Ok(input.length);
+        }
+
+        var totalIn: usize = 0;
+        while (this.state == bun_core.CompressState.Uninitialized || this.state == bun_core.CompressState.Inflating) {
+            let nextIn = input[totalIn..];
+
+            // Call zstd again with no input until it leaves the window short.
+            if (nextIn.length == 0 && !this.outputFull) {
+                if (isDone) {
+                    if (this.state == bun_core.CompressState.Inflating) {
+                        this.state = bun_core.CompressState.Error;
+                        return Err(ZstdError.ZstdDecompressionError);
+                    }
+                    this.state = bun_core.CompressState.End;
+                }
+                return Ok(totalIn);
+            }
+
+            if (out.length >= maxOutput) {
+                return Ok(totalIn);
+            }
+
+            let remainingOutput = this.maxOutputSize.saturatingSub(out.length);
+            if (remainingOutput == 0) {
+                this.state = bun_core.CompressState.Error;
+                return Err(ZstdError.ZstdDecompressionError);
+            }
+
+            if (out.reserve(STREAMING_OUTPUT_STEP).isErr()) {
+                this.state = bun_core.CompressState.Error;
+                return Err(ZstdError.OutOfMemory);
+            }
+            let at = out.length;
+            let budget = maxOutput - at;
+            var inBuf = ZstdInBuffer { src: nextIn.ptr as *void, size: nextIn.length, pos: 0 };
+            var outBuf = ZstdOutBuffer {
+                dst: unsafe { out.viewMut().ptr.add(at) } as *mut void,
+                size: (out.capacity - at).min(remainingOutput).min(budget),
+                pos: 0,
+            };
+
+            let rc = unsafe { ZSTD_decompressStream(
+                this.stream,
+                borrow mut outBuf as *mut ZstdOutBuffer,
+                borrow mut inBuf as *mut ZstdInBuffer,
+            ) };
+            if (isError(rc)) {
+                this.state = bun_core.CompressState.Error;
+                return Err(forDecompression(rc, ZstdError.ZstdDecompressionError));
+            }
+
+            let bytesWritten = outBuf.pos;
+            let bytesRead = inBuf.pos;
+            this.outputFull = bytesWritten == outBuf.size;
+            unsafe { out.setLength(at + bytesWritten); }
+            totalIn += bytesRead;
+
+            if (rc == 0) {
+                // Frame complete, and fully flushed.
+                this.state = bun_core.CompressState.Uninitialized;
+                this.outputFull = false;
+                if (totalIn >= input.length) {
+                    if (isDone) {
+                        this.state = bun_core.CompressState.End;
+                    }
+                    return Ok(totalIn);
+                }
+                // More input available: reinitialize for the next frame.
+                let _ = unsafe { ZSTD_initDStream(this.stream) };
+                continue;
+            }
+
+            this.state = bun_core.CompressState.Inflating;
+
+            if (bytesRead == nextIn.length) {
+                if (this.outputFull) {
+                    continue;
+                }
+                if (isDone) {
+                    this.state = bun_core.CompressState.Error;
+                    return Err(ZstdError.ZstdDecompressionError);
+                }
+                return Err(ZstdError.ShortRead);
+            }
+        }
+        return Ok(totalIn);
+    }
+
+    /// Safety: `stream` was created by `ZSTD_createDStream`; freed once here.
+    drop {
+        let _ = unsafe { ZSTD_freeDStream(this.stream) };
+    }
+}
+
+// ── compressed embedded assets ────────────────────────────────────────────
+// `embed_compressed!` stays in the Rust crate: it expands in the caller's crate to `include_bytes!` and a static.
+
+/// Cold, shared body of `embed_compressed!`'s release arm. Rust returns a `Box<[u8]>`; the shim boxes this vector.
+public fn inflateEmbedded(compressed: Slice<u8>) -> Vector<u8> => match (decompressAlloc(compressed)) {
+    Ok(inflated) => inflated,
+    Err(_) => {
+        panic("embedded asset: invalid zstd frame");
+    }
+};
+
+/// `inflateEmbedded` plus a trailing NUL byte. Rust's `reserve_exact` and `push` abort when out of memory, as `!`
+/// does.
+public fn inflateEmbeddedNul(compressed: Slice<u8>) -> Vector<u8> {
+    var inflated = inflateEmbedded(compressed);
+    inflated.reserve(1)!;
+    inflated.push(0)!;
+    return inflated;
+}

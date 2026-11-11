@@ -1,7 +1,7 @@
 [package]
 name = "bun_csrf"
 version = "0.1.0"
-kind = "object"
+kind = "library"
 ceesafec = ">=0.29.0"
 
 [dependencies]

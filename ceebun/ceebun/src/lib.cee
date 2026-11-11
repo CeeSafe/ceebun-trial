@@ -1,0 +1,2 @@
+// CeeBun's umbrella package: the one CeeSafe build linked into Bun (CeeSafe ADR 0088 §1.12). It depends on every
+// swapped crate, so they share one copy of each package and its statics; the archive holds their exports.

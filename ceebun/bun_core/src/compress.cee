@@ -1,0 +1,10 @@
+// `bun_core::compress` (src/bun_core/lib.rs).
+
+/// `compress::State`: the shared state-machine tag for the streaming (de)compressors in `bun_brotli`, `bun_zlib` and
+/// `bun_zstd`. A package's files share one namespace, so the module's name is in the type's.
+public enum CompressState {
+    Uninitialized,
+    Inflating,
+    End,
+    Error,
+}
