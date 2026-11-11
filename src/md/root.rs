@@ -1,0 +1,222 @@
+use crate::parser;
+use crate::types::Flags;
+
+// Re-export types needed by external renderers (e.g. JS callback renderer).
+pub use crate::types::BLOCK_FENCED_CODE;
+pub use crate::types::BlockType;
+pub use crate::types::Renderer;
+pub use crate::types::SpanDetail;
+pub use crate::types::SpanType;
+pub use crate::types::TextType;
+
+#[derive(Clone, Copy, Default)]
+pub struct RenderOptions {
+    pub(crate) tag_filter: bool,
+    pub(crate) heading_ids: bool,
+    pub(crate) autolink_headings: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct Options {
+    pub tables: bool,
+    pub strikethrough: bool,
+    pub tasklists: bool,
+    pub permissive_autolinks: bool,
+    pub permissive_url_autolinks: bool,
+    pub permissive_www_autolinks: bool,
+    pub permissive_email_autolinks: bool,
+    pub hard_soft_breaks: bool,
+    pub wiki_links: bool,
+    pub underline: bool,
+    pub latex_math: bool,
+    pub collapse_whitespace: bool,
+    pub permissive_atx_headers: bool,
+    pub no_indented_code_blocks: bool,
+    pub no_html_blocks: bool,
+    pub no_html_spans: bool,
+    /// GFM tag filter: replaces `<` with `&lt;` for disallowed HTML tags
+    /// (title, textarea, style, xmp, iframe, noembed, noframes, script, plaintext).
+    pub tag_filter: bool,
+    pub heading_ids: bool,
+    pub autolink_headings: bool,
+    /// GFM: `[^label]: ..` is the definition of a footnote. Only for consumers
+    /// that look at `BLOCK_FOOTNOTE`.
+    pub footnotes: bool,
+    /// `$$` is a fence, like three backticks.
+    pub math_blocks: bool,
+    /// `:::name` starts a container that `:::` ends. Only for consumers that
+    /// look at `BLOCK_DIRECTIVE`.
+    pub directives: bool,
+    /// Strikethrough takes two tildes.
+    pub no_single_tilde: bool,
+    /// See `compat.rs`.
+    pub micromark: bool,
+    /// See `compat.rs`: what a parser that follows micromark need not do.
+    pub micromark_to_the_letter: bool,
+    pub mdx: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            tables: true,
+            strikethrough: true,
+            tasklists: true,
+            permissive_autolinks: false,
+            permissive_url_autolinks: false,
+            permissive_www_autolinks: false,
+            permissive_email_autolinks: false,
+            hard_soft_breaks: false,
+            wiki_links: false,
+            underline: false,
+            latex_math: false,
+            collapse_whitespace: false,
+            permissive_atx_headers: false,
+            no_indented_code_blocks: false,
+            no_html_blocks: false,
+            no_html_spans: false,
+            tag_filter: false,
+            heading_ids: false,
+            autolink_headings: false,
+            footnotes: false,
+            math_blocks: false,
+            directives: false,
+            no_single_tilde: false,
+            micromark: false,
+            micromark_to_the_letter: false,
+            mdx: false,
+        }
+    }
+}
+
+impl Options {
+    // Private base (all-false) used for struct-update in the presets below.
+    const NONE: Self = Self {
+        tables: false,
+        strikethrough: false,
+        tasklists: false,
+        permissive_autolinks: false,
+        permissive_url_autolinks: false,
+        permissive_www_autolinks: false,
+        permissive_email_autolinks: false,
+        hard_soft_breaks: false,
+        wiki_links: false,
+        underline: false,
+        latex_math: false,
+        collapse_whitespace: false,
+        permissive_atx_headers: false,
+        no_indented_code_blocks: false,
+        no_html_blocks: false,
+        no_html_spans: false,
+        tag_filter: false,
+        heading_ids: false,
+        autolink_headings: false,
+        footnotes: false,
+        math_blocks: false,
+        directives: false,
+        no_single_tilde: false,
+        micromark: false,
+        micromark_to_the_letter: false,
+        mdx: false,
+    };
+
+    pub const TERMINAL: Self = Self {
+        tables: true,
+        strikethrough: true,
+        tasklists: true,
+        permissive_url_autolinks: true,
+        permissive_www_autolinks: true,
+        permissive_email_autolinks: true,
+        wiki_links: true,
+        underline: true,
+        latex_math: true,
+        ..Self::NONE
+    };
+
+    pub(crate) fn to_flags(self) -> Flags {
+        Flags {
+            tables: self.tables,
+            strikethrough: self.strikethrough,
+            tasklists: self.tasklists,
+            permissive_url_autolinks: self.permissive_url_autolinks || self.permissive_autolinks,
+            permissive_www_autolinks: self.permissive_www_autolinks || self.permissive_autolinks,
+            permissive_email_autolinks: self.permissive_email_autolinks
+                || self.permissive_autolinks,
+            wiki_links: self.wiki_links,
+            latex_math: self.latex_math,
+            collapse_whitespace: self.collapse_whitespace,
+            permissive_atx_headers: self.permissive_atx_headers,
+            no_indented_code_blocks: self.no_indented_code_blocks,
+            no_html_blocks: self.no_html_blocks,
+            no_html_spans: self.no_html_spans,
+            footnotes: self.footnotes,
+            math_blocks: self.math_blocks,
+            directives: self.directives,
+            no_single_tilde: self.no_single_tilde,
+            micromark: self.micromark,
+            micromark_to_the_letter: self.micromark_to_the_letter,
+            mdx: self.mdx,
+        }
+    }
+
+    pub(crate) fn to_render_options(self) -> RenderOptions {
+        RenderOptions {
+            tag_filter: self.tag_filter,
+            heading_ids: self.heading_ids,
+            autolink_headings: self.autolink_headings,
+        }
+    }
+}
+
+pub fn render_to_html(text: &[u8]) -> Result<Box<[u8]>, parser::ParserError> {
+    render_to_html_with_options(text, Options::default())
+}
+
+pub fn render_to_html_with_options(
+    text: &[u8],
+    options: Options,
+) -> Result<Box<[u8]>, parser::ParserError> {
+    parser::render_to_html(text, options.to_flags(), options.to_render_options())
+}
+
+/// Parse and render using a custom renderer implementation.
+pub fn render_with_renderer<'a>(
+    text: &'a [u8],
+    options: Options,
+    renderer: Renderer<'a>,
+) -> Result<(), parser::ParserError> {
+    parser::render_with_renderer(
+        text,
+        options.to_flags(),
+        options.to_render_options(),
+        renderer,
+        None,
+    )
+}
+
+/// The same with syntax of the consumer's own.
+pub fn render_with_extensions<'a>(
+    text: &'a [u8],
+    options: Options,
+    renderer: Renderer<'a>,
+    extensions: crate::types::Extensions<'a>,
+) -> Result<(), parser::ParserError> {
+    parser::render_with_renderer(
+        text,
+        options.to_flags(),
+        options.to_render_options(),
+        renderer,
+        Some(extensions),
+    )
+}
+
+pub use crate::types;
+
+pub use crate::helpers;
+
+pub use crate::ansi_renderer as ansi;
+pub use ansi::ImageUrlCollector;
+pub use ansi::Theme as AnsiTheme;
+pub use ansi::detect_kitty_graphics;
+pub use ansi::render_to_ansi;
+pub use ansi::{detect_light_background, detect_light_background_probing};

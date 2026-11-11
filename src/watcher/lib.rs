@@ -1,0 +1,39 @@
+#![warn(unused_must_use)]
+//! Bun's cross-platform filesystem watcher.
+
+// ─── platform impls ───────────────────────────────────────────────────────
+//
+// Each platform watcher is compiled only for its target. A host build never
+// compiles the non-native backends.
+
+// Android: same kernel inotify ABI as glibc/musl Linux.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[path = "INotifyWatcher.rs"]
+pub mod inotify_watcher;
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+#[path = "KEventWatcher.rs"]
+pub mod kevent_watcher;
+
+#[cfg(windows)]
+#[path = "WindowsWatcher.rs"]
+pub mod windows_watcher;
+
+#[path = "WatcherTrace.rs"]
+pub(crate) mod watcher_trace;
+
+#[path = "Watcher.rs"]
+pub mod watcher_impl;
+
+pub mod error;
+
+// ─── public re-exports ────────────────────────────────────────────────────
+
+pub use error::{Error, Result};
+
+pub use WatchItemKind as Kind;
+pub use watcher_impl::{
+    AnyResolveWatcher, ChangedFilePath, Event, FdOwnership, HashType, MAX_COUNT, Op, PackageJSON,
+    REQUIRES_FILE_DESCRIPTORS, WATCH_OPEN_FLAGS, WATCHES_BY_PATH, WatchEvent, WatchItemColumns,
+    WatchItemIndex, WatchItemKind, WatchList, Watcher, WatcherContext,
+};

@@ -1,0 +1,7 @@
+[test]
+preload = "./preload.ts"
+
+[install]
+linker = "isolated"
+# See ../bunfig.toml: CI deletes the install cache between steps.
+globalStore = false

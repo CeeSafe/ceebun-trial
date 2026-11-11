@@ -1,0 +1,1972 @@
+/**
+ * Build configuration.
+ *
+ * One flat struct. All derived booleans computed once in `resolveConfig()`,
+ * passed everywhere. No `if(ENABLE_X)` depending on `if(CI)` depending on
+ * `if(RELEASE)` — the chain is resolved here and the result is a plain value.
+ */
+
+import { execSync } from "node:child_process";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { homedir, arch as hostArch, platform as hostPlatform } from "node:os";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { locations, pins } from "./ci-images/spec.ts";
+import { NODEJS_ABI_VERSION, NODEJS_V8_VERSION, NODEJS_VERSION } from "./deps/nodejs-headers.ts";
+import { WEBKIT_VERSION } from "./deps/webkit.ts";
+import { assert, BuildError } from "./error.ts";
+import { resolveMacosSdkPath } from "./macos-sdk.ts";
+import { clangTargetArch, toolchainOverride } from "./tools.ts";
+import { cyan, dim, green } from "./tty.ts";
+
+export type OS = "linux" | "darwin" | "windows" | "freebsd";
+export type Arch = "x64" | "aarch64";
+export type Abi = "gnu" | "musl" | "android";
+export type BuildType = "Debug" | "Release" | "RelWithDebInfo" | "MinSizeRel";
+/** `full` builds bun. `codegen` runs the code generators and nothing else; it resolves a {@link CodegenConfig}, not a {@link Config}. */
+export type Mode = "full" | "codegen";
+export type WebKitMode = "prebuilt" | "local";
+/** The package manager for the package.json files the build installs. */
+export type PackageManager = "bun" | "npm";
+export type DebugInfo = "full" | "lines" | "none";
+
+export function defaultDebugInfo(cfg: Pick<Config, "debug" | "lto">): DebugInfo {
+  return cfg.debug || !cfg.lto ? "full" : "lines";
+}
+
+/**
+ * Host platform — what's running the build. Distinguish from target
+ * (Config.os/arch/windows) which is what we're building FOR.
+ *
+ * Host vs target matters for cross-compiles: a linux CI box can build for
+ * any linux abi/arch and (with the right SDK or sysroot) darwin and windows. Target determines cargo's `--target` triple and
+ * rustflags; host determines shell syntax (cmd vs sh), quoting, and
+ * tool executable suffixes.
+ *
+ * host == target unless cfg.crossTarget is set, in which case the C++ side
+ * is cross-compiled via clang's --target/--sysroot.
+ */
+export interface Host {
+  os: OS;
+  arch: Arch;
+  /** ".exe" on a Windows host, "" elsewhere. Mirrors Config.exeSuffix (target). */
+  exeSuffix: string;
+}
+
+/**
+ * Pinned version defaults. Each lives at the top of its own file
+ * (deps/webkit.ts, deps/nodejs-headers.ts) — look there to bump.
+ * Overridable via PartialConfig for testing (e.g. trying a WebKit branch).
+ */
+const versionDefaults = {
+  nodejsVersion: NODEJS_VERSION,
+  nodejsAbiVersion: NODEJS_ABI_VERSION,
+  nodejsV8Version: NODEJS_V8_VERSION,
+  webkitVersion: WEBKIT_VERSION,
+};
+
+/**
+ * Returns the `process.versions.webkit` string for `webkitVersion`. A tag
+ * becomes the bare sha and a preview becomes `preview-pr-<N>-<sha8>`.
+ */
+export function webkitVersionName(webkitVersion: string): string {
+  return webkitVersion.startsWith("autobuild-") ? webkitVersion.slice("autobuild-".length) : webkitVersion;
+}
+
+/**
+ * The full resolved build configuration. Every field is concrete — no
+ * undefined-because-it-depends-on-something-else. This is the single source
+ * of truth passed to every build function.
+ */
+export interface Config {
+  // ─── Target platform ───
+  os: OS;
+  arch: Arch;
+  /** Linux-only. undefined on darwin/windows. */
+  abi: Abi | undefined;
+
+  // ─── Derived platform booleans (computed from os/arch) ───
+  linux: boolean;
+  darwin: boolean;
+  windows: boolean;
+  freebsd: boolean;
+  /** linux || darwin || freebsd */
+  unix: boolean;
+  x64: boolean;
+  arm64: boolean;
+
+  /**
+   * What's running the build. Differs from os/arch/windows (target) in a
+   * cross-compile. Use for: shell syntax in rule commands,
+   * quoteArgs(), tool executable suffixes. See Host type docs.
+   */
+  host: Host;
+  /**
+   * True when the linked binary can execute on this host (same os+arch, and on
+   * linux same abi). Distinct from `crossTarget === undefined`: a native-arch
+   * linux-gnu build still passes --target/--sysroot for glibc pinning but the
+   * output runs fine here.
+   */
+  canRunOnHost: boolean;
+
+  // ─── Platform file conventions ───
+  // Centralized so a new target (or a forgotten .exe) is one edit away.
+  /** ".exe" on Windows, "" elsewhere. */
+  exeSuffix: string;
+  /** ".obj" on Windows, ".o" elsewhere. */
+  objSuffix: string;
+  /** "" on Windows, "lib" elsewhere. */
+  libPrefix: string;
+  /** ".lib" on Windows, ".a" elsewhere. */
+  libSuffix: string;
+
+  // ─── Build configuration ───
+  buildType: BuildType;
+  debug: boolean;
+  release: boolean;
+  /** What tells a Config from a {@link CodegenConfig}. */
+  mode: "full";
+
+  // ─── Features (all explicit booleans) ───
+  lto: boolean;
+  /**
+   * The link goes through scripts/build/trim/link.ts, which lays the executable out by removable feature and writes the
+   * trim table into it. `bun build --compile --trim` needs that table in the bun it copies. Costs a second link.
+   */
+  trimmable: boolean;
+  /**
+   * The ahead-of-time compiler and what its programs need at run time. Off: JavaScriptCore and Bun's bindings are compiled
+   * with ENABLE_AOT=0, the crate `bun_aot` stays out of the link, and `--aot` answers that this build has no compiler.
+   */
+  aot: boolean;
+  /**
+   * Default true. Off compiles JavaScriptCore without its JIT tiers (Baseline, DFG, FTL, WebAssembly's BBQ and OMG plans,
+   * RegExp code made at run time): JavaScript, RegExps and WebAssembly that arrive at run time are interpreted. Programs
+   * compiled with `--aot` run as before, and one compiled by a Bun with the tiers runs on a Bun without them. B3, Air and
+   * the assembler stay as the back end of the ahead-of-time compiler.
+   */
+  jit: boolean;
+  /**
+   * Linux with glibc: the relative relocations of the executable are packed (DT_RELR). Smaller, and faster to load.
+   * Only glibc 2.36 and later load such a file, so it is for a build whose users are known.
+   */
+  relr: boolean;
+  /** IR PGO: directory for .profraw output (instrumented build). Mutually exclusive with pgoUse. */
+  pgoGenerate: string | undefined;
+  /** IR PGO: .profdata file path (optimized build). Mutually exclusive with pgoGenerate. */
+  pgoUse: string | undefined;
+  asan: boolean;
+  assertions: boolean;
+  logs: boolean;
+  /** x64-only: target nehalem (no AVX). Default true on x64 — the only x64 build we ship. */
+  baseline: boolean;
+  canary: boolean;
+  /** MinSizeRel → optimize for size. */
+  smol: boolean;
+  staticSqlite: boolean;
+  staticLibatomic: boolean;
+  tinycc: boolean;
+  valgrind: boolean;
+  fuzzilli: boolean;
+  /** With `fuzzilli`: only the ahead-of-time compiler reports coverage (scripts/build/fuzzilli-compiler-coverage.txt). */
+  fuzzilliCompilerOnly: boolean;
+  /**
+   * Compile everything with `hardeningFlags` (flags.ts), JSC and ICU included: selects the `-hardened` WebKit prebuilt.
+   * The link makes a position-independent executable with full RELRO, eager binding and code in pages of its own.
+   * Defines BUN_HARDENED for C and C++ and `bun_hardened` for Rust. Costs file size, startup time and private memory.
+   * Leaves out one thing that any other build can do: an executable that it compiles ahead of time does not start where
+   * it cannot read its own file (`executeOnlyStart`).
+   * So far it has been built and run on Linux x64 with glibc alone.
+   */
+  hardened: boolean;
+  /**
+   * An executable that a hardened build compiles ahead of time exits at start unless the kernel denies it memory that
+   * is written and then executed: prctl(PR_SET_MDWE), Linux 6.3. On with `hardened`. Off: it also starts on an older
+   * kernel, where its seccomp filter alone refuses new executable memory. No environment variable does the same.
+   */
+  requireMdwe: boolean;
+  /**
+   * The environment variables that only a compiler, a test or somebody who debugs Bun sets are never read: those that
+   * write a file, print addresses, switch a check off or bring in other code. An executable compiled ahead of time takes a
+   * short list of BUN_JSC_* options, and the allocator its sizes and its pace. No setting is lost without a word: where
+   * the environment sets one of the variables that are never read, any other BUN_JSC_* option or any other MIMALLOC_*
+   * word, such an executable prints their names and exits with 1 before it runs any JavaScript. `bun` itself starts, and
+   * ignores them. On with `hardened`. Off: a hardened build that tests can steer as they steer any other, and that
+   * refuses nothing. No environment variable does the same.
+   */
+  lockEnvironment: boolean;
+  /**
+   * What an executable compiled ahead of time maps for as long as a VM or the process lives (its instance, its tables) lies
+   * between two pages that cannot be touched, at an address drawn for that mapping alone: an address of one says nothing
+   * about another's, nor about the C library's. So does every thread's second stack, where a hardened build has them.
+   * Costs a few system calls and 8 KB of page tables a mapping. On with `hardened`. Off: a hardened build to compare with.
+   */
+  guardedPages: boolean;
+  /**
+   * An executable compiled ahead of time maps its code out of its own file, at an address drawn at random. Where it cannot
+   * open that file (it may be run but not read: mode 0111) it moves the pages that its loader mapped to such an address
+   * instead, with mremap(). Off: there it says so and exits with 1 before any compiled code runs, and the code that
+   * moves is not in the binary: nothing of Bun's calls mremap() on the way to the program's first statement. Off with
+   * `hardened`. On: a hardened build to compare with.
+   * Defines BUN_REFUSES_EXECUTE_ONLY_START for C and C++, JSC included, and `bun_refuses_execute_only_start` for Rust.
+   */
+  executeOnlyStart: boolean;
+  /**
+   * Compile usockets bsd_* syscall fault-injection hooks. Runtime-armed via
+   * `bun:internal-for-testing` socketFaultInjection; disarmed cost is one
+   * acquire atomic load per syscall, zero when compiled out.
+   */
+  socketFaultInjection: boolean;
+  /**
+   * Default true. Off builds a Bun where `--disallow-code-generation-from-strings=strict` is
+   * always on: the level is a compile-time constant in Rust and C++, so no flag, environment
+   * variable or API of the built binary lowers it. (Not named after the runtime flag:
+   * build.ts would then take that flag for its own.)
+   */
+  codeGenerationFromStrings: boolean;
+  /**
+   * Default true. Off builds a Bun with no `WebAssembly` global: the engine's `useWasm` option is
+   * false whatever `BUN_JSC_useWasm` says, and WebKit is built with ENABLE_WEBASSEMBLY=0, which
+   * leaves the engine's WebAssembly code out of the binary. Every package that loads a WebAssembly
+   * module stops working, and so do the modules that `bun build --compile --aot` compiles ahead of
+   * time: it warns at each one that a program imports, and the executable throws a ReferenceError.
+   * Takes a WebKit built from source (`webkit: "local"`) or the one prebuilt without WebAssembly,
+   * which `hardened`, `lto` and `aot` together select.
+   */
+  webAssembly: boolean;
+  /**
+   * Default true. Off builds a Bun with no `ShadowRealm` global: the engine's `useShadowRealm` option
+   * is false whatever `BUN_JSC_useShadowRealm` says. A WebKit built from source (`webkit: "local"`) is
+   * also built with ENABLE_SHADOW_REALM=0, which leaves the class out of the binary; a prebuilt one
+   * keeps it.
+   */
+  shadowRealm: boolean;
+  /**
+   * Default true. Off builds a Bun whose `bun:ffi` calls no native function and loads no library: dlopen(),
+   * linkSymbols(), CFunction(), JSCallback(), cc() with a `library` and what cc() returns throw. A WebKit built from
+   * source (`webkit: "local"`) is also built with ENABLE_FFI=0, which leaves the engine's half of those calls out of
+   * the binary; a prebuilt one keeps it.
+   */
+  ffi: boolean;
+  /** Bundle small .cpp files into unified TUs (WebKit-style). See unified.ts. */
+  unifiedSources: boolean;
+  /**
+   * Archive each `direct` dep's objects into a per-dep .a (the old
+   * behaviour). Default off — dep .o files go straight into bun's link
+   * instead. Turn on to bisect duplicate-symbol issues:
+   * a .a only contributes members the linker actually pulls.
+   */
+  archiveDeps: boolean;
+  /**
+   * The compilers report their own phases: clang writes `-ftime-trace` JSON next to each `.o`, rustc's
+   * `-Z time-passes` are recorded next to each crate (rust/run.ts). `--timings` reads both (timings.ts).
+   */
+  timeTrace: boolean;
+  /**
+   * `codegen-units` of every crate, in place of the release profile's 1. A crate is then that many ThinLTO modules:
+   * rustc and the link work on them in parallel, and the link's cache keeps the ones an edit did not reach. For
+   * builds that are repeated all day. What ships keeps one module a crate. Undefined: what `Cargo.toml` says.
+   */
+  rustCodegenUnits: number | undefined;
+  rustIncremental: boolean;
+  rustLto: boolean;
+  debugInfo: DebugInfo;
+  linkerMap: boolean;
+
+  // ─── Environment ───
+  ci: boolean;
+  buildkite: boolean;
+
+  // ─── Dependency modes ───
+  webkit: WebKitMode;
+  /**
+   * Deps built from a local checkout instead of the pinned tarball, keyed by
+   * dep name → absolute source dir. Set via `--local-deps=name=path[,...]`;
+   * `webkit: "local"` is the WebKit entry ($BUN_WEBKIT_PATH or vendor/WebKit).
+   * The checkout is used as-is: no fetch, no `.ref` stamp, and the dep's
+   * `patches` are NOT applied (they target the pinned tarball; a fork
+   * checkout is expected to carry whatever you're iterating on).
+   */
+  localDeps: Record<string, string>;
+  /**
+   * Installs the package.json files the build needs: the repo root (esbuild,
+   * the lezer C++ parser), packages/bun-error, and src/node-fallbacks. Set
+   * via `--package-manager=npm`.
+   */
+  packageManager: PackageManager;
+
+  // ─── Paths (all absolute) ───
+  /** Repository root. */
+  cwd: string;
+  /** Build output directory, e.g. /path/to/bun/build/debug/. */
+  buildDir: string;
+  /** Generated code output, e.g. buildDir/codegen/. */
+  codegenDir: string;
+  /**
+   * The type declarations generated for src/js (`src/js/builtins.d.ts` references them): `build/types/`. They are made
+   * from source alone, so every profile writes the same files to the one place, like `vendor/`.
+   */
+  typesDir: string;
+  /**
+   * Persistent cache for dep tarballs and builds: `--cacheDir`, else
+   * `$BUN_BUILD_CACHE_DIR`, else the default (see `sharedCacheDir`; CI keeps
+   * it inside the build directory).
+   */
+  cacheDir: string;
+  /** Vendored dependencies (gitignored). */
+  vendorDir: string;
+
+  // ─── Toolchain (resolved absolute paths) ───
+  cc: string;
+  cxx: string;
+  /**
+   * Compiler for build-time host tools (dep_host_cc codegen helpers).
+   * Same as `cc` except when cross-compiling for windows from a unix host,
+   * where `cc` is clang-cl (emits COFF) and host tools need plain clang.
+   */
+  hostCc: string;
+  /**
+   * C++ driver for host-side links (cargo's host-triple linker in
+   * `.cargo/config.toml` — build scripts, proc-macros). Same as `cxx`
+   * except when cross-compiling for windows from a unix host.
+   */
+  hostCxx: string;
+  /** Parsed X.Y.Z from clang --version. Captured once at resolve time. */
+  clangVersion: string | undefined;
+  /**
+   * `clang -print-resource-dir` — builtin headers live at `<dir>/include`.
+   * Used by darwin cross-compiles, which rebuild the C++ include search path
+   * explicitly. undefined on Windows (nothing consumes it there).
+   */
+  clangResourceDir: string | undefined;
+  ar: string;
+  /**
+   * ld.lld on linux, lld-link on windows, ld64.lld when cross-compiling for
+   * darwin from a non-darwin host. May be empty on native darwin (clang
+   * invokes the system linker).
+   */
+  ld: string;
+  strip: string;
+  /** llvm-nm, for `DirectBuild.forbidUndefined`; undefined skips those checks. */
+  nm: string | undefined;
+  /** llvm-readobj / llvm-objdump / llvm-cxxfilt, for verify-binary.ts; any one missing skips those checks. */
+  readobj: string | undefined;
+  objdump: string | undefined;
+  cxxfilt: string | undefined;
+  /** Set when the target is darwin. Undefined on non-darwin targets. */
+  dsymutil: string | undefined;
+  /** Self-host bun for codegen (bun install, bun build). */
+  bun: string;
+  /** npm, set only when `packageManager` is "npm". */
+  npm: string | undefined;
+  /**
+   * Shell-ready command prefix for running .ts subprocesses (stream.ts,
+   * fetch-cli.ts, regen). Either the bun path or `node --experimental-strip-types`
+   * depending on what's running configure. Already quoted — splice directly
+   * into rule commands.
+   */
+  jsRuntime: string;
+  esbuild: string;
+  /** Optional — compiler launcher prefix. */
+  ccache: string | undefined;
+  /** cmake executable: CI packages the zips with `cmake -E tar` (ci.ts). */
+  cmake: string;
+  /** cargo executable. undefined when no rust toolchain is available. */
+  cargo: string | undefined;
+  /** CARGO_HOME — passed to cargo invocations for reproducibility. */
+  cargoHome: string | undefined;
+  /** RUSTUP_HOME — passed to cargo invocations for reproducibility. */
+  rustupHome: string | undefined;
+  /**
+   * RUSTUP_TOOLCHAIN — the `channel` from this repo's `rust-toolchain.toml`.
+   * Passed explicitly to every cargo invocation so the dep build and the
+   * workspace build agree on libstd even when `vendor/` is a symlink into a
+   * sibling worktree (rustup's directory walk follows the resolved path and
+   * would otherwise pick up that worktree's pin).
+   */
+  rustToolchain: string | undefined;
+  /**
+   * The rustc every Rust unit is compiled with: `<override>/bin/rustc` under BUN_TOOLCHAIN_RUST, else
+   * the pinned toolchain's real binary (`<sysroot>/bin/rustc`, not the rustup proxy — a couple hundred
+   * invocations each paying the proxy's manifest lookup add up). Also handed to cargo (planning, the
+   * Windows shim) as RUSTC so both agree. undefined when no Rust toolchain was found.
+   */
+  rustc: string | undefined;
+  /** `rustc --print sysroot`; rustdoc and the std sources (`-Zbuild-std`) live under it. */
+  rustSysroot: string | undefined;
+  /** The host triple rustc reports (`x86_64-unknown-linux-gnu`, …): the platform of build scripts and proc-macros. */
+  rustHostTriple: string | undefined;
+  /** Windows: MSVC link.exe path (to avoid Git's /usr/bin/link shadowing). */
+  msvcLinker: string | undefined;
+  /** Windows: llvm-rc, compiles bun.exe's resources. */
+  rc: string | undefined;
+  /** x64: nasm for BoringSSL's win-x64 assembly and libjpeg-turbo's x86_64 SIMD. */
+  nasm: string | undefined;
+
+  // ─── macOS SDK (darwin only, undefined elsewhere) ───
+  /** e.g. "13.0". `-mmacosx-version-min`, for bun's sources and the deps' alike (flags.ts). */
+  osxDeploymentTarget: string | undefined;
+  /**
+   * SDK path. Native darwin: from `xcrun --show-sdk-path`. Darwin
+   * cross-compile from a non-darwin host: an extracted MacOSX*.sdk (see
+   * macos-sdk.ts). `-isysroot`, for bun's sources and the deps' alike.
+   */
+  osxSysroot: string | undefined;
+
+  // ─── Cross-compilation (set when host != target for C++) ───
+  // Generic plumbing shared by every cross target (Android, FreeBSD,
+  // macOS-from-Linux, and Windows-from-unix).
+  /** clang `--target=` triple, e.g. "aarch64-unknown-linux-android28". undefined = native. */
+  crossTarget: string | undefined;
+  /** clang `--sysroot=` path. For Android: `<ndk>/toolchains/llvm/prebuilt/<host>/sysroot`. */
+  sysroot: string | undefined;
+  /**
+   * Windows cross-compile only: root of an xwin-style splat of the MSVC
+   * CRT/STL + Windows SDK laid out like a Visual Studio install
+   * (`VC/Tools/MSVC/<ver>`, `Windows Kits/10`). Passed to clang-cl as
+   * `/winsysroot` and to lld-link as `/winsysroot:` — the cross equivalent
+   * of the INCLUDE/LIB env a VS dev shell provides on a Windows host.
+   * undefined on native Windows builds (VS dev shell supplies the SDK).
+   */
+  winsysroot: string | undefined;
+  /** NDK compiler-rt/libunwind dir: `<ndk>/toolchains/llvm/prebuilt/<host>/lib/clang/<ver>/lib/linux`. */
+  androidNdkRuntimeDir: string | undefined;
+
+  // ─── Versioning ───
+  /** Bun's own version (from package.json). */
+  version: string;
+  /** Git commit of the bun checkout — feeds into the build's -Dsha equivalent. */
+  revision: string;
+  canaryRevision: string;
+  /** Node.js compat version. Default in versions.ts; override to test a bump. */
+  nodejsVersion: string;
+  nodejsAbiVersion: string;
+  nodejsV8Version: string;
+  /** WebKit commit. Default in versions.ts; override to test a WebKit branch. */
+  webkitVersion: string;
+}
+
+/**
+ * Partial config — what profiles and CLI flags provide.
+ * Resolution fills in the rest.
+ */
+export interface PartialConfig {
+  os?: OS;
+  arch?: Arch;
+  abi?: Abi;
+  buildType?: BuildType;
+  mode?: Mode;
+  lto?: boolean;
+  trimmable?: boolean;
+  jit?: boolean;
+  aot?: boolean;
+  relr?: boolean;
+  pgoGenerate?: string;
+  pgoUse?: string;
+  asan?: boolean;
+  assertions?: boolean;
+  logs?: boolean;
+  baseline?: boolean;
+  canary?: boolean;
+  staticSqlite?: boolean;
+  staticLibatomic?: boolean;
+  tinycc?: boolean;
+  valgrind?: boolean;
+  fuzzilli?: boolean;
+  fuzzilliCompilerOnly?: boolean;
+  hardened?: boolean;
+  requireMdwe?: boolean;
+  lockEnvironment?: boolean;
+  guardedPages?: boolean;
+  executeOnlyStart?: boolean;
+  socketFaultInjection?: boolean;
+  codeGenerationFromStrings?: boolean;
+  webAssembly?: boolean;
+  shadowRealm?: boolean;
+  ffi?: boolean;
+  unifiedSources?: boolean;
+  archiveDeps?: boolean;
+  timeTrace?: boolean;
+  rustCodegenUnits?: number;
+  rustIncremental?: boolean;
+  rustLto?: boolean;
+  debugInfo?: DebugInfo;
+  linkerMap?: boolean;
+  ci?: boolean;
+  buildkite?: boolean;
+  webkit?: WebKitMode;
+  /**
+   * `name=path[,name=path...]` — build these deps from a local checkout
+   * (e.g. `mimalloc=~/code/mimalloc`). `~` expands to $HOME; relative paths
+   * resolve against the repo root. See `Config.localDeps`.
+   */
+  localDeps?: string;
+  /** `bun` (default) or `npm`. See `Config.packageManager`. */
+  packageManager?: PackageManager;
+  buildDir?: string;
+  cacheDir?: string;
+  /** Override NDK location (default: $ANDROID_NDK_ROOT etc). Only used when abi=android. */
+  androidNdk?: string;
+  /** Override Android API level (default: ANDROID_API_LEVEL_DEFAULT). Only used when abi=android. */
+  androidApiLevel?: number;
+  /** FreeBSD sysroot (extracted base.txz). Only used when os=freebsd. */
+  freebsdSysroot?: string;
+  /** FreeBSD release version (default: FREEBSD_VERSION_DEFAULT). Only used when os=freebsd. */
+  freebsdVersion?: string;
+  /** Linux glibc sysroot (pinned old glibc/libstdc++). Only used when linux && abi=gnu. */
+  linuxSysroot?: string;
+  /**
+   * macOS SDK path (a MacOSX*.sdk directory). Only used when cross-compiling
+   * for darwin from a non-darwin host; native darwin builds use xcrun.
+   * Default: $MACOS_SDK_PATH, a well-known /opt install, or an auto-download
+   * into the cache dir — see macos-sdk.ts.
+   */
+  macosSdk?: string;
+  /**
+   * macOS deployment target (`-mmacosx-version-min`). Only used when
+   * cross-compiling for darwin from a non-darwin host (native darwin derives
+   * it from the installed SDK / CI floor). Default: MIN_OSX_DEPLOYMENT_TARGET.
+   */
+  osxDeploymentTarget?: string;
+  /** Windows sysroot (xwin splat, VS layout). Only used when cross-compiling for os=windows. */
+  winsysroot?: string;
+  // Version pins (defaults in versions.ts).
+  nodejsVersion?: string;
+  nodejsAbiVersion?: string;
+  nodejsV8Version?: string;
+  webkitVersion?: string;
+}
+
+/** The JavaScript tools: all that the code generators run with. */
+export interface JsToolchain {
+  bun: string;
+  /** Found only when the build installs with npm. */
+  npm?: string | undefined;
+  jsRuntime: string;
+  esbuild: string;
+}
+
+/**
+ * Resolved toolchain — found by tool discovery, passed in separately so
+ * tests can mock it out.
+ */
+export interface Toolchain extends JsToolchain {
+  cc: string;
+  cxx: string;
+  /**
+   * Host compiler / C++ driver for build-time host tools and host-side
+   * cargo links. Only set when they differ from `cc`/`cxx` (windows
+   * cross-compile from a unix host, where cc/cxx are clang-cl);
+   * resolveConfig() falls back to `cc`/`cxx` otherwise.
+   */
+  hostCc: string | undefined;
+  hostCxx: string | undefined;
+  /**
+   * Parsed clang --version (X.Y.Z). Captured during toolchain resolution
+   * so downstream checks (workarounds.ts) don't re-spawn. undefined if
+   * version parsing failed — shouldn't happen since we version-gate cc.
+   */
+  clangVersion: string | undefined;
+  /** `clang -print-resource-dir`. undefined on Windows. */
+  clangResourceDir: string | undefined;
+  ar: string;
+  ld: string;
+  /**
+   * lld's Mach-O port (`ld64.lld`), resolved on non-darwin unix hosts.
+   * Swapped in as `cfg.ld` when the target is darwin and the host isn't —
+   * there's no Apple `ld` to drive, and ld.lld only emits ELF.
+   */
+  ld64Lld: string | undefined;
+  /** Parsed `LLVM version:` from `rustc -vV` (X.Y.Z). */
+  rustLlvmVersion: string | undefined;
+  /** `rustc --print sysroot` for the pinned toolchain. */
+  rustSysroot: string | undefined;
+  /** `host:` from `rustc -vV`. */
+  rustHostTriple: string | undefined;
+  strip: string;
+  /**
+   * llvm-strip. On Linux hosts GNU strip is the default (`strip` above) but
+   * can't read Mach-O, so darwin cross-compiles swap this in as `cfg.strip`.
+   */
+  llvmStrip: string | undefined;
+  /** llvm-nm; undefined skips the per-dep undefined-symbol checks (source.ts). */
+  nm: string | undefined;
+  /** For the post-link binary checks (bun.ts / verify-binary.ts); undefined skips them. */
+  readobj: string | undefined;
+  objdump: string | undefined;
+  cxxfilt: string | undefined;
+  dsymutil: string | undefined;
+  ccache: string | undefined;
+  cmake: string;
+  /** Cargo executable. Required only if a rust dep (lolhtml) is being built. */
+  cargo: string | undefined;
+  /** CARGO_HOME. Set alongside cargo; undefined when cargo is unavailable. */
+  cargoHome: string | undefined;
+  /** RUSTUP_HOME. Set alongside cargo; undefined when cargo is unavailable. */
+  rustupHome: string | undefined;
+  /**
+   * Windows only: absolute path to MSVC's link.exe. Set as the cargo linker
+   * via CARGO_TARGET_<triple>_LINKER to prevent Git Bash's /usr/bin/link
+   * (the GNU hard-link utility) from shadowing the real linker in PATH.
+   */
+  msvcLinker: string | undefined;
+  /** Windows only: llvm-rc (resource compiler). */
+  rc: string | undefined;
+  /** x64 targets: nasm for BoringSSL's win-x64 assembly and libjpeg-turbo's x86_64 SIMD. */
+  nasm: string | undefined;
+}
+
+/**
+ * Host platform detection. Only used for picking defaults.
+ */
+export function detectHost(): Host {
+  const plat = hostPlatform();
+  const os: OS =
+    plat === "linux"
+      ? "linux"
+      : plat === "darwin"
+        ? "darwin"
+        : plat === "win32"
+          ? "windows"
+          : plat === "freebsd"
+            ? "freebsd"
+            : (() => {
+                throw new BuildError(`Unsupported host platform: ${plat}`, {
+                  hint: "Bun builds on linux, darwin, windows, or freebsd",
+                });
+              })();
+
+  const a = hostArch();
+  const arch: Arch =
+    a === "x64"
+      ? "x64"
+      : a === "arm64"
+        ? "aarch64"
+        : (() => {
+            throw new BuildError(`Unsupported host architecture: ${a}`, { hint: "Bun builds on x64 or arm64" });
+          })();
+
+  return { os, arch, exeSuffix: os === "windows" ? ".exe" : "" };
+}
+
+/**
+ * Detect linux ABI (gnu vs musl) by checking for /etc/alpine-release.
+ * Android is never auto-detected — it's always a cross-compile target,
+ * so it must be requested explicitly via --abi=android.
+ */
+export function detectLinuxAbi(): Abi {
+  return existsSync("/etc/alpine-release") ? "musl" : "gnu";
+}
+
+export function glibcLoadsPackedRelocations(version: string): boolean {
+  const [major = 0, minor = 0] = version.split(".").map(Number);
+  return major > 2 || (major === 2 && minor >= 36);
+}
+
+function hostLoadsPackedRelocations(): boolean {
+  try {
+    const version = /^glibc (\d+\.\d+)/.exec(
+      execSync("getconf GNU_LIBC_VERSION", { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }),
+    );
+    return version !== null && glibcLoadsPackedRelocations(version[1]!);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Minimum Android API level we target. 28 = Android 9 (2018), the oldest
+ * release with the bionic syscall wrappers we rely on without raw-syscall
+ * fallbacks. Covers ~96% of active devices as of 2026.
+ */
+export const ANDROID_API_LEVEL_DEFAULT = pins.androidNdk.apiLevel;
+
+/**
+ * FreeBSD release we target. 14.x is the current production series; 14.4
+ * is the oldest 14.x still on download.freebsd.org. Building against 14.4
+ * produces binaries that run on 14.4+ (FreeBSD guarantees forward ABI
+ * compat within a major).
+ */
+export const FREEBSD_VERSION_DEFAULT = pins.freebsd.version;
+
+/**
+ * Locate a FreeBSD sysroot (extracted base.txz). Checks env var then the
+ * path CI's build image puts it at. The sysroot is arch-specific (different
+ * crt/libc for amd64 vs arm64). Returns undefined if none found.
+ */
+export function detectFreebsdSysroot(arch: Arch): string | undefined {
+  const looksValid = (p: string) => existsSync(join(p, "usr", "include", "sys", "param.h"));
+  const env = process.env.FREEBSD_SYSROOT;
+  if (env && looksValid(env)) return env;
+  const candidate = locations.freebsdSysroot[arch];
+  return looksValid(candidate) ? candidate : undefined;
+}
+
+/**
+ * Locate the linux-gnu sysroot: ubuntu:20.04 (glibc 2.31) + gcc-13 libstdc++,
+ * matching the WebKit prebuilt's build environment. Arch-specific. See
+ * the `glibcSysroot` tool of ci-images/spec.ts.
+ */
+export function detectLinuxGlibcSysroot(arch: Arch): string | undefined {
+  const looksValid = (p: string) => existsSync(join(p, "usr", "include", "c++", "13"));
+  const env = process.env.LINUX_GLIBC_SYSROOT;
+  if (env && looksValid(env)) return env;
+  const candidate = locations.glibcSysroot[arch];
+  return looksValid(candidate) ? candidate : undefined;
+}
+
+/**
+ * Locate a linux-musl sysroot — alpine rootfs with musl + modern libstdc++;
+ * see the `muslSysroot` tool of ci-images/spec.ts. Checks env var then
+ * well-known install paths. Arch-specific. Returns undefined if none found.
+ */
+export function detectLinuxMuslSysroot(arch: Arch): string | undefined {
+  const looksValid = (p: string) => existsSync(join(p, "usr", "lib", "libc.so"));
+  const env = process.env.LINUX_MUSL_SYSROOT;
+  if (env && looksValid(env)) return env;
+  const candidate = locations.muslSysroot[arch];
+  return looksValid(candidate) ? candidate : undefined;
+}
+
+/**
+ * Locate a Windows sysroot (xwin splat of the MSVC CRT/STL + Windows SDK in
+ * Visual Studio layout). Checks the env var then well-known install paths.
+ * The splat contains both x64 and arm64 CRT/SDK libs, so unlike FreeBSD
+ * there's no per-arch variant. Returns undefined if none found.
+ */
+export function detectWindowsSysroot(): string | undefined {
+  // Case-tolerant: a real VS/SDK copy uses "Include", an xwin splat in
+  // winsysroot-style mode writes "include" (winsysroot.ts adds the
+  // title-case alias the LLVM toolchain needs at configure time).
+  const looksValid = (p: string) =>
+    existsSync(join(p, "Windows Kits", "10", "Include")) || existsSync(join(p, "Windows Kits", "10", "include"));
+  const env = process.env.WINDOWS_SYSROOT;
+  if (env && looksValid(env)) return env;
+  for (const p of [locations.windowsSysroot, "/opt/xwin"]) {
+    if (looksValid(p)) return p;
+  }
+  return undefined;
+}
+
+/**
+ * Locate the Android NDK. Checks the conventional env vars in priority
+ * order, then a couple of well-known install paths. Returns undefined if
+ * none found — caller decides whether to error.
+ */
+export function detectAndroidNdk(): string | undefined {
+  for (const v of ["ANDROID_NDK_ROOT", "ANDROID_NDK_HOME", "ANDROID_NDK"]) {
+    const p = process.env[v];
+    if (p && existsSync(join(p, "toolchains"))) return p;
+  }
+  for (const p of [locations.androidNdk, "/usr/local/android-ndk"]) {
+    if (existsSync(join(p, "toolchains"))) return p;
+  }
+  // Android Studio's sdkmanager puts NDKs under $ANDROID_HOME/ndk/<version>.
+  // We don't pick one automatically — too easy to get a stale version.
+  return undefined;
+}
+
+/**
+ * NDK toolchain prebuilt directory for the current build host. The NDK
+ * ships one prebuilt per host OS (always x86_64; arm64 macOS runs it
+ * under Rosetta).
+ */
+function ndkHostTag(host: Host): string {
+  switch (host.os) {
+    case "linux":
+      return "linux-x86_64";
+    case "darwin":
+      return "darwin-x86_64";
+    case "windows":
+      return "windows-x86_64";
+    case "freebsd":
+      throw new BuildError("Android NDK does not ship FreeBSD prebuilts", {
+        hint: "Cross-compile to Android from a Linux host",
+      });
+  }
+}
+
+/**
+ * Make the host clang able to link Android binaries by symlinking the
+ * NDK's compiler-rt builtins + libunwind into clang's resource dir.
+ *
+ * clang's driver emits a FULL PATH to `<resource-dir>/lib/<triple>/
+ * libclang_rt.builtins.a` — there's no `-L`-style search, so the file
+ * must exist at exactly that path. Our host clang has no Android-target
+ * compiler-rt; the NDK does. This is the standard "bring your own clang"
+ * setup for NDK cross-builds (Chromium does the same).
+ *
+ * Idempotent. Warns with a sudo hint if the resource dir isn't writable
+ * (CI's build image creates the symlinks as root: the `androidNdk` tool of ci-images/spec.ts).
+ */
+function linkNdkRuntimesIntoClang(cc: string, ndk: string, host: Host, triple: string): void {
+  const resourceDir = execSync(`"${cc}" -print-resource-dir`, { encoding: "utf8" }).trim();
+  const targetDir = join(resourceDir, "lib", triple);
+  // NDK r23+ layout: <prebuilt>/lib/clang/<ver>/lib/linux/<arch>/ for
+  // libunwind.a + new-style libclang_rt.builtins.a
+  const ndkPrebuilt = join(ndk, "toolchains", "llvm", "prebuilt", ndkHostTag(host));
+  const ndkClangLib = join(ndkPrebuilt, "lib", "clang");
+  // NDK ships exactly one clang version per release.
+  const ndkClangVer = readdirSync(ndkClangLib)[0];
+  if (ndkClangVer === undefined) {
+    throw new BuildError(`NDK clang resource dir not found under ${ndkClangLib}`);
+  }
+  const arch = triple.startsWith("x86_64") ? "x86_64" : "aarch64";
+  const ndkRtLinux = join(ndkClangLib, ndkClangVer, "lib", "linux");
+  // Populate BOTH layouts: apt.llvm.org clang uses old-style flat
+  // (lib/linux/libclang_rt.builtins-<arch>-android.a) while tarball builds use
+  // per-triple (lib/<triple>/libclang_rt.builtins.a). NDK r27 keeps builtins in
+  // the flat dir but libunwind in the per-arch subdir.
+  const flatDir = join(resourceDir, "lib", "linux");
+  const links = {
+    [join(targetDir, "libclang_rt.builtins.a")]: join(ndkRtLinux, `libclang_rt.builtins-${arch}-android.a`),
+    [join(targetDir, "libunwind.a")]: join(ndkRtLinux, arch, "libunwind.a"),
+    [join(flatDir, `libclang_rt.builtins-${arch}-android.a`)]: join(
+      ndkRtLinux,
+      `libclang_rt.builtins-${arch}-android.a`,
+    ),
+    [join(flatDir, arch, "libunwind.a")]: join(ndkRtLinux, arch, "libunwind.a"),
+  };
+  if (Object.keys(links).every(dst => existsSync(dst))) return;
+  try {
+    mkdirSync(targetDir, { recursive: true });
+    mkdirSync(join(flatDir, arch), { recursive: true });
+    for (const [dst, src] of Object.entries(links)) {
+      if (!existsSync(dst)) symlinkSync(src, dst);
+    }
+  } catch (cause) {
+    // Don't throw — on CI the image's bake creates them as root. The actual link step will fail
+    // loudly later if they're genuinely missing where needed.
+    const lnCmds = Object.entries(links)
+      .map(([dst, src]) => `sudo ln -sf "${src}" "${dst}"`)
+      .join(" && ");
+    console.warn(
+      `warning: could not link NDK compiler-rt into ${resourceDir} (${(cause as NodeJS.ErrnoException).code}). ` +
+        `If the final link fails on libclang_rt.builtins.a, run: sudo mkdir -p "${targetDir}" "${join(flatDir, arch)}" && ${lnCmds}`,
+    );
+  }
+}
+
+/**
+ * Resolve a PartialConfig into a full Config.
+ *
+ * This is where all the "X defaults to Y unless Z" chains get resolved into
+ * concrete values. After this runs, everything downstream sees plain booleans.
+ */
+/**
+ * The machine-shared build cache: `$BUN_BUILD_CACHE_DIR`, else
+ * `$BUN_INSTALL/build-cache` (`~/.bun/build-cache`). A relative value is
+ * anchored to the repo root (not process.cwd()) so the ninja regen rule —
+ * which runs from buildDir — resolves the same path. Like $BUN_INSTALL, the
+ * variable is read on every configure: set it in the environment of every
+ * build of a build directory, not for one invocation.
+ */
+export function sharedCacheDir(cwd: string): string {
+  if (process.env.BUN_BUILD_CACHE_DIR) return resolve(cwd, process.env.BUN_BUILD_CACHE_DIR);
+  const bunInstall = process.env.BUN_INSTALL ? resolve(cwd, process.env.BUN_INSTALL) : join(homedir(), ".bun");
+  return resolve(bunInstall, "build-cache");
+}
+
+/**
+ * The part of the config that no native tool is needed for: the build type, where things go, the JavaScript tools,
+ * and what build_options.rs is generated from. resolveConfig() and resolveCodegenConfig() both start from it.
+ */
+function resolveBase(partial: PartialConfig, host: Host, os: OS, arch: Arch, js: JsToolchain) {
+  const abi: Abi | undefined = os === "linux" ? (partial.abi ?? detectLinuxAbi()) : undefined;
+
+  const linux = os === "linux";
+  const darwin = os === "darwin";
+  const windows = os === "windows";
+  const freebsd = os === "freebsd";
+  const arm64 = arch === "aarch64";
+  // Darwin target on a non-darwin host (Linux CI box building macOS
+  // binaries). Same host-clang + --target/-isysroot model as Android/FreeBSD,
+  // with ld64.lld doing the Mach-O link. See the cross block further down.
+  const darwinCross = darwin && host.os !== "darwin";
+
+  // ─── Build type ───
+  const buildType = partial.buildType ?? "Debug";
+  const debug = buildType === "Debug";
+  const release = buildType === "Release" || buildType === "RelWithDebInfo" || buildType === "MinSizeRel";
+
+  // ─── Environment ───
+  // Explicit (not auto-detected from env) — matches CMake's optionx(CI DEFAULT OFF).
+  // The ci-* profiles set these. Affects build semantics: LTO default, PCH
+  // skip, macOS min SDK. Log-group/annotation decisions use the runtime env
+  // detection in ci.ts instead, so running a non-CI profile on a CI machine
+  // still gets collapsible logs but not CI build flags.
+  const ci = partial.ci ?? false;
+  const buildkite = partial.buildkite ?? false;
+
+  // ASAN: default on for debug builds on arm64 macOS or linux
+  const asanDefault = debug && ((darwin && arm64) || linux);
+  // Android: force off. NDK ASAN deployment needs wrap.sh + runtime .so
+  // shipping alongside the binary; UBSan likewise. Not worth the matrix.
+  // FreeBSD: force off. Cross-compiled — we'd need to ship FreeBSD's
+  // libclang_rt.asan (and there's no -asan WebKit prebuilt for it).
+  // Darwin cross: force off. The Linux LLVM toolchain doesn't ship the
+  // darwin ASAN/UBSan runtime dylibs (libclang_rt.*_osx_dynamic.dylib).
+  // Windows cross: force off. The host clang doesn't ship the windows
+  // clang_rt.asan runtime libs, so the link would fail.
+  const asan =
+    abi === "android" || freebsd || darwinCross || (windows && host.os !== "windows")
+      ? false
+      : (partial.asan ?? asanDefault);
+
+  // Assertions: default on in debug OR asan. ASAN coupling is ABI-critical:
+  // the -asan WebKit prebuilt is built with ASSERT_ENABLED=1, which gates
+  // struct fields (RefCountDebugger etc). If bun's C++ isn't also compiled
+  // with ASSERT_ENABLED=1, the struct layouts mismatch → crashes. CMake's
+  // build:asan always set ENABLE_ASSERTIONS=ON for this reason.
+  const assertions = partial.assertions ?? (debug || asan);
+
+  // ─── Paths ───
+  const cwd = findRepoRoot();
+  // Windows cross-compiles get their own default build dir — the native
+  // build of the same profile (build/debug, build/release) already holds
+  // host-target objects at the same obj/ paths, and mixing COFF into an ELF
+  // build dir (or vice versa) forces a full rebuild each time you switch.
+  const crossWindowsSuffix = windows && host.os !== "windows" ? `-windows-${arch}` : "";
+  // mode=codegen writes a manifest and a compile_commands.json with no native edges in them, so it gets a
+  // directory of its own: build/debug is where clangd reads compile_commands.json.
+  const codegenSuffix = partial.mode === "codegen" ? "-codegen" : "";
+  const defaultBuildDirName =
+    computeBuildDirName({ debug, release, asan, assertions }) + crossWindowsSuffix + codegenSuffix;
+  const buildDir =
+    partial.buildDir !== undefined
+      ? isAbsolute(partial.buildDir)
+        ? partial.buildDir
+        : resolve(cwd, partial.buildDir)
+      : resolve(cwd, "build", defaultBuildDirName);
+  const codegenDir = resolve(buildDir, "codegen");
+  const typesDir = resolve(cwd, "build", "types");
+  // Local builds share one cache across checkouts and profiles so
+  // ccache/tarballs/webkit reuse one another's work. CI stays per-build so
+  // runners remain hermetic and `rm -rf build/` is a full reset — unless
+  // $BUN_BUILD_CACHE_DIR says where the cache is, which holds everywhere.
+  const cacheDir =
+    partial.cacheDir !== undefined
+      ? isAbsolute(partial.cacheDir)
+        ? partial.cacheDir
+        : resolve(cwd, partial.cacheDir)
+      : ci && !process.env.BUN_BUILD_CACHE_DIR
+        ? resolve(buildDir, "cache")
+        : sharedCacheDir(cwd);
+
+  const packageManager = partial.packageManager ?? "bun";
+  if (packageManager !== "bun" && packageManager !== "npm") {
+    throw new BuildError(`Unknown packageManager: ${packageManager}`, { hint: "Use bun or npm" });
+  }
+  assert(packageManager === "bun" || js.npm !== undefined, "packageManager=npm needs toolchain.npm");
+
+  // ─── What build_options.rs is generated from (buildOptionsRs.ts) ───
+  const canary = partial.canary ?? true;
+  const canaryRevision = canary ? "1" : "0";
+  const fuzzilli = partial.fuzzilli ?? false;
+  const pkgJsonPath = resolve(cwd, "package.json");
+  const pkgJson = JSON.parse(readFileSync(pkgJsonPath, "utf8")) as { version: string };
+  const version = pkgJson.version;
+  const revision = getGitRevision(cwd, debug && !ci ? buildDir : undefined);
+  // Default from versions.ts. Override via --nodejs-version=<v> to test a bump.
+  const nodejsVersion = partial.nodejsVersion ?? versionDefaults.nodejsVersion;
+  // Override via --webkit-version=<hash> to test a branch before bumping the pin.
+  const webkitVersion = partial.webkitVersion ?? versionDefaults.webkitVersion;
+
+  return {
+    bun: js.bun,
+    npm: packageManager === "npm" ? js.npm : undefined,
+    jsRuntime: js.jsRuntime,
+    esbuild: js.esbuild,
+    canary,
+    canaryRevision,
+    fuzzilli,
+    version,
+    revision,
+    nodejsVersion,
+    webkitVersion,
+    abi,
+    linux,
+    darwin,
+    windows,
+    freebsd,
+    darwinCross,
+    buildType,
+    debug,
+    release,
+    ci,
+    buildkite,
+    asan,
+    assertions,
+    cwd,
+    buildDir,
+    codegenDir,
+    typesDir,
+    cacheDir,
+    packageManager,
+  };
+}
+
+/**
+ * The fields of {@link Config} the code generators read. They need bun, the root install and perl, and no compiler,
+ * linker, cmake or cargo. codegen.ts takes this type, so a generator that starts reading a native tool does not compile.
+ */
+export type CodegenFields = Pick<
+  Config,
+  | "host"
+  | "os"
+  | "abi"
+  | "x64"
+  | "debug"
+  | "cwd"
+  | "buildDir"
+  | "codegenDir"
+  | "typesDir"
+  | "cacheDir"
+  | "packageManager"
+  | "assertions"
+  | "canary"
+  | "canaryRevision"
+  | "fuzzilli"
+  | "version"
+  | "revision"
+  | "nodejsVersion"
+  | "webkitVersion"
+  | keyof JsToolchain
+>;
+
+/** What `mode: "codegen"` resolves: {@link CodegenFields}, with none of the native tools looked for. */
+export type CodegenConfig = CodegenFields & { mode: "codegen" };
+
+export function resolveCodegenConfig(partial: PartialConfig, toolchain: JsToolchain): CodegenConfig {
+  const host = detectHost();
+  const os = partial.os ?? host.os;
+  const arch = partial.arch ?? host.arch;
+  const { linux, darwin, windows, freebsd, darwinCross, buildType, release, ci, buildkite, asan, ...base } =
+    resolveBase(partial, host, os, arch, toolchain);
+  return { ...base, mode: "codegen", host, os, x64: arch === "x64" };
+}
+
+export function resolveConfig(partial: PartialConfig, toolchain: Toolchain): Config {
+  assert(partial.mode !== "codegen", "mode=codegen resolves a CodegenConfig: resolveCodegenConfig()");
+  const host = detectHost();
+
+  // ─── Target platform ───
+  const os = partial.os ?? host.os;
+  // Windows hosts: process.arch can be wrong under emulation (x64 bun on
+  // arm64 hardware). Ask the compiler what it targets — CMake does the same
+  // in project() to set CMAKE_SYSTEM_PROCESSOR. The found clang's default
+  // target is what we actually build for. Cross-compiles from a unix host
+  // skip this (the host clang-cl's default arch is just the host's).
+  const compilerArch = os === "windows" && host.os === "windows" ? clangTargetArch(toolchain.cc) : undefined;
+  const arch = partial.arch ?? compilerArch ?? host.arch;
+  const {
+    abi,
+    linux,
+    darwin,
+    windows,
+    freebsd,
+    darwinCross,
+    buildType,
+    debug,
+    release,
+    ci,
+    buildkite,
+    asan,
+    assertions,
+    cwd,
+    buildDir,
+    codegenDir,
+    typesDir,
+    cacheDir,
+    packageManager,
+    canary,
+    canaryRevision,
+    fuzzilli,
+    version,
+    revision,
+    nodejsVersion,
+    webkitVersion,
+    bun,
+    npm,
+    jsRuntime,
+    esbuild,
+  } = resolveBase(partial, host, os, arch, toolchain);
+
+  const unix = linux || darwin || freebsd;
+  const x64 = arch === "x64";
+  const arm64 = arch === "aarch64";
+  // Windows target on a non-Windows host (clang-cl + lld-link + xwin
+  // sysroot). See the cross block further down.
+
+  // Platform file conventions — MSVC style on Windows, Unix everywhere else.
+  const exeSuffix = windows ? ".exe" : "";
+  const objSuffix = windows ? ".obj" : ".o";
+  const libPrefix = windows ? "" : "lib";
+  const libSuffix = windows ? ".lib" : ".a";
+
+  const smol = buildType === "MinSizeRel";
+
+  // ─── Features ───
+  // Each is resolved exactly once here (asan and assertions: in resolveBase).
+
+  // LTO (ThinLTO across bun, JSC and the Rust side): on for every release
+  // build without assertions or ASAN, locally as in CI, so a local release
+  // binary has the codegen CI ships. `--lto=off` for faster relinks. JSC
+  // takes part through the prebuilt: `lto` selects the `-lto` WebKit tarball
+  // (deps/webkit.ts prebuiltSuffix), whose archives hold the LLVM bitcode
+  // oven-sh/WebKit's CI emitted. The linker here has to read it, which rests
+  // on both repos pinning the same LLVM: tools.ts enforces LLVM_VERSION on
+  // clang and ld.lld (a native macOS link runs that clang's libLTO; lld-link
+  // and ld64.lld are looked up beside it but not version-checked).
+  const ltoDefault = release && !assertions && !asan;
+  let lto = partial.lto ?? ltoDefault;
+  // ASAN and LTO don't mix — ASAN wins (silently, no warn — config is explicit).
+  // Fuzzilli: coverage does not link with ThinLTO ("undefined symbol:
+  // __sancov_gen_.1"). The copies of an inline function that ThinLTO does not
+  // keep become available_externally, their module-private guards included,
+  // and inlining one leaves a reference to guards that nothing defines.
+  // Android, FreeBSD: not enabled (never built that way; untested).
+  // Windows arm64: off — oven-sh/WebKit ships no bun-webkit-windows-arm64-lto
+  // (LLVM's CodeView emitter aborts on ARM64 NEON tuple registers when JSC
+  // goes through LTO), so forcing it off also keeps the fetch from 404ing.
+  if ((asan && lto) || fuzzilli || abi === "android" || freebsd || (windows && arm64)) {
+    lto = false;
+  }
+
+  const rustLto = partial.rustLto ?? true;
+  if (lto && !rustLto) {
+    throw new BuildError("rustLto cannot be off where lto is on", { hint: "Pass --lto=off too" });
+  }
+
+  const debugInfo = partial.debugInfo ?? defaultDebugInfo({ debug, lto });
+  if (debugInfo !== "full" && debugInfo !== "lines" && debugInfo !== "none") {
+    throw new BuildError(`Unknown debugInfo: ${debugInfo}`, { hint: "Use full, lines or none" });
+  }
+  if (windows && partial.debugInfo !== undefined) {
+    throw new BuildError("debugInfo cannot be chosen for a Windows target");
+  }
+
+  // The link reads LLVM bitcode from both compilers with clang's LLVM (release crates are bitcode with or without `lto`),
+  // and an LLVM cannot read a newer one's. A newer clang is refused too: rustc's linker-plugin-lto documentation
+  // recommends the same LLVM in both, and no CI build mixes them. Without a rustc there is nothing to compare;
+  // emitRust() reports that.
+  const clangMajor = majorOf(toolchain.clangVersion);
+  const rustLlvmMajor = majorOf(toolchain.rustLlvmVersion);
+  if (clangMajor !== undefined && rustLlvmMajor !== undefined && clangMajor !== rustLlvmMajor) {
+    throw new BuildError(
+      `clang is LLVM ${toolchain.clangVersion} and rustc's LLVM is ${toolchain.rustLlvmVersion}; they have to be the same major version`,
+      {
+        hint:
+          "The link reads LLVM bitcode from both compilers. " +
+          "pins.llvm.version (scripts/build/ci-images/spec.ts) and the nightly in rust-toolchain.toml move together, " +
+          "and so do BUN_TOOLCHAIN_LLVM and BUN_TOOLCHAIN_RUST.",
+      },
+    );
+  }
+
+  // PGO: paths resolved to absolute. generate/use are mutually exclusive.
+  const pgoGenerate = partial.pgoGenerate ? resolve(partial.pgoGenerate) : undefined;
+  const pgoUse = partial.pgoUse ? resolve(partial.pgoUse) : undefined;
+  if (pgoGenerate && pgoUse) {
+    throw new BuildError("--pgo-generate and --pgo-use are mutually exclusive");
+  }
+
+  // Logs: on by default in debug non-test
+  const logs = partial.logs ?? debug;
+
+  const baseline = partial.baseline ?? x64;
+
+  // Whether bun:sqlite and node:sqlite link the bundled sqlite3 directly
+  // (LAZY_LOAD_SQLITE=0) or dlopen the system library at runtime. macOS
+  // defaults to dlopen so both APIs share Apple's libsqlite3 (one library,
+  // one POSIX-lock inode map — howtocorrupt.html §2.2.1); Linux/Windows
+  // link the bundled amalgamation.
+  const staticSqlite = partial.staticSqlite ?? !darwin;
+
+  // Static libatomic: on by default. Arch/Manjaro don't ship libatomic.a —
+  // those users pass --static-libatomic=off. Not auto-detected: the link
+  // failure is loud ("cannot find -l:libatomic.a") and the fix is obvious.
+  const staticLibatomic = partial.staticLibatomic ?? true;
+
+  // TinyCC: off on Android (no upstream bionic support; FFI cc() falls back
+  // to dlopen-only) and FreeBSD (oven-sh/tinycc has no FreeBSD target).
+  const tinycc = partial.tinycc ?? !(abi === "android" || freebsd);
+
+  const valgrind = partial.valgrind ?? false;
+  const hardened = partial.hardened ?? false;
+  const requireMdwe = partial.requireMdwe ?? hardened;
+  const lockEnvironment = partial.lockEnvironment ?? hardened;
+  const guardedPages = partial.guardedPages ?? hardened;
+  const executeOnlyStart = partial.executeOnlyStart ?? !hardened;
+  // Default follows asan: on for local debug (Linux / arm64 macOS) and CI
+  // release-asan, off everywhere else. The fuzz tests are most useful when
+  // memory errors are detectable, and the disarmed-hot-path cost (one acquire
+  // atomic load) is acceptable in asan builds but not in shipped release.
+  const socketFaultInjection = partial.socketFaultInjection ?? asan;
+
+  // ─── Paths ───
+  const vendorDir = resolve(cwd, "vendor");
+
+  const localDeps = parseLocalDeps(partial.localDeps, cwd);
+  const webkit = partial.webkit ?? (localDeps.WebKit !== undefined ? "local" : "prebuilt");
+  if (webkit === "local") {
+    localDeps.WebKit ??= expandLocalPath(process.env.BUN_WEBKIT_PATH || resolve(vendorDir, "WebKit"), cwd);
+  }
+
+  // ─── Validation ───
+  assert(!baseline || x64, "baseline=true requires arch=x64 (baseline disables AVX which is x64-only)");
+  assert(
+    !partial.relr || (linux && abi === "gnu"),
+    "relr=true requires os=linux and abi=gnu (packed relative relocations are loaded by glibc 2.36 and later; nothing says that this target's C library can)",
+  );
+  assert(!valgrind || linux, "valgrind=true requires os=linux");
+  assert(!(asan && valgrind), "Cannot enable both asan and valgrind simultaneously");
+  assert(!hardened || (linux && abi !== "android"), "hardened=true requires os=linux and abi=gnu or musl");
+  assert(!requireMdwe || hardened, "requireMdwe=true requires hardened=true");
+  assert(!lockEnvironment || hardened, "lockEnvironment=true requires hardened=true");
+  assert(!guardedPages || linux, "guardedPages=true requires os=linux");
+  assert(
+    guardedPages === hardened || webkit === "local",
+    "guardedPages=" + guardedPages + " with hardened=" + hardened + " requires webkit=local",
+    { hint: "The -hardened WebKit prebuilts are compiled with it, the others without" },
+  );
+  assert(
+    executeOnlyStart || (linux && abi !== "android"),
+    "executeOnlyStart=false requires os=linux and abi=gnu or musl",
+  );
+  assert(
+    executeOnlyStart !== hardened || webkit === "local",
+    "executeOnlyStart=" + executeOnlyStart + " with hardened=" + hardened + " requires webkit=local",
+    { hint: "The -hardened WebKit prebuilts are compiled without it, the others with it" },
+  );
+  const jit = partial.jit ?? true;
+  assert(
+    jit || webkit === "local",
+    "jit=false requires webkit=local: there is no prebuilt WebKit without the JIT tiers",
+  );
+  assert(jit || (partial.aot ?? true), "jit=false requires aot=true");
+  assert(jit || (linux && x64), "jit=false requires os=linux and arch=x64");
+  assert(jit || !(partial.trimmable ?? false), "jit=false can't be combined with trimmable=true");
+  assert(
+    !hardened || webkit === "local" || (x64 && abi === "gnu" && release && !asan && !assertions && !fuzzilli),
+    "hardened=true requires a Linux x64 glibc release build without asan, assertions or fuzzilli, or webkit=local",
+    { hint: "Those are the -hardened WebKit prebuilts there are (oven-sh/WebKit's .github/scripts/lanes.mjs)" },
+  );
+  assert(
+    (partial.webAssembly ?? true) || webkit === "local" || (hardened && lto && (partial.aot ?? true)),
+    "webAssembly=false requires hardened=true, lto=true and aot=true, or webkit=local",
+    { hint: "That is the one WebKit prebuilt without WebAssembly (oven-sh/WebKit's .github/scripts/lanes.mjs)" },
+  );
+  assert(
+    !hardened || toolchain.llvmStrip !== undefined,
+    "hardened=true requires llvm-strip (GNU strip writes a file without PT_GNU_RELRO)",
+    { hint: "Install llvm for the same version as clang: apt install llvm-23 (or equivalent)." },
+  );
+  assert(os !== "linux" || abi !== undefined, "Linux builds require an abi (gnu, musl, or android)");
+
+  // ─── Cross-compilation (Android) ───
+  // We keep using the host's clang (same version everywhere) and pass
+  // --target/--sysroot. The NDK is needed only for its bionic sysroot,
+  // libc++, and compiler-rt — not for its bundled clang.
+  let crossTarget: string | undefined;
+  let sysroot: string | undefined;
+  let androidNdk: string | undefined;
+  let androidApiLevel: number | undefined;
+  let androidNdkRuntimeDir: string | undefined;
+  if (abi === "android") {
+    androidNdk =
+      partial.androidNdk !== undefined
+        ? isAbsolute(partial.androidNdk)
+          ? partial.androidNdk
+          : resolve(cwd, partial.androidNdk)
+        : detectAndroidNdk();
+    if (androidNdk === undefined) {
+      throw new BuildError("--abi=android requires the Android NDK", {
+        hint: "Set ANDROID_NDK_ROOT or pass --android-ndk=<path>. Download: https://developer.android.com/ndk/downloads",
+      });
+    }
+    androidApiLevel = partial.androidApiLevel ?? ANDROID_API_LEVEL_DEFAULT;
+    const ndkPrebuilt = join(androidNdk, "toolchains", "llvm", "prebuilt", ndkHostTag(host));
+    sysroot = join(ndkPrebuilt, "sysroot");
+    if (!existsSync(sysroot)) {
+      throw new BuildError(`Android NDK sysroot not found at ${sysroot}`, {
+        hint: `Is ANDROID_NDK_ROOT (${androidNdk}) a valid NDK? Expected r26 or newer.`,
+      });
+    }
+    // NDK ships exactly one clang version per release.
+    const ndkClangLib = join(ndkPrebuilt, "lib", "clang");
+    const ndkClangVer = readdirSync(ndkClangLib)[0];
+    if (ndkClangVer === undefined) {
+      throw new BuildError(`NDK clang resource dir not found under ${ndkClangLib}`);
+    }
+    androidNdkRuntimeDir = join(ndkClangLib, ndkClangVer, "lib", "linux");
+    const llvmArch = arch === "x64" ? "x86_64" : "aarch64";
+    crossTarget = `${llvmArch}-unknown-linux-android${androidApiLevel}`;
+    linkNdkRuntimesIntoClang(toolchain.cc, androidNdk, host, crossTarget);
+  }
+
+  // ─── Cross-compilation (FreeBSD) ───
+  // Same pattern as Android: host clang + --target/--sysroot. The sysroot
+  // is an extracted base.txz (libc, libc++, headers, crt files). When
+  // building ON FreeBSD, no cross flags are needed.
+  let freebsdVersion: string | undefined;
+  if (freebsd) {
+    freebsdVersion = partial.freebsdVersion ?? FREEBSD_VERSION_DEFAULT;
+    if (host.os !== "freebsd") {
+      sysroot =
+        partial.freebsdSysroot !== undefined
+          ? isAbsolute(partial.freebsdSysroot)
+            ? partial.freebsdSysroot
+            : resolve(cwd, partial.freebsdSysroot)
+          : detectFreebsdSysroot(arch);
+      if (sysroot === undefined) {
+        const dlArch = arch === "x64" ? "amd64" : "arm64";
+        const sysrootPath = locations.freebsdSysroot[arch];
+        throw new BuildError("--os=freebsd requires a FreeBSD sysroot when cross-compiling", {
+          hint: `Set FREEBSD_SYSROOT or pass --freebsd-sysroot=<path>. Create one with: mkdir -p ${sysrootPath} && curl -L ${pins.freebsd.baseUrl}/${dlArch}/${freebsdVersion}-RELEASE/base.txz | tar -C ${sysrootPath} -xJf - ./usr/include ./usr/lib ./lib`,
+        });
+      }
+      const llvmArch = arch === "x64" ? "x86_64" : "aarch64";
+      crossTarget = `${llvmArch}-unknown-freebsd${freebsdVersion}`;
+      // No compiler-rt symlinking needed (unlike Android): FreeBSD's base
+      // ships libgcc.a (which IS compiler-rt builtins, renamed for compat)
+      // in /usr/lib, and clang's freebsd driver finds it via --sysroot.
+    }
+  }
+
+  // ─── Linux-gnu/musl sysroot + target ───
+  // Every CI linux-gnu build (native AND cross-arch) uses the ubuntu:20.04 +
+  // gcc-13 sysroot so the glibc verneed matches what the --wrap list covers
+  // and the libstdc++ ABI matches the WebKit prebuilt. musl uses an
+  // alpine-derived sysroot. Local dev without a sysroot builds native.
+  if (linux && abi !== "android" && crossTarget === undefined) {
+    const llvmArch = x64 ? "x86_64" : "aarch64";
+    const hostAbi = host.os === "linux" ? detectLinuxAbi() : undefined;
+    const isCross = arch !== host.arch || abi !== hostAbi;
+    if (abi === "musl") {
+      sysroot = detectLinuxMuslSysroot(arch);
+      if (sysroot !== undefined || isCross) {
+        crossTarget = `${llvmArch}-alpine-linux-musl`;
+        if (sysroot === undefined) {
+          const p = locations.muslSysroot[arch];
+          throw new BuildError(`--os=linux --arch=${arch} --abi=musl requires a musl sysroot when cross-compiling`, {
+            hint: `Set LINUX_MUSL_SYSROOT or provision ${p} (see the muslSysroot tool of scripts/build/ci-images/spec.ts).`,
+          });
+        }
+      }
+    } else {
+      sysroot =
+        partial.linuxSysroot !== undefined
+          ? isAbsolute(partial.linuxSysroot)
+            ? partial.linuxSysroot
+            : resolve(cwd, partial.linuxSysroot)
+          : detectLinuxGlibcSysroot(arch);
+      if (sysroot !== undefined || isCross) {
+        crossTarget = `${llvmArch}-linux-gnu`;
+        if (sysroot === undefined) {
+          const p = locations.glibcSysroot[arch];
+          throw new BuildError(`--os=linux --arch=${arch} --abi=gnu cross-compile requires a glibc sysroot`, {
+            hint: `Set LINUX_GLIBC_SYSROOT or provision ${p} (see the glibcSysroot tool of scripts/build/ci-images/spec.ts).`,
+          });
+        }
+      }
+    }
+  }
+
+  // ─── Cross-compilation (Windows) ───
+  // Same pattern as Android/FreeBSD, with the MSVC spin: the host LLVM's
+  // clang-cl/lld-link/llvm-lib/llvm-rc are used (tools.ts picks them by
+  // target), and the "sysroot" is an xwin splat of the MSVC CRT/STL +
+  // Windows SDK in Visual Studio layout, passed via /winsysroot instead of
+  // --sysroot. Building ON Windows needs none of this — the VS dev shell
+  // provides INCLUDE/LIB.
+  let winsysroot: string | undefined;
+  if (windows && host.os !== "windows") {
+    winsysroot =
+      partial.winsysroot !== undefined
+        ? isAbsolute(partial.winsysroot)
+          ? partial.winsysroot
+          : resolve(cwd, partial.winsysroot)
+        : detectWindowsSysroot();
+    if (winsysroot === undefined) {
+      if (ci || buildkite) {
+        // CI always fetches its own sysroot into the per-build cache (see
+        // winsysroot.ts `ensureWindowsSysroot`, called from configure.ts
+        // before the graph is emitted) instead of relying on agent image
+        // provisioning.
+        winsysroot = resolve(cacheDir, "winsysroot");
+      } else {
+        throw new BuildError("--os=windows requires a Windows sysroot (MSVC CRT + Windows SDK) when cross-compiling", {
+          hint:
+            "Set WINDOWS_SYSROOT or pass --winsysroot=<path>. Create one with xwin (https://github.com/Jake-Shadle/xwin):\n" +
+            "  cargo install xwin  (or download a release binary)\n" +
+            `  xwin --accept-license --arch x86_64,aarch64 --sdk-version ${pins.windowsSysroot.sdk} --crt-version ${pins.windowsSysroot.crt} --include-atl splat --use-winsysroot-style --preserve-ms-arch-notation --include-debug-libs --output ${locations.windowsSysroot}`,
+        });
+      }
+    }
+    if (webkit === "local") {
+      throw new BuildError("Cross-compiling for Windows requires the prebuilt WebKit (webkit=local needs msbuild)", {
+        hint: "Drop --webkit=local or build on a Windows host.",
+      });
+    }
+    const llvmArch = arch === "x64" ? "x86_64" : "aarch64";
+    crossTarget = `${llvmArch}-pc-windows-msvc`;
+  }
+
+  // ─── Versioning ───
+  // Defaults from versions.ts. Override to test a bump before changing the
+  // pinned default.
+  const nodejsAbiVersion = partial.nodejsAbiVersion ?? versionDefaults.nodejsAbiVersion;
+  const nodejsV8Version = partial.nodejsV8Version ?? versionDefaults.nodejsV8Version;
+
+  // ─── macOS SDK ───
+  // Native darwin: ask xcode-select/xcrun. Cross-compiling from a non-darwin
+  // host: an extracted MacOSX*.sdk — explicit path, well-known install, or
+  // auto-downloaded into the cache dir (see macos-sdk.ts / ensureMacosSdk()).
+  let osxDeploymentTarget: string | undefined;
+  let osxSysroot: string | undefined;
+  if (darwin && host.os === "darwin") {
+    ({ osxDeploymentTarget, osxSysroot } = detectMacosSdk(ci));
+    if (partial.osxDeploymentTarget !== undefined) osxDeploymentTarget = partial.osxDeploymentTarget;
+  }
+
+  // ─── Cross-compilation (macOS from a non-darwin host) ───
+  // Host clang + `--target=<arch>-apple-macosx` + `-isysroot <SDK>`, linked
+  // with lld's Mach-O port (ld64.lld) and post-processed with llvm-strip /
+  // dsymutil — all of which ship in the same LLVM install we already require.
+  // The deployment target defaults to the CI floor (the SDK itself can be
+  // newer; only `-mmacosx-version-min` decides what the binary runs on).
+  let ld64StripSwap: { ld: string; strip: string } | undefined;
+  if (darwinCross) {
+    if (webkit === "local") {
+      throw new BuildError("Cross-compiling for macOS requires the prebuilt WebKit", {
+        hint: "Drop --webkit=local or build on a macOS host.",
+      });
+    }
+    crossTarget = `${arm64 ? "arm64" : "x86_64"}-apple-macosx`;
+    osxDeploymentTarget = partial.osxDeploymentTarget ?? MIN_OSX_DEPLOYMENT_TARGET;
+    osxSysroot = resolveMacosSdkPath(partial.macosSdk, cacheDir, cwd);
+    if (toolchain.ld64Lld === undefined) {
+      throw new BuildError("Cross-compiling for macOS requires ld64.lld (lld's Mach-O port)", {
+        hint: "Install lld for the same LLVM version as clang: apt install lld-23 (or equivalent).",
+      });
+    }
+    if (toolchain.llvmStrip === undefined) {
+      throw new BuildError("Cross-compiling for macOS requires llvm-strip (GNU strip can't read Mach-O)", {
+        hint: "Install llvm for the same version as clang: apt install llvm-23 (or equivalent).",
+      });
+    }
+    if (toolchain.clangResourceDir === undefined) {
+      throw new BuildError("Cross-compiling for macOS requires clang's resource directory", {
+        hint: "`clang -print-resource-dir` failed — is the discovered clang runnable?",
+      });
+    }
+    if (toolchain.dsymutil === undefined) {
+      throw new BuildError("Cross-compiling for macOS requires LLVM dsymutil", {
+        hint: "Install llvm for the same version as clang: apt install llvm-23 (or equivalent).",
+      });
+    }
+    ld64StripSwap = {
+      ld: toolchain.ld64Lld,
+      strip: toolchain.llvmStrip,
+    };
+  }
+
+  return {
+    os,
+    arch,
+    abi,
+    linux,
+    darwin,
+    windows,
+    freebsd,
+    unix,
+    x64,
+    arm64,
+    host,
+    canRunOnHost:
+      os === host.os &&
+      arch === host.arch &&
+      (!linux || abi === (detectLinuxAbi() ?? abi)) &&
+      (!partial.relr || hostLoadsPackedRelocations()),
+    exeSuffix,
+    objSuffix,
+    libPrefix,
+    libSuffix,
+    buildType,
+    debug,
+    release,
+    mode: "full",
+    lto,
+    jit,
+    trimmable:
+      (partial.trimmable ?? false) &&
+      release &&
+      !asan &&
+      !valgrind &&
+      linksWithLld({ darwin, crossTarget }) &&
+      host.os !== "windows",
+    aot: partial.aot ?? true,
+    relr: partial.relr ?? false,
+    pgoGenerate,
+    pgoUse,
+    asan,
+    assertions,
+    logs,
+    baseline,
+    canary,
+    smol,
+    staticSqlite,
+    staticLibatomic,
+    tinycc,
+    valgrind,
+    fuzzilli,
+    hardened,
+    requireMdwe,
+    lockEnvironment,
+    guardedPages,
+    executeOnlyStart,
+    socketFaultInjection,
+    codeGenerationFromStrings: partial.codeGenerationFromStrings ?? true,
+    webAssembly: partial.webAssembly ?? true,
+    shadowRealm: partial.shadowRealm ?? true,
+    ffi: partial.ffi ?? true,
+    unifiedSources: partial.unifiedSources ?? true,
+    archiveDeps: partial.archiveDeps ?? false,
+    timeTrace: partial.timeTrace ?? false,
+    rustCodegenUnits: partial.rustCodegenUnits,
+    rustIncremental: partial.rustIncremental ?? false,
+    rustLto,
+    debugInfo,
+    linkerMap: partial.linkerMap ?? true,
+    fuzzilliCompilerOnly: partial.fuzzilliCompilerOnly ?? false,
+    ci,
+    buildkite,
+    webkit,
+    localDeps,
+    packageManager,
+    cwd,
+    buildDir,
+    codegenDir,
+    typesDir,
+    cacheDir,
+    vendorDir,
+    cc: toolchain.cc,
+    cxx: toolchain.cxx,
+    hostCc: toolchain.hostCc ?? toolchain.cc,
+    hostCxx: toolchain.hostCxx ?? toolchain.cxx,
+    clangVersion: toolchain.clangVersion,
+    clangResourceDir: toolchain.clangResourceDir,
+    ar: toolchain.ar,
+    ld: ld64StripSwap?.ld ?? toolchain.ld,
+    // Cross strips: linux-gnu uses <triple>-strip (GNU, handles -R .eh_frame
+    // fully; host strip rejects foreign-arch ELF); other cross targets use
+    // llvm-strip. Hardened: llvm-strip, native or cross. Removing a mapped section makes GNU strip write
+    // new program headers, without PT_GNU_RELRO.
+    strip:
+      ld64StripSwap?.strip ??
+      (hardened ? toolchain.llvmStrip : undefined) ??
+      (crossTarget !== undefined
+        ? linux && abi === "gnu" && existsSync(`/usr/bin/${crossTarget}-strip`)
+          ? `/usr/bin/${crossTarget}-strip`
+          : (toolchain.llvmStrip ?? toolchain.strip)
+        : toolchain.strip),
+    nm: toolchain.nm,
+    readobj: toolchain.readobj,
+    objdump: toolchain.objdump,
+    cxxfilt: toolchain.cxxfilt,
+    dsymutil: toolchain.dsymutil,
+    bun,
+    npm,
+    jsRuntime,
+    esbuild,
+    ccache: toolchain.ccache,
+    cmake: toolchain.cmake,
+    cargo: toolchain.cargo,
+    cargoHome: toolchain.cargoHome,
+    rustupHome: toolchain.rustupHome,
+    rustToolchain: toolchainOverride.rust !== undefined ? undefined : readRustToolchainChannel(cwd),
+    rustc:
+      toolchainOverride.rust !== undefined
+        ? join(toolchainOverride.rust, "bin", `rustc${host.exeSuffix}`)
+        : toolchain.rustSysroot !== undefined
+          ? join(toolchain.rustSysroot, "bin", `rustc${host.exeSuffix}`)
+          : undefined,
+    rustSysroot: toolchain.rustSysroot,
+    rustHostTriple: toolchain.rustHostTriple,
+    msvcLinker: toolchain.msvcLinker,
+    rc: toolchain.rc,
+    nasm: toolchain.nasm,
+    osxDeploymentTarget,
+    osxSysroot,
+    crossTarget,
+    sysroot,
+    winsysroot,
+    androidNdkRuntimeDir,
+    version,
+    revision,
+    nodejsVersion,
+    nodejsV8Version,
+    nodejsAbiVersion,
+    canaryRevision,
+    webkitVersion,
+  };
+}
+
+/** Minimum macOS SDK version we support. */
+const MIN_OSX_DEPLOYMENT_TARGET = "13.0";
+
+/**
+ * Detect macOS SDK paths.
+ *
+ * - CI: always target the minimum (reproducible builds).
+ * - Local: target the installed SDK's major version (avoids linker warnings
+ *   about object files built for newer macOS than target).
+ *
+ * Fast path: `xcode-select -p` (~5ms) gives the developer dir; from there
+ * we construct the SDK path and parse the version from the resolved
+ * symlink. Avoids `xcrun` (~100ms × 2 spawns). Falls back to xcrun only if
+ * the constructed path doesn't exist (exotic installs).
+ */
+function detectMacosSdk(ci: boolean): { osxDeploymentTarget: string; osxSysroot: string } {
+  // xcode-select -p prints the active developer dir (respects
+  // `xcode-select --switch` and DEVELOPER_DIR). It's a tiny C binary —
+  // fast enough to be negligible, unlike xcrun which does a bunch of
+  // environment discovery.
+  let devDir: string;
+  try {
+    devDir = (process.env.DEVELOPER_DIR ?? execSync("xcode-select -p", { encoding: "utf8" })).trim();
+  } catch (cause) {
+    throw new BuildError("xcode-select failed — command line tools not installed?", {
+      hint: "Run: xcode-select --install",
+      cause,
+    });
+  }
+
+  // For full Xcode the dev dir is ".../Developer"; for CLT it's
+  // "/Library/Developer/CommandLineTools". SDK layout differs:
+  //   Xcode: <dev>/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk
+  //   CLT:   <dev>/SDKs/MacOSX.sdk
+  //
+  // Return the SYMLINK path as sysroot (matches what xcrun returns, and
+  // what ends up in build.ninja — so swapping SDKs doesn't cause a
+  // spurious full rebuild). But follow the link to PARSE the version
+  // from the real basename (e.g. MacOSX14.2.sdk → "14").
+  const candidates = [`${devDir}/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk`, `${devDir}/SDKs/MacOSX.sdk`];
+
+  let osxSysroot: string | undefined;
+  let sdkVersionFromPath: string | undefined;
+  for (const path of candidates) {
+    if (existsSync(path)) {
+      osxSysroot = path; // symlink — matches xcrun's output
+      const resolved = realpathSync(path);
+      const m = resolved.match(/MacOSX(\d+)(?:\.\d+)*\.sdk$/);
+      if (m) sdkVersionFromPath = m[1];
+      break;
+    }
+  }
+
+  // Neither layout matched — fall back to xcrun. Rare (custom SDK
+  // locations via SDKROOT env or similar).
+  if (osxSysroot === undefined) {
+    try {
+      osxSysroot = execSync("xcrun --sdk macosx --show-sdk-path", { encoding: "utf8" }).trim();
+    } catch (cause) {
+      throw new BuildError("Failed to find macOS SDK path", {
+        hint: "Run: xcode-select --install",
+        cause,
+      });
+    }
+  }
+
+  let osxDeploymentTarget: string;
+  if (ci) {
+    osxDeploymentTarget = MIN_OSX_DEPLOYMENT_TARGET;
+  } else if (sdkVersionFromPath !== undefined) {
+    osxDeploymentTarget = sdkVersionFromPath;
+  } else {
+    // Couldn't parse from path (unversioned symlink target?) — ask xcrun.
+    let sdkVersion: string;
+    try {
+      sdkVersion = execSync("xcrun --sdk macosx --show-sdk-version", { encoding: "utf8" }).trim();
+    } catch (cause) {
+      throw new BuildError("Failed to find macOS SDK version", {
+        hint: "Run: xcode-select --install",
+        cause,
+      });
+    }
+    const major = sdkVersion.match(/^(\d+)/)?.[1];
+    assert(major !== undefined, `Could not parse macOS SDK version: ${sdkVersion}`);
+    osxDeploymentTarget = major;
+  }
+
+  // Floor at minimum
+  if (compareVersionStrings(osxDeploymentTarget, MIN_OSX_DEPLOYMENT_TARGET) < 0) {
+    throw new BuildError(
+      `macOS SDK ${osxDeploymentTarget} is older than minimum supported ${MIN_OSX_DEPLOYMENT_TARGET}`,
+      { hint: "Update Xcode or Xcode Command Line Tools" },
+    );
+  }
+
+  return { osxDeploymentTarget, osxSysroot };
+}
+
+/** Simple X.Y version comparison. Returns -1, 0, 1. */
+function compareVersionStrings(a: string, b: string): number {
+  const pa = a.split(".").map(Number);
+  const pb = b.split(".").map(Number);
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    const ai = pa[i] ?? 0;
+    const bi = pb[i] ?? 0;
+    if (ai !== bi) return ai < bi ? -1 : 1;
+  }
+  return 0;
+}
+
+/**
+ * Find the repository root by walking up from cwd looking for package.json
+ * with name "bun". Exported so `resolveToolchain()` in configure.ts can
+ * resolve paths correctly when invoked from ninja (where cwd = build dir).
+ */
+export function findRepoRoot(): string {
+  let dir = process.cwd();
+  while (true) {
+    const pkgPath = join(dir, "package.json");
+    if (existsSync(pkgPath)) {
+      try {
+        const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { name?: string };
+        if (pkg.name === "bun") {
+          return dir;
+        }
+      } catch {
+        // Invalid JSON, keep walking
+      }
+    }
+    const parent = resolve(dir, "..");
+    if (parent === dir) {
+      throw new BuildError("Could not find bun repository root", { hint: "Run this from within the bun repository" });
+    }
+    dir = parent;
+  }
+}
+
+/**
+ * Parse `--local-deps=name=path[,name=path...]` into name → absolute path.
+ * Names are checked against `allDeps` later (bun.ts) where the dep list is
+ * in scope; here we only validate shape and resolve paths.
+ */
+function parseLocalDeps(spec: string | undefined, cwd: string): Record<string, string> {
+  // Null prototype: any name (even `__proto__`) is stored as a plain entry and
+  // reaches the unknown-dep check in validateBunConfig.
+  const out = Object.create(null) as Record<string, string>;
+  if (spec === undefined || spec === "") return out;
+  for (const entry of spec.split(",")) {
+    const eq = entry.indexOf("=");
+    if (eq <= 0 || eq === entry.length - 1) {
+      throw new BuildError(`--local-deps: expected name=path, got '${entry}'`, {
+        hint: "Example: --local-deps=mimalloc=~/code/mimalloc",
+      });
+    }
+    out[entry.slice(0, eq)] = expandLocalPath(entry.slice(eq + 1), cwd);
+  }
+  return out;
+}
+
+/**
+ * Shells don't expand `~` inside quotes or after `=`. Relative paths are
+ * anchored to the repo root so ninja's regen rule (which runs from buildDir)
+ * resolves the same path as the initial configure.
+ */
+function expandLocalPath(path: string, cwd: string): string {
+  if (path === "~" || path.startsWith("~/") || path.startsWith("~\\")) return join(homedir(), path.slice(1));
+  return resolve(cwd, path);
+}
+
+/**
+ * Get the current git revision (HEAD sha).
+ *
+ * Uses `git rev-parse` rather than reading .git/HEAD directly — the sha
+ * is baked into the binary and surfaces in bug reports, so correctness
+ * matters more than the ~20ms spawn. Git's plumbing has edge cases
+ * (packed-refs, worktrees, symbolic refs) that rev-parse handles for free.
+ */
+/**
+ * Parse the major component out of an X.Y.Z version string.
+ * Returns undefined for undefined/unparseable input so callers can
+ * compare without `!` assertions.
+ */
+function majorOf(version: string | undefined): number | undefined {
+  if (version === undefined) return undefined;
+  const m = version.match(/^(\d+)\./);
+  return m ? Number(m[1]) : undefined;
+}
+
+/**
+ * Read `channel` from `rust-toolchain.toml`. Passed as `RUSTUP_TOOLCHAIN` to
+ * cargo invocations so vendored Rust deps and the workspace staticlib are
+ * built with the same nightly — see `Config.rustToolchain` for why rustup's
+ * own directory walk isn't sufficient when `vendor/` is a worktree-shared
+ * symlink.
+ *
+ * Returns undefined if the file is missing (rustup then falls back to its
+ * normal lookup, which is correct for the workspace build's cwd).
+ */
+function readRustToolchainChannel(cwd: string): string | undefined {
+  const path = resolve(cwd, "rust-toolchain.toml");
+  if (!existsSync(path)) return undefined;
+  const m = /^\s*channel\s*=\s*"([^"]+)"/m.exec(readFileSync(path, "utf8"));
+  return m?.[1];
+}
+
+function getGitRevision(cwd: string, pinDir: string | undefined): string {
+  // CI env first — authoritative and zero-cost.
+  const envSha = process.env.BUILDKITE_COMMIT ?? process.env.GITHUB_SHA ?? process.env.GIT_SHA;
+  if (envSha !== undefined && envSha.length > 0) {
+    return envSha;
+  }
+  // Local debug builds pin the sha at first configure: it is a const in `bun_core`, so tracking HEAD would recompile every Rust crate on each commit/checkout/pull.
+  const pinFile = pinDir === undefined ? undefined : resolve(pinDir, "git-revision");
+  if (pinFile !== undefined && existsSync(pinFile)) {
+    const pinned = readFileSync(pinFile, "utf8").trim();
+    if (/^[0-9a-f]{40}$/.test(pinned)) return pinned;
+  }
+  let sha: string;
+  try {
+    sha = execSync("git rev-parse HEAD", { cwd, encoding: "utf8" }).trim();
+  } catch {
+    return "unknown";
+  }
+  if (pinFile !== undefined) {
+    mkdirSync(pinDir!, { recursive: true });
+    writeFileSync(pinFile, sha + "\n");
+  }
+  return sha;
+}
+
+/**
+ * Compute build directory name based on config.
+ * Matches the pattern used by package.json scripts.
+ */
+function computeBuildDirName(c: { debug: boolean; release: boolean; asan: boolean; assertions: boolean }): string {
+  if (c.debug) return "debug";
+  if (c.asan) return "release-asan";
+  if (c.assertions) return "release-assertions";
+  return "release";
+}
+
+/**
+ * Name of the output executable (no suffix).
+ *
+ * Debug builds: bun-debug. Release with ASAN: bun-asan. Etc.
+ * The plain `bun` name (without -profile) only exists post-strip.
+ *
+ * Lives here (not bun.ts) so flags.ts can use it for linker-map filename
+ * without a circular import.
+ */
+export function bunExeName(cfg: Config): string {
+  if (cfg.debug) return "bun-debug";
+  // Release variants — suffix encodes which features differ from plain release.
+  // First match wins.
+  if (cfg.asan && cfg.valgrind) return "bun-asan-valgrind";
+  if (cfg.asan) return "bun-asan";
+  if (cfg.valgrind) return "bun-valgrind";
+  if (cfg.assertions) return "bun-assertions";
+  // Plain release: called bun-profile (the stripped one is `bun`).
+  return "bun-profile";
+}
+
+/**
+ * An lld does the link: every one but a native macOS link, which goes through Apple's ld. That linker takes none of
+ * lld's LTO-level or ICF options (it runs clang's libLTO at its default level and has no ICF), so flags.ts states
+ * those only where this holds. Lives here (not flags.ts) because `trimmable` is resolved from it.
+ */
+export function linksWithLld(c: Pick<Config, "darwin" | "crossTarget">): boolean {
+  return !c.darwin || c.crossTarget !== undefined;
+}
+
+/**
+ * Whether this config produces a stripped `bun` alongside `bun-profile`.
+ *
+ * Only plain release builds strip — not debug (you want symbols), not
+ * asan/valgrind (strip interferes), not assertions (usually debugging).
+ */
+export function shouldStrip(cfg: Config): boolean {
+  return !cfg.debug && !cfg.asan && !cfg.valgrind && !cfg.assertions;
+}
+
+const c = { dim, cyan, green };
+
+/**
+ * Format a config for display (used at configure time).
+ * `exe` is the output binary name (e.g. "bun-debug" or "bun-profile → bun (stripped)").
+ */
+export function formatConfig(cfg: Config, exe: string): string {
+  const label = (s: string) => c.dim(s.padEnd(12));
+  // Relative build dir with ./ prefix — shorter, copy-pastable.
+  const relBuildDir = `.${sep}${relative(cfg.cwd, cfg.buildDir)}`;
+  const lines: string[] = [
+    `[configured] ${c.green(exe)}`,
+    `  ${label("target")} ${cfg.os}-${cfg.arch}${cfg.abi !== undefined ? "-" + cfg.abi : ""}`,
+    `  ${label("build type")} ${cfg.buildType}`,
+    `  ${label("build dir")} ${relBuildDir}`,
+    `  ${label("revision")} ${cfg.revision === "unknown" ? "unknown" : cfg.revision.slice(0, 10)}${cfg.debug && !cfg.ci ? " (pinned; rm <build dir>/git-revision to refresh)" : ""}`,
+  ];
+  const features: string[] = [];
+  if (cfg.lto) features.push("lto");
+  if (cfg.trimmable) features.push("trimmable");
+  if (!cfg.jit) features.push("no-jit");
+  if (!cfg.aot) features.push("no-aot");
+  if (cfg.relr) features.push("relr");
+  if (cfg.pgoGenerate) features.push("pgo-gen");
+  if (cfg.pgoUse) features.push("pgo-use");
+  if (cfg.asan) features.push("asan");
+  if (cfg.assertions) features.push("assertions");
+  if (cfg.logs) features.push("logs");
+  if (cfg.baseline) features.push("baseline");
+  if (cfg.rustCodegenUnits !== undefined) features.push(`rust-codegen-units:${cfg.rustCodegenUnits}`);
+  if (cfg.rustIncremental) features.push("rust-incremental");
+  if (!cfg.rustLto) features.push("rust-lto:off");
+  if (cfg.debugInfo !== defaultDebugInfo(cfg)) features.push(`debug-info:${cfg.debugInfo}`);
+  if (!cfg.linkerMap) features.push("linker-map:off");
+  if (cfg.valgrind) features.push("valgrind");
+  if (cfg.fuzzilli) features.push(cfg.fuzzilliCompilerOnly ? "fuzzilli:compiler-only" : "fuzzilli");
+  if (cfg.hardened) features.push("hardened");
+  if (cfg.requireMdwe !== cfg.hardened) features.push("require-mdwe:off");
+  if (cfg.lockEnvironment !== cfg.hardened) features.push("lock-environment:off");
+  if (cfg.guardedPages !== cfg.hardened) features.push(cfg.guardedPages ? "guarded-pages" : "guarded-pages:off");
+  if (cfg.executeOnlyStart === cfg.hardened) {
+    features.push(cfg.executeOnlyStart ? "execute-only-start" : "execute-only-start:off");
+  }
+  if (cfg.socketFaultInjection !== cfg.asan) {
+    features.push(`socket-fault-injection:${cfg.socketFaultInjection ? "on" : "off"}`);
+  }
+  if (!cfg.codeGenerationFromStrings) features.push("code-generation-from-strings:off");
+  if (!cfg.webAssembly) features.push("webassembly:off");
+  if (!cfg.shadowRealm) features.push("shadow-realm:off");
+  if (!cfg.ffi) features.push("ffi:off");
+  if (!cfg.canary) features.push("canary:off");
+  // Non-default modes — show so you notice when a build is unusual.
+  if (cfg.webkit !== "prebuilt") features.push(`webkit:${cfg.webkit}`);
+  for (const name of Object.keys(cfg.localDeps)) if (name !== "WebKit") features.push(`local:${name}`);
+  if (cfg.packageManager !== "bun") features.push(`package-manager:${cfg.packageManager}`);
+  // Version pin overrides — show an identifying value so you catch "forgot
+  // to revert my WebKit test branch" before the build goes weird. Strip the
+  // autobuild- prefix so preview tags show their sha instead of the prefix.
+  if (cfg.webkitVersion !== versionDefaults.webkitVersion) {
+    const v = cfg.webkitVersion.startsWith("autobuild-")
+      ? cfg.webkitVersion.slice("autobuild-".length)
+      : cfg.webkitVersion;
+    features.push(`webkit-version:${/^[0-9a-f]{40}$/.test(v) ? v.slice(0, 10) : v}`);
+  }
+  if (cfg.nodejsVersion !== versionDefaults.nodejsVersion) features.push(`nodejs:${cfg.nodejsVersion}`);
+  lines.push(`  ${label("features")} ${features.length > 0 ? c.cyan(features.join(", ")) : c.dim("(none)")}`);
+  return lines.join("\n");
+}
+
+/**
+ * One-line "nothing changed" configure message. Bracketed to match the
+ * [name] prefix style used by deps.
+ */
+export function formatConfigUnchanged(exe: string, elapsed: number): string {
+  return `[configured] ${c.green(exe)} in ${elapsed}ms ${c.dim("(unchanged)")}`;
+}

@@ -1,0 +1,3637 @@
+import { spawnSync } from "bun";
+import { beforeAll, describe, expect, it, test } from "bun:test";
+import { bunEnv, bunExe, isASAN, isLinux, isWindows, tempDir, tempDirWithFiles, tmpdirSync } from "harness";
+import { mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve, sep } from "node:path";
+
+describe("bun test", () => {
+  test("running a non-existent absolute file path is a 1 exit code", () => {
+    const spawn = Bun.spawnSync({
+      cmd: [bunExe(), "test", join(import.meta.dirname, "non-existent.test.ts")],
+      env: bunEnv,
+      stdin: "ignore",
+      stdout: "inherit",
+      stderr: "inherit",
+    });
+    expect(spawn.exitCode).toBe(1);
+  });
+  test("can provide no arguments", () => {
+    const stderr = runTest({
+      args: [],
+      input: [
+        `
+          import { test, expect } from "bun:test";
+          test("test #1", () => {
+            expect(true).toBe(true);
+          });
+        `,
+        `
+          import { test, expect } from "bun:test";
+          test.todo("test #2");
+        `,
+        `
+          import { test, expect } from "bun:test";
+          test("test #3", () => {
+            expect(true).toBe(false);
+          });
+        `,
+      ],
+    });
+    expect(stderr).toContain("test #1");
+    expect(stderr).toContain("test #2");
+    expect(stderr).toContain("test #3");
+  });
+  test("can provide a relative file", () => {
+    const path = join("path", "to", "relative.test.ts");
+    const cwd = createTest(
+      `
+      import { test, expect } from "bun:test";
+      test("${path}", () => {
+        expect(true).toBe(true);
+      });
+    `,
+      path,
+    );
+    const stderr = runTest({
+      cwd,
+      args: [path],
+    });
+    expect(stderr).toContain(path);
+  });
+  // This fails on macOS because /private/var symlinks to /var
+  test.todo("can provide an absolute file", () => {
+    const path = join("path", "to", "absolute.test.ts");
+    const cwd = createTest(
+      `
+      import { test, expect } from "bun:test";
+      test("${path}", () => {
+        expect(true).toBe(true);
+      });
+    `,
+      path,
+    );
+    const absolutePath = resolve(cwd, path);
+    const stderr = runTest({
+      cwd,
+      args: [absolutePath],
+    });
+    expect(stderr).toContain(path);
+  });
+  test("can provide a relative directory", () => {
+    const path = join("path", "to", "relative.test.ts");
+    const dir = dirname(path);
+    const cwd = createTest(
+      `
+      import { test, expect } from "bun:test";
+      test("${dir}", () => {
+        expect(true).toBe(true);
+      });
+    `,
+      path,
+    );
+    const stderr = runTest({
+      cwd,
+      args: [dir],
+    });
+    expect(stderr).toContain(dir);
+  });
+  test.todo("can provide an absolute directory", () => {
+    const path = join("path", "to", "absolute.test.ts");
+    const cwd = createTest(
+      `
+      import { test, expect } from "bun:test";
+      test("${path}", () => {
+        expect(true).toBe(true);
+      });
+    `,
+      path,
+    );
+    const absoluteDir = resolve(cwd, dirname(path));
+    const stderr = runTest({
+      cwd,
+      args: [absoluteDir],
+    });
+    expect(stderr).toContain(path);
+  });
+
+  test.each([
+    ["arrays and objects", "i % 2 ? [value] : { a: value }"],
+    ["instances of a class", "new (class A { a = value; })()"],
+    ["JSX children", `{ $$typeof: Symbol.for("react.element"), type: "div", props: { children: value } }`],
+    ["JSX props", `{ $$typeof: Symbol.for("react.element"), type: "div", props: { a: value } }`],
+    ["the data of events", `new MessageEvent("message", { data: value })`],
+    ["asymmetric matchers", "expect.objectContaining({ a: value })"],
+  ])("%s nested too deeply to print are a RangeError", (_, wrap) => {
+    const stderr = runTest({
+      input: `
+        import { test, expect } from "bun:test";
+        function thrownFor(depth) {
+          let value = 1;
+          for (let i = 0; i < depth; i++) value = ${wrap};
+          try {
+            expect(value).toMatchInlineSnapshot('"x"');
+          } catch (error) {
+            return error.constructor.name;
+          }
+        }
+        test("deep", () => {
+          expect([thrownFor(10), thrownFor(100_000)]).toEqual(["Error", "RangeError"]);
+        }, 60_000);
+      `,
+      expectExitCode: 0,
+    });
+    expect(stderr).toContain("1 pass");
+  });
+  describe("when filters are provided", () => {
+    let dir: string;
+    beforeAll(() => {
+      const makeTest = (name: string, pass = true) => `
+      import { test, expect } from "bun:test";
+      test("${name}", () => {
+        expect(1).toBe(${pass ? 1 : 0});
+      });
+      `;
+      dir = tempDirWithFiles("bun-test-filtering", {
+        "foo.test.js": makeTest("foo"),
+        bar: {
+          "bar1.spec.tsx": makeTest("bar1"),
+          "bar2.spec.ts": makeTest("bar2"),
+        },
+      });
+    });
+
+    it("if that filter is a path to a directory, will run all tests in that directory", () => {
+      const stderr = runTest({ cwd: dir, args: ["./bar"] });
+      expect(stderr).toContain("2 pass");
+      expect(stderr).not.toContain("foo");
+    });
+  });
+
+  test("works with require", () => {
+    const stderr = runTest({
+      args: [],
+      input: [
+        `
+          const { test, expect } = require("bun:test");
+          test("test #1", () => {
+            expect().pass();
+          })
+        `,
+      ],
+    });
+    expect(stderr).toContain("test #1");
+  });
+  test("works with dynamic import", () => {
+    const stderr = runTest({
+      args: [],
+      input: `
+        const { test, expect } = await import("bun:test");
+        test("test #1", () => {
+          expect().pass();
+        })
+      `,
+    });
+    expect(stderr).toContain("test #1");
+  });
+  test("works with cjs require", () => {
+    const cwd = createTest(
+      `
+        const { test, expect } = require("bun:test");
+        test("test #1", () => {
+          expect().pass();
+        })
+      `,
+      "test.test.cjs",
+    );
+    const stderr = runTest({
+      cwd,
+    });
+    expect(stderr).toContain("test #1");
+  });
+  test("works with cjs dynamic import", () => {
+    const cwd = createTest(
+      `
+        const { test, expect } = await import("bun:test");
+        test("test #1", () => {
+          expect().pass();
+        })
+      `,
+      "test.test.cjs",
+    );
+    const stderr = runTest({
+      cwd,
+    });
+    expect(stderr).toContain("test #1");
+  });
+  test.todo("can provide a mix of files and directories");
+  describe("--rerun-each", () => {
+    test.todo("can rerun with a default value");
+    test.todo("can rerun with a provided value");
+  });
+  describe("--todo", () => {
+    test("should not run todo by default", () => {
+      const stderr = runTest({
+        input: `
+          import { test, expect } from "bun:test";
+          test.todo("todo", async () => {
+            console.error("should not run");
+          });
+        `,
+      });
+      expect(stderr).not.toContain("should not run");
+    });
+    test("should run todo when enabled", () => {
+      const stderr = runTest({
+        args: ["--todo"],
+        input: `
+          import { test, expect } from "bun:test";
+          test.todo("todo", async () => {
+            console.error("should run");
+          });
+        `,
+      });
+      expect(stderr).toContain("should run");
+    });
+  });
+  describe("only", () => {
+    test("should run nested describe.only", () => {
+      const stderr = runTest({
+        args: [],
+        input: `
+            import { test, describe } from "bun:test";
+            describe("outer", () => {
+              describe.only("inner (nested)", () => {
+                test("test", () => {
+                  console.error("reachable");
+                })
+              })
+              describe("inner (skipped)", () => {
+                test("test", () => {
+                  console.error("unreachable");
+                })
+              })
+            })
+            `,
+        env: { CI: "false" },
+      });
+      expect(stderr).toContain("reachable");
+      expect(stderr).not.toContain("unreachable");
+      expect(stderr.match(/reachable/g)).toHaveLength(1);
+    });
+    test("should skip non-only tests", () => {
+      const stderr = runTest({
+        args: [],
+        input: `
+          import { test, describe } from "bun:test";
+          test("test #1", () => {
+            console.error("unreachable");
+          });
+          test.only("test #2", () => {
+            console.error("reachable");
+          });
+          test("test #3", () => {
+            console.error("unreachable");
+          });
+          test.skip("test #4", () => {
+            console.error("unreachable");
+          });
+          test.todo("test #5");
+          describe("describe #1", () => {
+            test("test #6", () => {
+              console.error("unreachable");
+            });
+            test.only("test #7", () => {
+              console.error("reachable");
+            });
+          });
+          describe.only("describe #2", () => {
+            test("test #8", () => {
+              console.error("unreachable");
+            });
+            test.skip("test #9", () => {
+              console.error("unreachable");
+            });
+            test.only("test #10", () => {
+              console.error("reachable");
+            });
+          });
+        `,
+        env: { CI: "false" },
+      });
+      expect(stderr).toContain("reachable");
+      expect(stderr).not.toContain("unreachable");
+      expect(stderr.match(/reachable/g)).toHaveLength(3);
+    });
+  });
+  describe("--bail", () => {
+    test("must provide a number bail", () => {
+      const stderr = runTest({
+        args: ["--bail=foo"],
+      });
+      expect(stderr).toContain("expects a number");
+    });
+
+    test("must provide non-negative bail", () => {
+      const stderr = runTest({
+        args: ["--bail=-1"],
+      });
+      expect(stderr).toContain("expects a number");
+    });
+
+    test("should not be 0", () => {
+      const stderr = runTest({
+        args: ["--bail=0"],
+      });
+      expect(stderr).toContain("expects a number");
+    });
+
+    test("bail should be 1 by default", () => {
+      const stderr = runTest({
+        args: ["--bail"],
+        input: `
+          import { test, expect } from "bun:test";
+          test("test #1", () => {
+            expect(true).toBe(false);
+          });
+          test("test #2", () => {
+            expect(true).toBe(true);
+          });
+        `,
+      });
+      expect(stderr).toContain("Bailed out after 1 failure");
+      expect(stderr).not.toContain("test #2");
+    });
+
+    test("should bail out after 3 failures", () => {
+      const stderr = runTest({
+        args: ["--bail=3"],
+        input: `
+          import { test, expect } from "bun:test";
+          test("test #1", () => {
+            expect(true).toBe(false);
+          });
+          test("test #2", () => {
+            expect(true).toBe(false);
+          });
+          test("test #3", () => {
+            expect(true).toBe(false);
+          });
+          test("test #4", () => {
+            expect(true).toBe(true);
+          });
+        `,
+      });
+      expect(stderr).toContain("Bailed out after 3 failures");
+      expect(stderr).not.toContain("test #4");
+    });
+
+    // The failure is reported from a promise reaction, so the exit starts inside a JS frame.
+    test.skipIf(!isASAN)("tears down the VM without leaks", async () => {
+      using dir = tempDir("bun-test-bail-leak-check", {
+        "a.test.ts": `
+          import { test, expect } from "bun:test";
+          test("fails", async () => {
+            setTimeout(() => console.log("ran: timer"), 60_000);
+            await Bun.sleep(1);
+            console.log("ran: fails");
+            expect(1).toBe(2);
+          });
+          test("unreachable", () => {
+            console.log("ran: unreachable");
+          });
+        `,
+      });
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "test", "--bail"],
+        env: {
+          ...bunEnv,
+          BUN_DESTRUCT_VM_ON_EXIT: "1",
+          ASAN_OPTIONS: "allow_user_segv_handler=1:detect_leaks=1:abort_on_error=1",
+          LSAN_OPTIONS: `print_suppressions=0:suppressions=${join(import.meta.dir, "../../leaksan.supp")}`,
+        },
+        cwd: String(dir),
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stdout.split("\n").filter(line => line.startsWith("ran: "))).toEqual(["ran: fails"]);
+      expect(stderr).toContain("Bailed out after 1 failure");
+      expect(exitCode, stderr).toBe(1);
+    });
+  });
+  describe("--timeout", () => {
+    test("must provide a number timeout", () => {
+      const stderr = runTest({
+        args: ["--timeout", "foo"],
+      });
+      expect(stderr).toContain("Invalid timeout");
+    });
+    test("must provide non-negative timeout", () => {
+      const stderr = runTest({
+        args: ["--timeout", "-1"],
+      });
+      expect(stderr).toContain("Invalid timeout");
+    });
+    // TODO: https://github.com/oven-sh/bun/issues/8069
+    // This test crashes, which will pass because stderr contains "timed out"
+    // but the crash can also mean it hangs, which will end up failing.
+    // Possibly fixed by https://github.com/oven-sh/bun/pull/8076/files
+    test("timeout can be set to 30ms", () => {
+      const stderr = runTest({
+        args: ["--timeout", "30"],
+        input: `
+          import { test, expect } from "bun:test";
+          import { sleep } from "bun";
+          test("ok", async () => {
+            await expect(sleep(1)).resolves.toBeUndefined();
+          });
+          test("timeout", async () => {
+            await expect(sleep(64)).resolves.toBeUndefined();
+          });
+        `,
+      });
+      expect(stderr).toHaveTestTimedOutAfter(30);
+    });
+    test("timeout should default to 5000ms", () => {
+      const time = process.platform === "linux" ? 5005 : 5500;
+      const stderr = runTest({
+        input: `
+          import { test, expect } from "bun:test";
+          import { sleep } from "bun";
+          test("timeout", async () => {
+            await sleep(${time});
+          });
+        `,
+      });
+      expect(stderr).toHaveTestTimedOutAfter(5000);
+    }, 10000);
+  });
+  describe("support for Github Actions", () => {
+    test("should not group logs by default", () => {
+      const stderr = runTest({
+        env: {
+          GITHUB_ACTIONS: undefined,
+        },
+      });
+      expect(stderr).not.toContain("::group::");
+      expect(stderr).not.toContain("::endgroup::");
+    });
+    test("should not group logs when disabled", () => {
+      const stderr = runTest({
+        env: {
+          GITHUB_ACTIONS: "false",
+        },
+      });
+      expect(stderr).not.toContain("::group::");
+      expect(stderr).not.toContain("::endgroup::");
+    });
+    test("should group logs when enabled", () => {
+      const stderr = runTest({
+        env: {
+          GITHUB_ACTIONS: "true",
+        },
+      });
+      expect(stderr).toContain("::group::");
+      expect(stderr.match(/::group::/g)).toHaveLength(1);
+      expect(stderr).toContain("::endgroup::");
+      expect(stderr.match(/::endgroup::/g)).toHaveLength(1);
+    });
+    test("should group logs with multiple files", () => {
+      const stderr = runTest({
+        input: [
+          `
+            import { test, expect } from "bun:test";
+            test("pass", () => {
+              expect(true).toBe(true);
+            });
+          `,
+          `
+            import { test, expect } from "bun:test";
+            test.skip("skip", () => {});
+          `,
+          `
+            import { test, expect } from "bun:test";
+            test("fail", () => {
+              expect(true).toBe(false);
+            });
+          `,
+        ],
+        env: {
+          GITHUB_ACTIONS: "true",
+        },
+      });
+      expect(stderr).toContain("::group::");
+      expect(stderr.match(/::group::/g)).toHaveLength(3);
+      expect(stderr).toContain("::endgroup::");
+      expect(stderr.match(/::endgroup::/g)).toHaveLength(3);
+    });
+    test("should group logs with --rerun-each", () => {
+      const stderr = runTest({
+        args: ["--rerun-each", "3"],
+        input: [
+          `
+            import { test, expect } from "bun:test";
+            test("pass", () => {
+              expect(true).toBe(true);
+            });
+          `,
+          `
+            import { test, expect } from "bun:test";
+            test("fail", () => {
+              expect(true).toBe(false);
+            });
+          `,
+        ],
+        env: {
+          GITHUB_ACTIONS: "true",
+        },
+      });
+      expect(stderr).toContain("::group::");
+      expect(stderr.match(/::group::/g)).toHaveLength(6);
+      expect(stderr).toContain("::endgroup::");
+      expect(stderr.match(/::endgroup::/g)).toHaveLength(6);
+    });
+    test("should not annotate errors by default", () => {
+      const stderr = runTest({
+        input: `
+          import { test, expect } from "bun:test";
+          test("fail", () => {
+            expect(true).toBe(false);
+          });
+        `,
+        env: {
+          GITHUB_ACTIONS: undefined,
+        },
+      });
+      expect(stderr).not.toContain("::error");
+    });
+    test("should not annotate errors with inspect() by default", () => {
+      const stderr = runTest({
+        input: `
+          import { test } from "bun:test";
+          import { inspect } from "bun";
+          test("inspect", () => {
+            inspect(new TypeError());
+            console.error(inspect(new TypeError()));
+          });
+        `,
+        env: {
+          GITHUB_ACTIONS: undefined,
+        },
+      });
+      expect(stderr).not.toContain("::error");
+    });
+    test("should not annotate errors with inspect() when enabled", () => {
+      const stderr = runTest({
+        input: `
+          import { test } from "bun:test";
+          import { inspect } from "bun";
+          test("inspect", () => {
+            inspect(new TypeError());
+            console.error(inspect(new TypeError()));
+          });
+        `,
+        env: {
+          GITHUB_ACTIONS: "true",
+        },
+      });
+      expect(stderr).not.toContain("::error");
+    });
+    test("should annotate errors in the global scope", () => {
+      const stderr = runTest({
+        input: `
+          throw new Error();
+        `,
+        env: {
+          GITHUB_ACTIONS: "true",
+        },
+      });
+      expect(stderr).toMatch(/::error file=.*,line=\d+,col=\d+,title=error::/);
+    });
+    test.each(["test", "describe"])("should annotate errors in a %s scope", type => {
+      const stderr = runTest({
+        input: `
+          import { ${type} } from "bun:test";
+          ${type}("fail", () => {
+            throw new Error();
+          });
+        `,
+        env: {
+          GITHUB_ACTIONS: "true",
+        },
+      });
+      expect(stderr).toMatch(/::error file=.*,line=\d+,col=\d+,title=error::/);
+    });
+    test.each(["beforeAll", "beforeEach", "afterEach", "afterAll"])("should annotate errors in a %s callback", type => {
+      const stderr = runTest({
+        input: `
+          import { test, ${type} } from "bun:test";
+          ${type}(() => {
+            throw new Error();
+          });
+          test("test", () => {});
+        `,
+        env: {
+          GITHUB_ACTIONS: "true",
+        },
+      });
+      expect(stderr).toMatch(/::error file=.*,line=\d+,col=\d+,title=error::/);
+    });
+    test("should annotate errors with escaped strings", () => {
+      const stderr = runTest({
+        input: `
+          import { test, expect } from "bun:test";
+          test("fail", () => {
+            expect(true).toBe(false);
+          });
+        `,
+        env: {
+          FORCE_COLOR: "1",
+          GITHUB_ACTIONS: "true",
+        },
+      });
+      expect(stderr).toMatch(/::error file=.*,line=\d+,col=\d+,title=.*::/);
+      expect(stderr).toMatch(/error: expect\(received\)\.toBe\(expected\)/); // stripped ansi
+      expect(stderr).toMatch(/Expected: false%0AReceived: true%0A/); // escaped newlines
+    });
+    test("should annotate errors without a stack", () => {
+      const stderr = runTest({
+        input: `
+          import { test, expect } from "bun:test";
+          test("fail", () => {
+            throw "Oops!";
+          });
+        `,
+        env: {
+          FORCE_COLOR: "1",
+          GITHUB_ACTIONS: "true",
+        },
+      });
+      expect(stderr).toMatch(/::error file=.*,line=\d+,col=\d+,title=error: Oops!::/m);
+    });
+    test("should annotate an error message containing non-ASCII bytes", () => {
+      const stderr = runTest({
+        input: `
+          import { test } from "bun:test";
+          test("fail", () => {
+            throw "hello é world";
+          });
+        `,
+        env: {
+          FORCE_COLOR: "1",
+          GITHUB_ACTIONS: "true",
+        },
+      });
+      const annotation = stderr.split("\n").find(l => l.startsWith("::error"));
+      expect(annotation).toMatch(/^::error file=.*,line=\d+,col=\d+,title=error: hello é world::%0A {6}at /);
+    });
+    test("should annotate an error message containing emoji and newlines", () => {
+      const stderr = runTest({
+        input: `
+          import { test } from "bun:test";
+          test("fail", () => {
+            throw "before 😋 after\\nsecond 😋 line";
+          });
+        `,
+        env: {
+          FORCE_COLOR: "1",
+          GITHUB_ACTIONS: "true",
+        },
+      });
+      const annotation = stderr.split("\n").find(l => l.startsWith("::error"));
+      expect(annotation).toMatch(
+        /^::error file=.*,line=\d+,col=\d+,title=error: before 😋 after::second 😋 line%0A {6}at /,
+      );
+    });
+    test("should percent-encode metacharacters in the annotation file property", () => {
+      const stderr = runTest({
+        input: [
+          {
+            filename: "odd,name%path.test.ts",
+            contents: `
+              import { test } from "bun:test";
+              test("fail", () => {
+                throw new Error("boom");
+              });
+            `,
+          },
+        ],
+        env: {
+          GITHUB_ACTIONS: "true",
+        },
+      });
+      const annotation = stderr.split("\n").find(l => l.startsWith("::error"));
+      expect(annotation).toMatch(
+        /^::error file=(.*[\\/])?odd%2Cname%25path\.test\.ts,line=\d+,col=\d+,title=error: boom::/,
+      );
+    });
+    test("should percent-encode metacharacters in the annotation title", () => {
+      const stderr = runTest({
+        input: `
+          import { test } from "bun:test";
+          test("fail", () => {
+            const err = new Error("alpha: one, two 100%\\nbeta: three, four");
+            err.name = "Odd:Name,With%Chars";
+            throw err;
+          });
+        `,
+        env: {
+          FORCE_COLOR: "1",
+          GITHUB_ACTIONS: "true",
+        },
+      });
+      const annotation = stderr.split("\n").find(l => l.startsWith("::error"));
+      expect(annotation).toMatch(
+        /^::error file=.*,line=\d+,col=\d+,title=Odd%3AName%2CWith%25Chars: alpha%3A one%2C two 100%25::beta: three, four%0A {6}at /,
+      );
+    });
+    test("should keep a function name containing a newline on the annotation line", () => {
+      const stderr = runTest({
+        input: `
+          import { test } from "bun:test";
+          function inner() {
+            throw new Error("boom");
+          }
+          Object.defineProperty(inner, "name", { value: "odd\\nname" });
+          test("fail", () => {
+            inner();
+          });
+        `,
+        env: {
+          FORCE_COLOR: "1",
+          GITHUB_ACTIONS: "true",
+        },
+      });
+      const annotation = stderr.split("\n").find(l => l.startsWith("::error"));
+      expect(annotation).toMatch(/^::error file=.*,line=\d+,col=\d+,title=error: boom::/);
+      expect(annotation).toContain("%0A      at odd%0Aname (");
+    });
+    test("should annotate a test timeout", () => {
+      const stderr = runTest({
+        input: `
+          import { test } from "bun:test";
+          test("time out", async () => {
+            await Bun.sleep(1000);
+          }, { timeout: 1 });
+        `,
+        env: {
+          FORCE_COLOR: "1",
+          GITHUB_ACTIONS: "true",
+        },
+      });
+      expect(stderr).toMatch(/::error title=error: Test \"time out\" timed out after \d+ms::/);
+    });
+    test("should annotate an error thrown from a source whose URL is longer than a path buffer", () => {
+      // Longer than a path buffer on every platform (98302 bytes on Windows).
+      const padding = 100_000;
+      const dataUrlModule = 'export default function fromDataUrl() { throw new Error("boom"); }//';
+      const base64 = btoa(dataUrlModule + Buffer.alloc(padding, "x").toString());
+      const longPath = "/" + Buffer.alloc(padding, "y").toString();
+      const stderr = runTest({
+        input: `
+          import { test } from "bun:test";
+          test("data url", async () => {
+            const source = ${JSON.stringify(dataUrlModule)} + Buffer.alloc(${padding}, "x").toString();
+            const m = await import("data:text/javascript;base64," + btoa(source));
+            m.default();
+          });
+          test("long sourceURL", () => {
+            const sourceURL = "/" + Buffer.alloc(${padding}, "y").toString();
+            (0, eval)("(function fromLongPath() { throw new Error('boom'); })\\n//# sourceURL=" + sourceURL)();
+          });
+        `,
+        env: {
+          GITHUB_ACTIONS: "true",
+        },
+        expectExitCode: 1,
+      });
+      const annotations = stderr.split("\n").filter(line => line.startsWith("::error"));
+      expect(annotations).toHaveLength(2);
+      const [dataUrl, longSourceUrl] = annotations;
+      expect(dataUrl).toStartWith(`::error file=data%3Atext/javascript;base64%2C${base64},line=1,col=`);
+      expect(dataUrl).toContain(`%0A      at fromDataUrl (data:text/javascript;base64,${base64}:1:`);
+      expect(longSourceUrl).toStartWith(`::error file=${longPath},line=1,col=`);
+      expect(longSourceUrl).toContain(`%0A      at fromLongPath (${longPath}:1:`);
+    });
+    test("should make the annotation file relative to GITHUB_WORKSPACE only when it is a path", () => {
+      const cwd = createTest([
+        {
+          filename: "workspace.test.ts",
+          contents: `
+            import { test } from "bun:test";
+            test("in the test file", () => {
+              throw new Error("boom");
+            });
+            test("in a sourceURL that is not a path", () => {
+              (0, eval)("(function fromSourceUrl() { throw new Error('boom'); })\\n//# sourceURL=webpack://app/./src/x.ts")();
+            });
+          `,
+        },
+      ]);
+      const stderr = runTest({
+        cwd,
+        env: {
+          GITHUB_ACTIONS: "true",
+          GITHUB_WORKSPACE: dirname(cwd),
+        },
+        expectExitCode: 1,
+      });
+      const annotations = stderr.split("\n").filter(line => line.startsWith("::error"));
+      expect(annotations).toHaveLength(2);
+      const [testFile, sourceUrl] = annotations;
+      expect(testFile).toStartWith(`::error file=${basename(cwd)}${sep}workspace.test.ts,line=4,col=`);
+      expect(sourceUrl).toStartWith("::error file=webpack%3A//app/./src/x.ts,line=1,col=");
+      expect(sourceUrl).toContain("%0A      at fromSourceUrl (webpack://app/./src/x.ts:1:");
+    });
+    // The reporters reuse the buffer that stored the file's title while its tests ran.
+    test("should print the test file's name in the group for each --rerun-each run", () => {
+      const cwd = createTest([
+        {
+          filename: "helper.ts",
+          contents: `
+            import { expect } from "bun:test";
+            export function failing() {
+              expect(1).toBe(2);
+            }
+          `,
+        },
+        {
+          filename: "rerun.test.ts",
+          contents: `
+            import { test } from "bun:test";
+            import { failing } from "./helper";
+            test("fails", failing);
+          `,
+        },
+      ]);
+      const stderr = runTest({
+        cwd,
+        args: ["--rerun-each", "3"],
+        env: {
+          GITHUB_ACTIONS: "true",
+          GITHUB_WORKSPACE: undefined,
+        },
+        expectExitCode: 1,
+      });
+      expect(stderr.split("\n").filter(line => line.startsWith("::group::"))).toEqual([
+        "::group::rerun.test.ts: (run #1)",
+        "::group::rerun.test.ts: (run #2)",
+        "::group::rerun.test.ts: (run #3)",
+      ]);
+    });
+  });
+  describe(".each", () => {
+    test("should run tests with test.each", () => {
+      const numbers = [
+        [1, 2, 3],
+        [1, 1, 2],
+        [3, 4, 7],
+      ];
+
+      const stderr = runTest({
+        args: [],
+        input: `
+          import { test, expect } from "bun:test";
+
+          test.each(${JSON.stringify(numbers)})("%i + %i = %i", (a, b, e) => {
+            expect(a + b).toBe(e);
+          });
+        `,
+      });
+      numbers.forEach(numbers => {
+        expect(stderr).toContain(`${numbers[0]} + ${numbers[1]} = ${numbers[2]}`);
+      });
+    });
+    test("should allow tests run with test.each to be skipped", () => {
+      const numbers = [
+        [1, 2, 3],
+        [1, 1, 2],
+        [3, 4, 7],
+      ];
+
+      const stderr = runTest({
+        args: ["-t", "$a"],
+        input: `
+          import { test, expect } from "bun:test";
+
+          test.each(${JSON.stringify(numbers)})("%i + %i = %i", (a, b, e) => {
+            expect(a + b).toBe(e);
+          });
+        `,
+      });
+      numbers.forEach(numbers => {
+        expect(stderr).not.toContain(`(pass) ${numbers[0]} + ${numbers[1]} = ${numbers[2]}`);
+      });
+    });
+    test("should allow tests run with test.each to be matched", () => {
+      const numbers = [
+        [1, 2, 3],
+        [1, 1, 2],
+        [3, 4, 7],
+      ];
+
+      const stderr = runTest({
+        args: ["-t", "1 \\+"],
+        input: `
+          import { test, expect } from "bun:test";
+
+          test.each(${JSON.stringify(numbers)})("%i + %i = %i", (a, b, e) => {
+            expect(a + b).toBe(e);
+          });
+        `,
+      });
+      numbers.forEach(numbers => {
+        if (numbers[0] === 1) {
+          expect(stderr).toContain(`(pass) ${numbers[0]} + ${numbers[1]} = ${numbers[2]}`);
+        } else {
+          expect(stderr).not.toContain(`(pass) ${numbers[0]} + ${numbers[1]} = ${numbers[2]}`);
+        }
+      });
+    });
+    test("should run tests with describe.each", () => {
+      const numbers = [
+        [1, 2, 3],
+        [1, 1, 2],
+        [3, 4, 7],
+      ];
+
+      const stderr = runTest({
+        args: [],
+        input: `
+          import { test, expect, describe } from "bun:test";
+
+          describe.each(${JSON.stringify(numbers)})("%i + %i = %i", (a, b, e) => {\
+            test("addition", () => {
+              expect(a + b).toBe(e);
+            });
+          });
+        `,
+      });
+      numbers.forEach(numbers => {
+        expect(stderr).toContain(`${numbers[0]} + ${numbers[1]} = ${numbers[2]}`);
+      });
+    });
+    test("check formatting for %i", () => {
+      const numbers = [
+        [1, 2, 3],
+        [1, 1, 2],
+        [3, 4, 7],
+      ];
+
+      const stderr = runTest({
+        args: [],
+        input: `
+          import { test, expect } from "bun:test";
+
+          test.each(${JSON.stringify(numbers)})("%i + %i = %i", (a, b, e) => {
+            expect(a + b).toBe(e);
+          });
+        `,
+      });
+      numbers.forEach(numbers => {
+        expect(stderr).toContain(`${numbers[0]} + ${numbers[1]} = ${numbers[2]}`);
+      });
+    });
+    test("check formatting for %f", () => {
+      const numbers = [
+        [1.4, 2.9, 4.3],
+        [1, 1, 2],
+        [3.1, 4.5, 7.6],
+      ];
+
+      const stderr = runTest({
+        args: [],
+        input: `
+          import { test, expect } from "bun:test";
+
+          test.each(${JSON.stringify(numbers)})("%f + %f = %d", (a, b, e) => {
+            expect(a + b).toBe(e);
+          });
+        `,
+      });
+      numbers.forEach(numbers => {
+        expect(stderr).toContain(`${numbers[0]} + ${numbers[1]} = ${numbers[2]}`);
+      });
+    });
+    test("check formatting for %d", () => {
+      const numbers = [
+        [1.4, 2.9, 4.3],
+        [1, 1, 2],
+        [3.1, 4.5, 7.6],
+      ];
+
+      const stderr = runTest({
+        args: [],
+        input: `
+          import { test, expect } from "bun:test";
+
+          test.each(${JSON.stringify(numbers)})("%f + %f = %d", (a, b, e) => {
+            expect(a + b).toBe(e);
+          });
+        `,
+      });
+      numbers.forEach(numbers => {
+        expect(stderr).toContain(`${numbers[0]} + ${numbers[1]} = ${numbers[2]}`);
+      });
+    });
+    test("check formatting for %s", () => {
+      const strings = ["hello", "world", "foo"];
+
+      const stderr = runTest({
+        args: [],
+        input: `
+          import { test, expect } from "bun:test";
+
+          test.each(${JSON.stringify(strings)})("with a string: %s", (s) => {
+            expect(s).toBeType("string");
+          });
+        `,
+      });
+      strings.forEach(s => {
+        expect(stderr).toContain(`with a string: ${s}`);
+      });
+    });
+    test("check formatting for %j", () => {
+      const input = [
+        {
+          foo: "bar",
+          nested: {
+            again: {
+              a: 2,
+            },
+          },
+        },
+      ];
+
+      const stderr = runTest({
+        args: [],
+        input: `
+          import { test, expect } from "bun:test";
+
+          test.each(${JSON.stringify(input)})("with an object: %j", (o) => {
+            expect(o).toBe(o);
+          });
+        `,
+      });
+      expect(stderr).toContain(`with an object: ${JSON.stringify(input[0])}`);
+    });
+    test("check formatting for %o", () => {
+      const input = [
+        {
+          foo: "bar",
+          nested: {
+            again: {
+              a: 2,
+            },
+          },
+        },
+      ];
+
+      const stderr = runTest({
+        args: [],
+        input: `
+          import { test, expect } from "bun:test";
+
+          test.each(${JSON.stringify(input)})("with an object: %o", (o) => {
+            expect(o).toBe(o);
+          });
+        `,
+      });
+      expect(stderr).toContain(`(pass) with an object: { foo: "bar", nested: { again: { a: 2 } } }`);
+    });
+    test("check formatting for %#", () => {
+      const numbers = [
+        [1, 2, 3],
+        [1, 1, 2],
+        [3, 4, 7],
+      ];
+
+      const stderr = runTest({
+        args: [],
+        input: `
+          import { test, expect } from "bun:test";
+
+          test.each(${JSON.stringify(numbers)})("test number %#: %i + %i = %i", (a, b, e) => {
+            expect(a + b).toBe(e);
+          });
+        `,
+      });
+      numbers.forEach((_, idx) => {
+        expect(stderr).toContain(`test number ${idx}:`);
+      });
+    });
+    test("check formatting for %%", () => {
+      const numbers = [
+        [1, 2, 3],
+        [1, 1, 2],
+        [3, 4, 7],
+      ];
+
+      const stderr = runTest({
+        args: [],
+        input: `
+          import { test, expect } from "bun:test";
+
+          test.each(${JSON.stringify(numbers)})("test number %#: %i + %i = %i %%", (a, b, e) => {
+            expect(a + b).toBe(e);
+          });
+        `,
+      });
+      expect(stderr).toContain(`%`);
+    });
+    test("check formatting for %p", () => {
+      const stderr = runTest({
+        args: [],
+        input: `
+          import { test } from "bun:test";
+
+          test.each([[{ foo: "bar", nested: [1, { a: 2 }] }, "str"]])("with %p and %p", () => {});
+        `,
+      });
+      expect(stderr).toContain(`(pass) with { foo: "bar", nested: [ 1, { a: 2 } ] } and "str"`);
+    });
+
+    describe("$variable syntax", () => {
+      test("should replace $variables with object properties in test names", () => {
+        const cases = [
+          { a: 1, b: 2, expected: 3 },
+          { a: 5, b: 5, expected: 10 },
+          { a: -1, b: 1, expected: 0 },
+        ];
+
+        const stderr = runTest({
+          args: [],
+          input: `
+            import { test, expect } from "bun:test";
+            
+            const cases = ${JSON.stringify(cases)};
+            test.each(cases)('$a + $b = $expected', ({ a, b, expected }) => {
+              expect(a + b).toBe(expected);
+            });
+          `,
+        });
+
+        expect(stderr).toContain("(pass) 1 + 2 = 3");
+        expect(stderr).toContain("(pass) 5 + 5 = 10");
+        expect(stderr).toContain("(pass) -1 + 1 = 0");
+        expect(stderr).toContain("3 pass");
+      });
+
+      test("should show $variable literal when property doesn't exist", () => {
+        const cases = [{ a: 1 }, { a: 2 }];
+
+        const stderr = runTest({
+          args: [],
+          input: `
+            import { test, expect } from "bun:test";
+            
+            const cases = ${JSON.stringify(cases)};
+            test.each(cases)('value $a with missing $nonexistent', ({ a }) => {
+              expect(a).toBeDefined();
+            });
+          `,
+        });
+
+        expect(stderr).toContain("(pass) value 1 with missing $nonexistent");
+        expect(stderr).toContain("(pass) value 2 with missing $nonexistent");
+        expect(stderr).toContain("2 pass");
+      });
+
+      test("should work with describe.each", () => {
+        const cases = [
+          { module: "fs", method: "readFile" },
+          { module: "path", method: "join" },
+        ];
+
+        const stderr = runTest({
+          args: [],
+          input: `
+            import { test, expect, describe } from "bun:test";
+            
+            const cases = ${JSON.stringify(cases)};
+            describe.each(cases)('$module module', ({ module, method }) => {
+              test('has $method', () => {
+                const mod = require(module);
+                expect(mod).toHaveProperty(method);
+              });
+            });
+          `,
+        });
+
+        expect(stderr).toContain("fs module > has $method");
+        expect(stderr).toContain("path module > has $method");
+        expect(stderr).toContain("2 pass");
+      });
+
+      test("should work with complex property names", () => {
+        const cases = [
+          { user_name: "john_doe", age: 30, is_active: true },
+          { user_name: "jane_smith", age: 25, is_active: false },
+        ];
+
+        const stderr = runTest({
+          args: [],
+          input: `
+            import { test, expect } from "bun:test";
+            
+            const cases = ${JSON.stringify(cases)};
+            test.each(cases)('user $user_name age $age active $is_active', ({ user_name, age, is_active }) => {
+              expect(user_name).toBeDefined();
+              expect(age).toBeGreaterThan(0);
+              expect(typeof is_active).toBe('boolean');
+            });
+          `,
+        });
+
+        expect(stderr).toContain("(pass) user john_doe age 30 active true");
+        expect(stderr).toContain("(pass) user jane_smith age 25 active false");
+        expect(stderr).toContain("2 pass");
+      });
+
+      test("should coexist with % formatting for arrays", () => {
+        const numbers = [
+          [1, 2, 3],
+          [5, 5, 10],
+        ];
+
+        const stderr = runTest({
+          args: [],
+          input: `
+            import { test, expect } from "bun:test";
+            
+            test.each(${JSON.stringify(numbers)})('%i + %i = %i', (a, b, expected) => {
+              expect(a + b).toBe(expected);
+            });
+          `,
+        });
+
+        expect(stderr).toContain("(pass) 1 + 2 = 3");
+        expect(stderr).toContain("(pass) 5 + 5 = 10");
+        expect(stderr).toContain("2 pass");
+      });
+
+      test("should support nested property access", () => {
+        const cases = [
+          {
+            user: { name: "Alice", profile: { city: "NYC" } },
+            expected: "Alice from NYC",
+          },
+          {
+            user: { name: "Bob", profile: { city: "LA" } },
+            expected: "Bob from LA",
+          },
+        ];
+
+        const stderr = runTest({
+          args: [],
+          input: `
+            import { test, expect } from "bun:test";
+            
+            const cases = ${JSON.stringify(cases)};
+            test.each(cases)('$user.name from $user.profile.city', ({ user, expected }) => {
+              expect(\`\${user.name} from \${user.profile.city}\`).toBe(expected);
+            });
+          `,
+        });
+
+        expect(stderr).toContain("(pass) Alice from NYC");
+        expect(stderr).toContain("(pass) Bob from LA");
+        expect(stderr).toContain("2 pass");
+      });
+
+      test("should support array indexing with dot notation", () => {
+        const cases = [
+          {
+            users: [{ name: "Alice" }, { name: "Bob" }],
+            first: "Alice",
+          },
+          {
+            users: [{ name: "Carol" }, { name: "Dave" }],
+            first: "Carol",
+          },
+        ];
+
+        const stderr = runTest({
+          args: [],
+          input: `
+            import { test, expect } from "bun:test";
+            
+            const cases = ${JSON.stringify(cases)};
+            test.each(cases)('first user is $users.0.name', ({ users, first }) => {
+              expect(users[0].name).toBe(first);
+            });
+          `,
+        });
+
+        expect(stderr).toContain("(pass) first user is Alice");
+        expect(stderr).toContain("(pass) first user is Carol");
+        expect(stderr).toContain("2 pass");
+      });
+
+      test("handles edge cases with underscores and invalid identifiers", () => {
+        const cases = [
+          {
+            _valid: "underscore",
+            $dollar: "dollar",
+            _123mix: "mix",
+            "123invalid": "invalid",
+            "has-dash": "dash",
+            "has space": "space",
+          },
+        ];
+
+        const stderr = runTest({
+          args: [],
+          input: `
+            import { test, expect } from "bun:test";
+            
+            const cases = ${JSON.stringify(cases)};
+            test.each(cases)('Edge: $_valid | $$dollar | $_123mix | $123invalid | $has-dash | $has space', (obj) => {
+              expect(obj).toBeDefined();
+            });
+          `,
+        });
+
+        expect(stderr).toContain("(pass) Edge: underscore | dollar | mix | $123invalid | $has-dash | $has space");
+      });
+
+      test("handles deeply nested properties with arrays", () => {
+        const cases = [
+          {
+            data: {
+              users: [
+                { name: "Alice", tags: ["admin", "user"] },
+                { name: "Bob", tags: ["user"] },
+              ],
+              count: 2,
+            },
+          },
+        ];
+
+        const stderr = runTest({
+          args: [],
+          input: `
+            import { test, expect } from "bun:test";
+            
+            const cases = ${JSON.stringify(cases)};
+            test.each(cases)('First user: $data.users.0.name with tag: $data.users.0.tags.0', (obj) => {
+              expect(obj).toBeDefined();
+            });
+          `,
+        });
+
+        expect(stderr).toContain("First user: Alice with tag: admin");
+      });
+
+      test("surfaces a throwing custom formatter in the interpolated value as a test error", () => {
+        // The declaration throw aborts module evaluation, so each variant
+        // needs its own file to be verified independently.
+        const throwing = (message: string) =>
+          `({ [Symbol.for("nodejs.util.inspect.custom")]() { throw new Error(${JSON.stringify(message)}); } })`;
+        const stderr = runTest({
+          args: [],
+          expectExitCode: 1,
+          input: [
+            {
+              filename: "test-each-path.test.ts",
+              contents: `
+                import { test } from "bun:test";
+                test.each([{ a: { b: ${throwing("boom from test.each $path")} } }])("case $a.b", () => {});
+              `,
+            },
+            {
+              filename: "test-each-p.test.ts",
+              contents: `
+                import { test } from "bun:test";
+                test.each([[${throwing("boom from test.each %p")}]])("case %p", () => {});
+              `,
+            },
+            {
+              filename: "describe-each-path.test.ts",
+              contents: `
+                import { test, describe } from "bun:test";
+                describe.each([{ a: { b: ${throwing("boom from describe.each $path")} } }])("suite $a.b", () => {
+                  test("inner", () => {});
+                });
+              `,
+            },
+            {
+              filename: "describe-each-p.test.ts",
+              contents: `
+                import { test, describe } from "bun:test";
+                describe.each([[${throwing("boom from describe.each %p")}]])("suite %p", () => {
+                  test("inner", () => {});
+                });
+              `,
+            },
+          ],
+        });
+
+        expect(stderr).toContain("boom from test.each $path");
+        expect(stderr).toContain("boom from test.each %p");
+        expect(stderr).toContain("boom from describe.each $path");
+        expect(stderr).toContain("boom from describe.each %p");
+      });
+
+      test("handles missing properties gracefully", () => {
+        const cases = [{ a: 1 }];
+
+        const stderr = runTest({
+          args: [],
+          input: `
+            import { test, expect } from "bun:test";
+            
+            const cases = ${JSON.stringify(cases)};
+            test.each(cases)('$a | $missing | $a.b.c | $a', ({ a }) => {
+              expect(a).toBe(1);
+            });
+          `,
+        });
+
+        expect(stderr).toContain("(pass) 1 | $missing | $a.b.c | 1");
+      });
+    });
+  });
+
+  test("Prints error when no test matches", () => {
+    const stderr = runTest({
+      args: ["-t", "not-a-test"],
+      input: `
+        import { test, expect } from "bun:test";
+        test("test", () => {});
+      `,
+      expectExitCode: 1,
+    });
+    expect(
+      stderr
+        .replace(/bun-test-(.*)\.test\.ts/, "bun-test-*.test.ts")
+        .trim()
+        .replace(/\[[\d.]+m?s\]/, "[xx ms]"),
+    ).toMatchInlineSnapshot(`
+      "bun-test-*.test.ts:
+
+      error: regex "not-a-test" matched 0 tests. Searched 1 file (skipping 1 test) [xx ms]"
+    `);
+  });
+
+  test("Does not print the regex error when a test fails", () => {
+    const stderr = runTest({
+      args: ["-t", "not-a-test"],
+      input: `
+        import { test, expect } from "bun:test";
+        test("not-a-test", () => {
+          expect(false).toBe(true);
+        });
+      `,
+      expectExitCode: 1,
+    });
+    expect(stderr).not.toContain("error: regex");
+    expect(stderr).toContain("1 fail");
+  });
+
+  test("Does not print the regex error when a test matches and a test passes", () => {
+    const stderr = runTest({
+      args: ["-t", "not-a-test"],
+      input: `
+        import { test, expect } from "bun:test";
+        test("not-a-test", () => {
+          expect(false).toBe(true); 
+        });
+        test("not-a-test", () => {
+          expect(true).toBe(true);
+        });
+      `,
+      expectExitCode: 1,
+    });
+    expect(stderr).not.toContain("error: regex");
+    expect(stderr).toContain("1 fail");
+    expect(stderr).toContain("1 pass");
+  });
+
+  test("path to a non-test.ts file will work", () => {
+    const stderr = runTest({
+      args: ["./index.ts"],
+      input: [
+        {
+          filename: "index.ts",
+          contents: `
+            import { test, expect } from "bun:test";
+            test("test #1", () => {
+              expect(true).toBe(true);
+            });
+          `,
+        },
+      ],
+    });
+    expect(stderr).toContain("test #1");
+  });
+
+  test("path to a non-test.ts without ./ will print a helpful hint", () => {
+    const stderr = runTest({
+      args: ["index.ts"],
+      input: [
+        {
+          filename: "index.ts",
+          contents: `
+            import { test, expect } from "bun:test";
+            test("test #1", () => {
+              expect(true).toBe(true);
+            });
+          `,
+        },
+      ],
+    });
+    expect(stderr).not.toContain("test #1");
+    expect(stderr).toContain("index.ts");
+  });
+
+  test("Skipped and todo tests are filtered out when not matching -t filter", () => {
+    const stderr = runTest({
+      args: ["-t", "should match"],
+      input: `
+        import { test, describe } from "bun:test";
+
+        describe("group 1", () => {
+          test("should match filter", () => {
+            console.log("this test should run");
+          });
+
+          test("should not match filter", () => {
+            console.log("this test should be filtered out");
+          });
+
+          test.skip("skipped test that should not match", () => {
+            console.log("this skipped test should be filtered out");
+          });
+
+          test.todo("todo test that should not match", () => {
+            console.log("this todo test should be filtered out");
+          });
+        });
+
+        describe("group 2", () => {
+          test("another test that should match filter", () => {
+            console.log("this test should run");
+          });
+
+          test.skip("another skipped test", () => {
+            console.log("this skipped test should be filtered out");
+          });
+
+          test.todo("another todo test", () => {
+            console.log("this todo test should be filtered out");
+          });
+        });
+      `,
+    });
+    expect(
+      stderr
+        .replace(/bun-test-(.*)\.test\.ts/, "bun-test-*.test.ts")
+        .replace(/ \[[\d.]+m?s\]/g, "") // Remove all timings
+        .replace(/Ran \d+ tests across \d+ files?\.\s*$/, "Ran 2 tests across 1 file.") // Normalize test counts
+        .trim(),
+    ).toMatchInlineSnapshot(`
+      "bun-test-*.test.ts:
+      (pass) group 1 > should match filter
+      (pass) group 2 > another test that should match filter
+
+       2 pass
+       5 filtered out
+       0 fail
+      Ran 2 tests across 1 file."
+    `);
+  });
+
+  test("--tsconfig-override works", () => {
+    using dir = tempDir("test-tsconfig-override", {
+      "math.test.ts": `
+        import { describe, test, expect } from "bun:test";
+        import { add } from "@utils/math";
+        
+        describe("math", () => {
+          test("addition", () => {
+            expect(add(2, 3)).toBe(5);
+          });
+        });
+      `,
+      "src/math.ts": `
+        export function add(a: number, b: number) {
+          return a + b;
+        }
+      `,
+      "tsconfig.json": `
+        {
+          "compilerOptions": {
+            "paths": {
+              "@utils/*": ["./wrong/*"]
+            }
+          }
+        }
+      `,
+      "test-tsconfig.json": `
+        {
+          "compilerOptions": {
+            "paths": {
+              "@utils/*": ["./src/*"]
+            }
+          }
+        }
+      `,
+    });
+
+    // Test without --tsconfig-override (should fail)
+    const failResult = spawnSync({
+      cmd: [bunExe(), "test", "math.test.ts"],
+      env: bunEnv,
+      cwd: dir,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    expect(failResult.exitCode).not.toBe(0);
+    expect(failResult.stderr?.toString() || "").toContain("Cannot find module");
+
+    // Test with --tsconfig-override (should succeed)
+    const successResult = spawnSync({
+      cmd: [bunExe(), "test", "--tsconfig-override", "test-tsconfig.json", "math.test.ts"],
+      env: bunEnv,
+      cwd: dir,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    expect(successResult.exitCode).toBe(0);
+    const stdout = successResult.stdout?.toString() || "";
+    const stderr = successResult.stderr?.toString() || "";
+    const output = stdout + stderr;
+    expect(output).toContain("1 pass");
+    expect(output).toContain("addition");
+  });
+
+  test("--tsconfig-override works with monorepo spec tsconfig", () => {
+    using dir = tempDir("test-tsconfig-monorepo", {
+      "packages/app/src/index.ts": `
+        export function getMessage() {
+          return "Hello from app";
+        }
+      `,
+      "packages/app/src/index.test.ts": `
+        import { test, expect } from "bun:test";
+        import { getMessage } from "@app/index";
+        import { formatMessage } from "@shared/utils";
+        
+        test("app message", () => {
+          expect(getMessage()).toBe("Hello from app");
+          expect(formatMessage("test")).toBe("Formatted: test");
+        });
+      `,
+      "packages/shared/utils.ts": `
+        export function formatMessage(msg: string) {
+          return "Formatted: " + msg;
+        }
+      `,
+      "packages/app/tsconfig.json": `
+        {
+          "compilerOptions": {
+            "paths": {
+              "@app/*": ["./src/*"]
+            }
+          }
+        }
+      `,
+      "packages/app/tsconfig.spec.json": `
+        {
+          "extends": "./tsconfig.json",
+          "compilerOptions": {
+            "baseUrl": "../..",
+            "paths": {
+              "@app/*": ["packages/app/src/*"],
+              "@shared/*": ["packages/shared/*"]
+            }
+          }
+        }
+      `,
+    });
+
+    const result = spawnSync({
+      cmd: [
+        bunExe(),
+        "test",
+        "--tsconfig-override",
+        "./packages/app/tsconfig.spec.json",
+        "./packages/app/src/index.test.ts",
+      ],
+      env: bunEnv,
+      cwd: dir,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    expect(result.exitCode).toBe(0);
+    const stdout = result.stdout?.toString() || "";
+    const stderr = result.stderr?.toString() || "";
+    const output = stdout + stderr;
+    expect(output).toContain("1 pass");
+    expect(output).toContain("app message");
+  });
+
+  // jest and vitest never run a test file's process.on('exit') listeners; node's test harness asserts from them.
+  describe.concurrent("process.on('exit') listeners", () => {
+    async function runFiles(files: Record<string, string>, ...args: string[]) {
+      using dir = tempDir("bun-test-exit-listener", files);
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "test", ...args],
+        env: bunEnv,
+        cwd: String(dir),
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      return { stdout, stderr, exitCode };
+    }
+
+    function runFile(name: string, contents: string) {
+      return runFiles({ [name]: contents }, name);
+    }
+
+    const bunTestFile = (n: number) => `
+      import { test } from "bun:test";
+      process.on("exit", () => {
+        console.log("exit listener ${n} ran");
+        process.exit(1);
+      });
+      test("test ${n}", () => {});
+    `;
+    const nodeTestFile = (n: number) => `
+      import { test } from "node:test";
+      process.on("exit", () => process.exit(1));
+      test("test ${n}", () => {});
+    `;
+
+    test("are not run for a bun:test file", async () => {
+      const { stdout, stderr, exitCode } = await runFile("exit.test.ts", bunTestFile(1));
+      expect(stdout).not.toContain("exit listener");
+      expect(stderr).toContain("1 pass");
+      expect(exitCode).toBe(0);
+    });
+
+    test("are not run for a file that registers globals-style tests", async () => {
+      const { stdout, stderr, exitCode } = await runFile(
+        "globals.test.ts",
+        `
+          process.on("exit", () => {
+            console.log("exit listener ran");
+            process.exit(1);
+          });
+          test("a passing test", () => {});
+        `,
+      );
+      expect(stdout).not.toContain("exit listener ran");
+      expect(stderr).toContain("1 pass");
+      expect(exitCode).toBe(0);
+    });
+
+    test("are not run when node:test is only imported", async () => {
+      const { stdout, stderr, exitCode } = await runFile(
+        "node-import-only.test.ts",
+        `
+          import { test } from "bun:test";
+          import { mock } from "node:test";
+          void mock;
+          process.on("exit", () => {
+            console.log("exit listener ran");
+            process.exit(1);
+          });
+          test("a passing test", () => {});
+        `,
+      );
+      expect(stdout).not.toContain("exit listener ran");
+      expect(stderr).toContain("1 pass");
+      expect(exitCode).toBe(0);
+    });
+
+    test("are not run when only a Worker uses node:test", async () => {
+      const { stdout, stderr, exitCode } = await runFiles(
+        {
+          "worker-uses-node-test.test.ts": `
+            import { test } from "bun:test";
+            process.on("exit", () => {
+              console.log("exit listener ran");
+              process.exit(1);
+            });
+            test("a Worker uses node:test", async () => {
+              const worker = new Worker(new URL("./worker.ts", import.meta.url));
+              await new Promise((resolve, reject) => {
+                worker.addEventListener("message", resolve, { once: true });
+                worker.addEventListener("error", e => reject(e.error ?? new Error(e.message)), { once: true });
+              });
+              worker.terminate();
+            });
+          `,
+          "worker.ts": `
+            import { mock } from "node:test";
+            mock.fn(() => {});
+            postMessage("used");
+          `,
+        },
+        "worker-uses-node-test.test.ts",
+      );
+      expect(stdout).not.toContain("exit listener ran");
+      expect(stderr).toContain("1 pass");
+      expect(exitCode).toBe(0);
+    });
+
+    test("still run when the file itself calls process.exit()", async () => {
+      const { stdout, exitCode } = await runFile(
+        "explicit-exit.test.ts",
+        `
+          import { test } from "bun:test";
+          process.on("exit", code => console.log("exit listener ran with", code));
+          test("exits", () => process.exit(3));
+        `,
+      );
+      expect(stdout).toContain("exit listener ran with 3");
+      expect(exitCode).toBe(3);
+    });
+
+    test("run once a node:test API registers a test", async () => {
+      const { stdout, stderr, exitCode } = await runFile(
+        "node.test.ts",
+        `
+          import { test } from "node:test";
+          process.on("exit", code => console.log("exit listener ran with", code));
+          test("a passing test", () => {});
+        `,
+      );
+      expect(stdout).toContain("exit listener ran with 0");
+      expect(stderr).toContain("1 pass");
+      expect(exitCode).toBe(0);
+    });
+
+    test("can fail the run once node:test registered a test, like node's common.mustCall()", async () => {
+      const { stderr, exitCode } = await runFile("node-exit-code.test.ts", nodeTestFile(1));
+      expect(stderr).toContain("1 pass");
+      expect(exitCode).toBe(1);
+    });
+
+    test("run when --bail stops a file that registered a node:test test", async () => {
+      const { stdout, stderr, exitCode } = await runFiles(
+        {
+          "node-bail.test.ts": `
+            import { test } from "node:test";
+            import assert from "node:assert";
+            process.on("exit", code => console.log("exit listener ran with", code));
+            test("fails", () => assert.strictEqual(1, 2));
+          `,
+        },
+        "--bail",
+        "node-bail.test.ts",
+      );
+      expect(stdout).toContain("exit listener ran with 1");
+      expect(stderr).toContain("Bailed out after 1 failure");
+      expect(exitCode).toBe(1);
+    });
+
+    test("run for a bun:test file under BUN_TEST_DRAIN_EVENT_LOOP, which the vendored node tests set", async () => {
+      using dir = tempDir("bun-test-exit-listener", { "drain.test.ts": bunTestFile(1) });
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "test", "drain.test.ts"],
+        env: { ...bunEnv, BUN_TEST_DRAIN_EVENT_LOOP: "1" },
+        cwd: String(dir),
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stdout).toContain("exit listener 1 ran");
+      expect(stderr).toContain("1 pass");
+      expect(exitCode).toBe(1);
+    });
+
+    test.each(
+      Object.entries({
+        "bun:test": `test("fails", done => { setInterval(() => {}, 1000); done(new Error("reported")); });`,
+        "node:test": `test("fails", () => { setInterval(() => {}, 1000); throw new Error("reported"); });`,
+      }),
+    )(
+      "%s: BUN_TEST_DRAIN_EVENT_LOOP doesn't wait for a timer that a failed test left running",
+      async (from, failing) => {
+        using dir = tempDir("bun-test-drain-failed", {
+          "drain.test.ts": `import { test } from "${from}";\n${failing}`,
+        });
+        await using proc = Bun.spawn({
+          cmd: [bunExe(), "test", "drain.test.ts"],
+          env: { ...bunEnv, BUN_TEST_DRAIN_EVENT_LOOP: "1" },
+          cwd: String(dir),
+          stderr: "pipe",
+        });
+        const [stderr, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
+        expect(stderr).toContain("error: reported");
+        expect(stderr).toContain("1 fail");
+        expect(exitCode).toBe(1);
+      },
+    );
+
+    test("are not run in --parallel workers for bun:test files", async () => {
+      const { stdout, stderr, exitCode } = await runFiles(
+        { "a.test.ts": bunTestFile(1), "b.test.ts": bunTestFile(2) },
+        "--parallel=2",
+        "a.test.ts",
+        "b.test.ts",
+      );
+      // Worker output is relayed on the coordinator's stderr.
+      expect(stdout + stderr).not.toContain("exit listener");
+      expect(stderr).toContain("2 pass");
+      expect(exitCode).toBe(0);
+    });
+
+    // --parallel implies --isolate, and a file's listeners are torn down with its global before the worker exits.
+    test("--parallel workers exit cleanly after node:test files; listeners do not reach the run's exit code", async () => {
+      const { stderr, exitCode } = await runFiles(
+        { "a.test.ts": nodeTestFile(1), "b.test.ts": nodeTestFile(2) },
+        "--parallel=2",
+        "a.test.ts",
+        "b.test.ts",
+      );
+      expect(stderr).not.toContain("worker crashed");
+      expect(stderr).toContain("2 pass");
+      expect(exitCode).toBe(0);
+    });
+  });
+});
+
+function createTest(input?: string | (string | { filename: string; contents: string })[], filename?: string): string {
+  const cwd = tmpdirSync();
+  const inputs = Array.isArray(input) ? input : [input ?? ""];
+  for (const input of inputs) {
+    const contents = typeof input === "string" ? input : input.contents;
+    const name = typeof input === "string" ? (filename ?? `bun-test-${Math.random()}.test.ts`) : input.filename;
+
+    const path = join(cwd, name);
+    try {
+      writeFileSync(path, contents);
+    } catch {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, contents);
+    }
+  }
+  return cwd;
+}
+
+function runTest({
+  input = "",
+  cwd,
+  args = [],
+  env = {},
+  expectExitCode = undefined,
+}: {
+  input?: string | (string | { filename: string; contents: string })[];
+  cwd?: string;
+  args?: string[];
+  env?: Record<string, string | undefined>;
+  expectExitCode?: number;
+} = {}): string {
+  cwd ??= createTest(input);
+  try {
+    const { stderr, exitCode } = spawnSync({
+      cwd,
+      cmd: [bunExe(), "test", ...args],
+      env: { ...bunEnv, AGENT: "0", ...env },
+      stderr: "pipe",
+      stdout: "ignore",
+    });
+    if (expectExitCode !== undefined) {
+      expect(exitCode).toBe(expectExitCode);
+    }
+    return stderr.toString();
+  } finally {
+    rmSync(cwd, { recursive: true });
+  }
+}
+
+test.concurrent.each([
+  ["America/New_York", "America/New_York"],
+  [undefined, "UTC"],
+  // ICU rejects this name, so the run uses the system's zone.
+  [":/etc/localtime", undefined],
+])("delete process.env.TZ goes back to the time zone the run started with: TZ=%s", async (TZ, expected) => {
+  using dir = tempDir("bun-test-delete-tz", {
+    "tz.test.js": `
+      test("time zones", () => {
+        const zone = () => Intl.DateTimeFormat().resolvedOptions().timeZone;
+        const zones = [zone()];
+        process.env.TZ = "Asia/Tokyo";
+        zones.push(zone());
+        delete process.env.TZ;
+        zones.push(zone());
+        console.log(JSON.stringify(zones));
+      });
+    `,
+  });
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "test"],
+    env: { ...bunEnv, TZ },
+    cwd: String(dir),
+    stdout: "pipe",
+    stderr: "ignore",
+  });
+  const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+  const zones = JSON.parse(stdout.split("\n").find(line => line.startsWith("["))!);
+  expect(zones).toEqual([expected ?? zones[0], "Asia/Tokyo", zones[0]]);
+  expect(exitCode).toBe(0);
+});
+
+// A test's console in Jest and Vitest is a `new Console()`, which has none. React's development build logs each render
+// where it finds one, and reads into the props for that: a getter that throws there breaks every later render.
+describe.concurrent("--react-compiler", () => {
+  const component = (name: string, directive = "") => `
+    export function ${name}({ items }) {
+      ${directive}
+      const doubled = items.map(item => item * 2);
+      return <ul>{doubled.map(item => <li key={item}>{item}</li>)}</ul>;
+    }
+  `;
+  const printCompiled = `console.log("compiled: " + Object.keys(all).filter(name => /\\$\\[\\d+\\]/.test(String(all[name]))).join(" "));`;
+  const files = {
+    "node_modules/react/package.json": JSON.stringify({
+      name: "react",
+      version: "19.0.0",
+      exports: {
+        ".": "./index.js",
+        "./compiler-runtime": "./compiler-runtime.js",
+        "./jsx-runtime": "./jsx.js",
+        "./jsx-dev-runtime": "./jsx.js",
+      },
+    }),
+    "node_modules/react/index.js": `export const useState = value => [value, () => {}];`,
+    "node_modules/react/compiler-runtime.js": `export const c = size => Array(size).fill(Symbol.for("react.memo_cache_sentinel"));`,
+    "node_modules/react/jsx.js": `export const jsxDEV = (type, props) => ({ type, props }), jsx = jsxDEV, jsxs = jsxDEV;`,
+    "node_modules/library/package.json": JSON.stringify({ name: "library", main: "./index.jsx" }),
+    "node_modules/library/index.jsx": component("Library"),
+    "src/List.tsx": component("List"),
+    "src/List.stories.tsx": component("Story"),
+    "src/OptOut.tsx": component("OptOut", `"use no memo";`),
+    "src/shared.test.tsx": component("InATestFile"),
+    "src/useTotal.ts": `
+      import { useState } from "react";
+      export function useTotal(items: number[]) {
+        const [factor] = useState(2);
+        const scaled = items.map(item => item * factor);
+        return { scaled, factor };
+      }
+    `,
+    "other/Other.jsx": component("Other"),
+    "setup.tsx": component("InAPreload") + `globalThis.InAPreload = InAPreload;`,
+    "compiled.test.tsx": `
+      import { expect, test } from "bun:test";
+      import { Library } from "library";
+      import { Other } from "./other/Other";
+      import { List } from "./src/List";
+      import { Story } from "./src/List.stories";
+      import { OptOut } from "./src/OptOut";
+      import { InATestFile } from "./src/shared.test";
+      import { useTotal } from "./src/useTotal";
+      ${component("InThisFile")}
+      test("which are compiled", () => {
+        const all = { List, useTotal, Story, Other, OptOut, Library, InATestFile, InThisFile, InAPreload: globalThis.InAPreload };
+        ${printCompiled}
+        expect(JSON.stringify(List({ items: [1, 2] }))).toBe(JSON.stringify(OptOut({ items: [1, 2] })));
+        expect(useTotal([1, 2])).toEqual({ scaled: [2, 4], factor: 2 });
+      });
+    `,
+  };
+  async function compiled(more: Record<string, string>, args: string[] = []) {
+    using dir = tempDir("react-compiler", { ...files, ...more });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "test", "--preload=./setup.tsx", ...args, "./compiled.test.tsx"],
+      cwd: String(dir),
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { compiled: stdout.match(/compiled: (.*)/)?.[1] ?? stderr, stderr, exitCode };
+  }
+
+  const everything = "List useTotal Story Other";
+  test.each([
+    ["nothing without it", "", [], ""],
+    ["the flag", "", ["--react-compiler"], everything],
+    ["the flag, in workers", "", ["--react-compiler", "--parallel=2"], everything],
+    ["the flag, with --isolate", "", ["--react-compiler", "--isolate"], everything],
+    ["true", `reactCompiler = true`, [], everything],
+    ["false", `reactCompiler = false`, [], ""],
+    ["false, and the flag", `reactCompiler = false`, ["--react-compiler"], everything],
+    ["folders", `reactCompiler = ["./src/"]`, [], "List useTotal Story"],
+    ["a pattern", `reactCompiler = ["**/*.jsx"]`, [], "Other"],
+    ["exclude alone", `reactCompiler = { exclude = "src" }`, [], "Other"],
+    [
+      "include and exclude",
+      `reactCompiler = { include = ["src", "other"], exclude = ["**/*.stories.*", "other"] }`,
+      [],
+      "List useTotal",
+    ],
+    [
+      "include and exclude, in workers",
+      `reactCompiler = { include = ["src"], exclude = ["**/*.stories.*"] }`,
+      ["--parallel=2"],
+      "List useTotal",
+    ],
+  ])("%s", async (_, config, args, expected) => {
+    const result = await compiled({ "bunfig.toml": `[test]\n${config}` }, args);
+    expect(result.compiled).toBe(expected);
+    expect(result.exitCode).toBe(0);
+  });
+
+  describe("in a workspace, run from apps/web", () => {
+    const workspace = {
+      ...Object.fromEntries(Object.entries(files).filter(([path]) => path.startsWith("node_modules/react/"))),
+      "apps/web/Root.tsx": component("Root"),
+      "apps/web/src/Local.tsx": component("Local"),
+      "apps/web/test/Helper.tsx": component("Helper"),
+      "packages/ui/Ui.tsx": component("Ui"),
+      "packages/ui2/Ui2.tsx": component("Ui2"),
+      "packages/linked/package.json": JSON.stringify({ name: "linked", main: "./index.tsx" }),
+      "packages/linked/index.tsx": component("Linked"),
+      "apps/web/node_modules/.keep": "",
+      "apps/web/where.test.tsx": `
+        import { test } from "bun:test";
+        import { Linked } from "linked";
+        import { Ui } from "../../packages/ui/Ui";
+        import { Ui2 } from "../../packages/ui2/Ui2";
+        import { Root } from "./Root";
+        import { Local } from "./src/Local";
+        import { Helper } from "./test/Helper";
+        test("which are compiled", () => {
+          const all = { Root, Local, Helper, Ui, Ui2, Linked };
+          ${printCompiled}
+        });
+      `,
+    };
+    const inWeb = "Root Local Helper";
+    test.each([
+      ["a package linked into node_modules is compiled", `true`, `${inWeb} Ui Ui2 Linked`],
+      ["a linked package is included by its real path", `["../../packages/linked"]`, "Linked"],
+      [`"." is the run directory`, `["."]`, inWeb],
+      [`"../../apps/web" is the run directory too`, `["../../apps/web"]`, inWeb],
+      ["a path that goes up and back down into the run directory", `["../../apps/web/src/"]`, "Local"],
+      ["a folder above the run directory includes it", `["../.."]`, `${inWeb} Ui Ui2 Linked`],
+      ["an absolute path", `["<dir>/apps/web/src"]`, "Local"],
+      [
+        "exclude with a path that goes up and back down",
+        `{ exclude = ["../../apps/web/test", "../../packages"] }`,
+        "Root Local",
+      ],
+      ["a folder doesn't match a sibling whose name starts the same", `["../../packages/ui"]`, "Ui"],
+      ["a pattern reaches outside the run directory", `{ exclude = ["**/U*.tsx"] }`, `${inWeb} Linked`],
+      ["a pattern that goes up and back down only matches inside that folder", `["../../apps/web/**/*.tsx"]`, inWeb],
+    ])("%s", async (_, config, expected) => {
+      using dir = tempDir("react-compiler-workspace", workspace);
+      const root = String(dir).replaceAll("\\", "/");
+      symlinkSync(join(String(dir), "packages/linked"), join(String(dir), "apps/web/node_modules/linked"), "junction");
+      await Bun.write(
+        join(String(dir), "apps/web/bunfig.toml"),
+        `[test]\nreactCompiler = ${config.replace("<dir>", root)}`,
+      );
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "test", "./where.test.tsx"],
+        cwd: join(String(dir), "apps/web"),
+        env: bunEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stdout.match(/compiled: (.*)/)?.[1] ?? stderr).toBe(expected);
+      expect(exitCode).toBe(0);
+    });
+  });
+
+  // The fifth is OptOut.tsx: the compiler still has to read it to find out there is nothing to compile.
+  test.each([
+    [["--react-compiler"], everything, 5],
+    [[], "", 0],
+  ])("a compiled file is cached whatever its size %j", async (args, expected, entries) => {
+    using dir = tempDir("react-compiler", files);
+    const cache = join(String(dir), "cache");
+    mkdirSync(cache);
+    for (let run = 0; run < 2; run++) {
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "test", "--preload=./setup.tsx", ...args, "./compiled.test.tsx"],
+        cwd: String(dir),
+        env: { ...bunEnv, BUN_RUNTIME_TRANSPILER_CACHE_PATH: cache },
+        stdout: "pipe",
+        stderr: "inherit",
+      });
+      const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+      expect(stdout.match(/compiled: (.*)/)?.[1]).toBe(expected);
+      expect(readdirSync(cache)).toHaveLength(entries);
+      expect(exitCode).toBe(0);
+    }
+  });
+
+  test("the original of a mocked module is compiled", async () => {
+    const result = await compiled(
+      {
+        "compiled.test.tsx": `
+          import { test, vi } from "bun:test";
+          vi.mock("./src/List", async importOriginal => ({ ...(await importOriginal()), extra: 1 }));
+          import { List } from "./src/List";
+          test("which are compiled", async () => {
+            const all = { List, actual: (await vi.importActual("./src/List")).List };
+            ${printCompiled}
+          });
+        `,
+      },
+      ["--react-compiler"],
+    );
+    expect(result.compiled).toBe("List actual");
+    expect(result.exitCode).toBe(0);
+  });
+
+  test("a data: URL that is longer than a path can be is not compiled", async () => {
+    const result = await compiled(
+      {
+        "compiled.test.tsx": `
+          import { test } from "bun:test";
+          test("which are compiled", async () => {
+            const hook = "export function useDoubled(items) { return { doubled: items.map(item => item * 2) }; }";
+            const all = await import("data:text/javascript," + hook + "/*" + Buffer.alloc(70_000, "-") + "*/");
+            ${printCompiled}
+          });
+        `,
+      },
+      ["--react-compiler"],
+    );
+    expect(result.compiled).toBe("");
+    expect(result.exitCode).toBe(0);
+  });
+
+  test.each([
+    `reactCompiler = 1`,
+    `reactCompiler = [1]`,
+    `reactCompiler = { include = 1 }`,
+    `reactCompiler = { exclude = [1] }`,
+  ])("%s is an error", async config => {
+    const result = await compiled({ "bunfig.toml": `[test]\n${config}` });
+    expect(result.stderr).toContain("reactCompiler");
+    expect(result.exitCode).toBe(1);
+  });
+});
+
+describe.concurrent("console.timeStamp", () => {
+  test.each([[[]], [["--isolate"]], [["--isolate=modules"]]])(
+    "is not defined in a preload or a test file %j",
+    async args => {
+      using dir = tempDir("console-timestamp", {
+        "preload.js": `globalThis.inPreload = [typeof console.timeStamp, "timeStamp" in console];`,
+        "first.test.js": `
+        import { expect, test } from "bun:test";
+        test("the console", () => {
+          expect(globalThis.inPreload).toEqual(["undefined", false]);
+          expect([typeof console.timeStamp, "timeStamp" in console]).toEqual(["undefined", false]);
+          expect([typeof console.time, typeof console.timeEnd, typeof console.timeLog]).toEqual(["function", "function", "function"]);
+        });
+      `,
+        "second.test.js": `
+        import { expect, test } from "bun:test";
+        test("a file can define it", () => {
+          console.timeStamp = () => "mine";
+          expect(console.timeStamp()).toBe("mine");
+        });
+      `,
+      });
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "test", "--preload", "./preload.js", ...args],
+        cwd: String(dir),
+        env: bunEnv,
+        stdout: "ignore",
+        stderr: "pipe",
+      });
+      const [stderr, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
+      expect(stderr).toContain(" 2 pass\n 0 fail\n");
+      expect(exitCode).toBe(0);
+    },
+  );
+
+  test("is a function outside of bun test", async () => {
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "-e", "console.log(typeof console.timeStamp)"],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "inherit",
+    });
+    const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+    expect(stdout).toBe("function\n");
+    expect(exitCode).toBe(0);
+  });
+});
+
+describe.concurrent("test file discovery (scanner)", () => {
+  test("discovers tests in deeply nested directories and prunes dot-dirs and node_modules", async () => {
+    const files: Record<string, string> = {
+      "a_first.test.ts": `import { test } from "bun:test"; test("a", () => { console.log("RAN a_first"); });`,
+      "b_second.test.ts": `import { test } from "bun:test"; test("b", () => { console.log("RAN b_second"); });`,
+      "styles.spec.tsx": `import { test } from "bun:test"; test("spec", () => { console.log("RAN spec"); });`,
+      "not-a-test.ts": `console.log("SHOULD NOT RUN plain");`,
+      "nested/deep/inner.test.ts": `import { test } from "bun:test"; test("inner", () => { console.log("RAN inner"); });`,
+      "nested/util.ts": `export const x = 1;`,
+      ".hidden/skipped.test.ts": `import { test } from "bun:test"; test("hidden", () => { console.log("SHOULD NOT RUN hidden"); });`,
+      "node_modules/pkg/skipped.test.ts": `import { test } from "bun:test"; test("nm", () => { console.log("SHOULD NOT RUN node_modules"); });`,
+    };
+    // Long directory chain so the scanner's directory FIFO and per-directory
+    // reads are exercised many times in a single scan.
+    let prefix = "chain";
+    for (let i = 0; i < 32; i++) {
+      prefix += `/d${i}`;
+      files[`${prefix}/leaf${i}.test.ts`] = `import { test } from "bun:test"; test("leaf${i}", () => {});`;
+    }
+    using dir = tempDir("scanner-discovery", files);
+
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "test"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+    expect(stdout).toContain("RAN a_first");
+    expect(stdout).toContain("RAN b_second");
+    expect(stdout).toContain("RAN spec");
+    expect(stdout).toContain("RAN inner");
+    expect(stdout).not.toContain("SHOULD NOT RUN");
+    // 4 named tests + 32 chain leaves
+    expect(stderr).toContain(" 36 pass");
+    expect(exitCode).toBe(0);
+  });
+
+  test("scanning a relative subdirectory only runs tests under it", async () => {
+    using dir = tempDir("scanner-subdir", {
+      "root_only.test.ts": `import { test } from "bun:test"; test("root", () => { console.log("RAN root"); });`,
+      "nested/inner.test.ts": `import { test } from "bun:test"; test("inner", () => { console.log("RAN inner"); });`,
+      "nested/deeper/most.test.ts": `import { test } from "bun:test"; test("most", () => { console.log("RAN most"); });`,
+    });
+
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "test", "./nested"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+    expect(stdout).toContain("RAN inner");
+    expect(stdout).toContain("RAN most");
+    expect(stdout).not.toContain("RAN root");
+    expect(stderr).toContain(" 2 pass");
+    expect(exitCode).toBe(0);
+  });
+
+  test("scanning a relative file path that is not a directory runs that single file", async () => {
+    using dir = tempDir("scanner-single-file", {
+      "solo.test.ts": `import { test } from "bun:test"; test("solo", () => { console.log("RAN solo"); });`,
+      "other.test.ts": `import { test } from "bun:test"; test("other", () => { console.log("RAN other"); });`,
+    });
+
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "test", "./solo.test.ts"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+    expect(stdout).toContain("RAN solo");
+    expect(stdout).not.toContain("RAN other");
+    expect(stderr).toContain(" 1 pass");
+    expect(exitCode).toBe(0);
+  });
+
+  test.each([
+    ["named twice", ["./a.test.ts", "./a.test.ts"], ["LOADED a"], "Ran 1 test across 2 files."],
+    ["named in three ways", ["./a.test.ts", "a.test.ts", "ABSOLUTE"], ["LOADED a"], "Ran 1 test across 3 files."],
+    [
+      "imported by the file after it",
+      ["./a.test.ts", "./b.test.ts"],
+      ["LOADED a", "LOADED b"],
+      "Ran 2 tests across 2 files.",
+    ],
+    [
+      "imported by the file before it",
+      ["./b.test.ts", "./a.test.ts"],
+      ["LOADED a", "LOADED b"],
+      "Ran 2 tests across 2 files.",
+    ],
+  ])("a test file that is %s is loaded once", async (_, args, loaded, ran) => {
+    using dir = tempDir("test-file-twice", {
+      "a.test.ts": `import { test } from "bun:test"; console.log("LOADED a"); test("a", () => {});`,
+      "b.test.ts": `import { test } from "bun:test"; import "./a.test.ts"; console.log("LOADED b"); test("b", () => {});`,
+    });
+
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "test", ...args.map(arg => (arg === "ABSOLUTE" ? join(String(dir), "a.test.ts") : arg))],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+    expect(stdout.split("\n").filter(line => line.startsWith("LOADED"))).toEqual(loaded);
+    expect(stderr).toContain(ran);
+    expect(exitCode).toBe(0);
+  });
+
+  // The scanner builds every absolute path in a PathBuffer of MAX_PATH_BYTES:
+  // 4096 on Linux, 1024 on every other POSIX (src/bun_core/util.rs). On Windows
+  // it is 32767*3+1 bytes, more than a command line or an NT path can hold, so
+  // the overflow is unreachable there.
+  const maxPathBytes = isLinux ? 4096 : 1024;
+  const existsTest = `import { test } from "bun:test"; test("exists", () => {});`;
+
+  for (const [kind, prefix, len] of [
+    ["absolute", "/", 5000],
+    ["absolute", "/", 100_000],
+    ["relative", "./", 5000],
+  ] as const) {
+    test.skipIf(isWindows)(
+      `${kind} path argument of ${len} bytes (longer than MAX_PATH_BYTES) reports no match instead of panicking`,
+      async () => {
+        using dir = tempDir("scanner-long-arg", { "exists.test.ts": existsTest });
+        const longArg = prefix + Buffer.alloc(len, "a").toString() + ".test.ts";
+
+        await using proc = Bun.spawn({
+          cmd: [bunExe(), "test", longArg],
+          env: bunEnv,
+          cwd: String(dir),
+          stderr: "pipe",
+        });
+        const [stderr, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
+
+        expect(stderr).toContain("had no matches");
+        expect(exitCode).toBe(1);
+      },
+    );
+  }
+
+  test.skipIf(isWindows)(
+    "a path argument longer than MAX_PATH_BYTES is skipped like a missing path when other arguments match",
+    async () => {
+      using dir = tempDir("scanner-long-arg-mixed", { "exists.test.ts": existsTest });
+      const longArg = "/" + Buffer.alloc(5000, "a").toString() + ".test.ts";
+
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "test", "./exists.test.ts", longArg],
+        env: bunEnv,
+        cwd: String(dir),
+        stderr: "pipe",
+      });
+      const [stderr, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
+
+      expect(stderr).toContain("Ran 1 test across 1 file.");
+      expect(exitCode).toBe(0);
+    },
+  );
+
+  // The directory walk joins parent + entry name for every directory it
+  // descends into and every candidate test file. With pathIgnorePatterns
+  // configured it additionally joins each directory before queueing it, so the
+  // same tree is scanned once per configuration to reach both code paths.
+  for (const [config, files] of [
+    ["no bunfig", {}],
+    ["pathIgnorePatterns configured", { "bunfig.toml": `[test]\npathIgnorePatterns = ["unrelated/**"]\n` }],
+  ] as const) {
+    test.skipIf(isWindows)(
+      `entries whose absolute path exceeds MAX_PATH_BYTES are skipped during the directory walk (${config})`,
+      async () => {
+        using dir = tempDir("scanner-deep-tree", {
+          ...files,
+          "shallow.test.ts": `import { test } from "bun:test"; test("shallow", () => {});`,
+        });
+        const root = String(dir);
+        // Each level adds "/" + segment = 255 bytes. The deepest directory the
+        // scanner can still open is the last one whose path is at most
+        // maxPathBytes - 1 (it reserves one byte for the NUL); the directory
+        // below it is skipped. A 255-byte name in the deepest directory
+        // overflows too: that directory is at most 254 bytes short of the limit
+        // and the name adds 256. The deepest directory gets three such entries:
+        // a test file, a subdirectory, and a symlink. readdir does not report a
+        // symlink's kind, so the scanner stats it first, and that stat builds
+        // the path through the resolver (RealFS::kind) rather than through the
+        // scanner's own joins.
+        const segment = Buffer.alloc(254, "d").toString();
+        const longTestFile = Buffer.alloc(247, "f").toString() + ".test.ts";
+        const longTestLink = Buffer.alloc(247, "l").toString() + ".test.ts";
+        const fitDepth = Math.floor((maxPathBytes - 1 - root.length) / (segment.length + 1));
+        expect([longTestFile.length, longTestLink.length]).toEqual([255, 255]);
+        expect(root.length + fitDepth * 255 + 256).toBeGreaterThan(maxPathBytes);
+
+        // The over-long entries cannot be addressed by absolute path
+        // (ENAMETOOLONG), so walk down the chain and create them relative to
+        // the deepest directory.
+        const script = ["set -e"];
+        for (let level = 1; level <= fitDepth; level++) {
+          script.push(`mkdir ${segment} && cd ${segment}`);
+        }
+        script.push(`touch ${longTestFile}`, `ln -s ${longTestFile} ${longTestLink}`, `mkdir ${segment}`);
+        await using setup = Bun.spawn({
+          cmd: ["bash", "-c", script.join("\n")],
+          env: bunEnv,
+          cwd: root,
+          stderr: "pipe",
+        });
+        const [setupStderr, setupExitCode] = await Promise.all([setup.stderr.text(), setup.exited]);
+        expect(setupStderr).toBe("");
+        expect(setupExitCode).toBe(0);
+
+        await using proc = Bun.spawn({
+          cmd: [bunExe(), "test"],
+          env: bunEnv,
+          cwd: root,
+          stderr: "pipe",
+        });
+        const [stderr, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
+
+        expect(stderr).toContain("shallow.test.ts:");
+        expect(stderr).toContain("Ran 1 test across 1 file.");
+        expect(exitCode).toBe(0);
+      },
+    );
+  }
+
+  // https://github.com/oven-sh/bun/issues/39852
+  test.skipIf(isWindows)("does not keep a directory fd open per scanned directory", async () => {
+    const N = 64;
+    const files: Record<string, string> = {};
+    for (let i = 0; i < N; i++) {
+      files[`sub${i}/a/b/c/.gitkeep`] = "";
+    }
+    files["sub0/probe.test.ts"] = /* ts */ `
+      import { test } from "bun:test";
+      import { readdirSync } from "node:fs";
+      test("probe", () => {
+        console.log("OPEN_FDS=" + readdirSync(process.platform === "linux" ? "/proc/self/fd" : "/dev/fd").length);
+      });
+    `;
+    using dir = tempDir("scanner-dir-fds", files);
+
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "test", "probe"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    // 4N+1 directories are scanned; none of them may stay open.
+    expect(Number(stdout.match(/OPEN_FDS=(\d+)/)?.[1])).toBeLessThan(N);
+    expect(stderr).toContain(" 1 pass");
+    expect(exitCode).toBe(0);
+  });
+});
+
+function runFiles(files: Record<string, string>, ...args: string[]) {
+  return runFilesWithEnv({}, files, ...args);
+}
+
+async function runFilesWithEnv(env: Record<string, string>, files: Record<string, string>, ...args: string[]) {
+  using dir = tempDir("bun-test-waits", files);
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "test", ...args],
+    env: { ...bunEnv, ...env },
+    cwd: String(dir),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  return {
+    stdout,
+    stderr,
+    errors: stderr
+      .split(/\r?\n/)
+      .filter(line => /^(error|note): /.test(line))
+      .map(line => line.replace(/"[^"]*[\\/]([^"\\/]+)"/g, '"$1"')),
+    counts: stderr.match(/^ \d+ (pass|fail)$/gm),
+    exitCode,
+  };
+}
+
+// No test has started yet, so no test timeout can end these waits.
+describe.concurrent("a test file that can never finish loading", () => {
+  const nothingLeft = "note: the event loop is empty, so nothing can settle it anymore";
+  const neverLoads = `
+    import { test } from "bun:test";
+    await new Promise(() => {});
+    test("never registered", () => {});
+  `;
+  const passes = `
+    import { test } from "bun:test";
+    test("passes", () => {});
+  `;
+
+  test.each([
+    [[]],
+    [["--isolate"]],
+    // On Windows the pipe to the coordinator keeps a worker's loop alive.
+    ...(isWindows ? [] : [[["--parallel=2"]], [["--parallel=2", "--isolate"]]]),
+  ])("fails immediately and the run continues %j", async flags => {
+    const { errors, counts, exitCode } = await runFiles(
+      { "a.test.ts": neverLoads, "b.test.ts": passes, "c.test.ts": passes },
+      ...flags,
+    );
+    expect({ errors, counts, exitCode }).toEqual({
+      errors: [
+        'error: "a.test.ts" never finished loading',
+        nothingLeft,
+        'note: unsettled top-level await in "a.test.ts"',
+      ],
+      counts: [" 2 pass", " 1 fail"],
+      exitCode: 1,
+    });
+  });
+
+  test("once the last timer has fired", async () => {
+    const { errors, counts, exitCode } = await runFiles({
+      "a.test.ts": `
+        await new Promise(() => setTimeout(() => console.log("fired"), 1));
+      `,
+    });
+    expect({ errors, counts, exitCode }).toEqual({
+      errors: [
+        'error: "a.test.ts" never finished loading',
+        nothingLeft,
+        'note: unsettled top-level await in "a.test.ts"',
+      ],
+      counts: [" 0 pass", " 1 fail"],
+      exitCode: 1,
+    });
+  });
+
+  // Both are pipes here, and their writers register with the event loop. An idle writer must not count as work left.
+  test.each([
+    ["process.stdout", []],
+    ["process.stderr", []],
+    [`process.stdout.write("written\\n")`, []],
+    ["process.stdout", ["--isolate"]],
+    // On Windows the pipe to the coordinator keeps a worker's loop alive.
+    ...(isWindows ? [] : [["process.stdout", ["--parallel=2"]]]),
+  ] as [string, string[]][])("after %s %j", async (touch, flags) => {
+    const { errors, counts, exitCode } = await runFiles(
+      {
+        "a.test.ts": `
+          ${touch};
+          await new Promise(() => {});
+        `,
+        "b.test.ts": passes,
+      },
+      ...flags,
+    );
+    expect({ errors, counts, exitCode }).toEqual({
+      errors: [
+        'error: "a.test.ts" never finished loading',
+        nothingLeft,
+        'note: unsettled top-level await in "a.test.ts"',
+      ],
+      counts: [" 1 pass", " 1 fail"],
+      exitCode: 1,
+    });
+  });
+
+  test("names the modules that wait, in the order they were evaluated, not their importers", async () => {
+    const { errors, counts, exitCode } = await runFiles({
+      "a.test.ts": `
+        import "./middle.ts";
+      `,
+      "middle.ts": `
+        import "./y.ts";
+      `,
+      "y.ts": `
+        export const y = 1;
+        await import("./x.ts");
+      `,
+      "x.ts": `
+        export const x = 1;
+        await import("./y.ts");
+      `,
+    });
+    expect({ errors, counts, exitCode }).toEqual({
+      errors: [
+        'error: "a.test.ts" never finished loading',
+        nothingLeft,
+        'note: unsettled top-level await in "y.ts"',
+        'note: unsettled top-level await in "x.ts"',
+      ],
+      counts: [" 0 pass", " 1 fail"],
+      exitCode: 1,
+    });
+  });
+
+  test("names at most five modules", async () => {
+    const files: Record<string, string> = { "a.test.ts": "" };
+    for (let i = 0; i < 7; i++) {
+      files["a.test.ts"] += `import "./dep${i}.ts";\n`;
+      files[`dep${i}.ts`] = "await new Promise(() => {});";
+    }
+    const { errors } = await runFiles(files);
+    expect(errors).toEqual([
+      'error: "a.test.ts" never finished loading',
+      nothingLeft,
+      ...[0, 1, 2, 3, 4].map(i => `note: unsettled top-level await in "dep${i}.ts"`),
+      "note: and 2 more",
+    ]);
+  });
+
+  test("names a module whose onLoad() plugin never settles", async () => {
+    const { errors, counts, exitCode } = await runFiles({
+      "a.test.ts": `
+        Bun.plugin({
+          name: "stuck",
+          setup(build) {
+            build.onLoad({ filter: /stuck\\.ts$/ }, () => new Promise(() => {}));
+          },
+        });
+        await import("./importer.ts");
+      `,
+      "importer.ts": `
+        import "./stuck.ts";
+      `,
+      "stuck.ts": "",
+    });
+    expect({ errors, counts, exitCode }).toEqual({
+      errors: [
+        'error: "a.test.ts" never finished loading',
+        nothingLeft,
+        'note: unsettled top-level await in "a.test.ts"',
+        'note: an onLoad() plugin or a mock.module() factory never settled for "stuck.ts"',
+      ],
+      counts: [" 0 pass", " 1 fail"],
+      exitCode: 1,
+    });
+  });
+
+  test("the next file re-evaluates the modules it left unfinished", async () => {
+    const { stdout, errors, counts, exitCode } = await runFiles(
+      {
+        "a.test.ts": `
+          globalThis.gate = new Promise(() => {});
+          await import("./importer.ts");
+        `,
+        "b.test.ts": `
+          import { test, expect } from "bun:test";
+          globalThis.gate = Promise.resolve("open");
+          const { gate } = await import("./importer.ts");
+          test("gate", () => expect(gate).toBe("open"));
+        `,
+        "importer.ts": `
+          export { gate } from "./gated.ts";
+        `,
+        "gated.ts": `
+          console.log("evaluating gated.ts");
+          export const gate = await globalThis.gate;
+        `,
+      },
+      "./a.test.ts",
+      "./b.test.ts",
+    );
+    expect({ stdout, errors: errors.slice(2), counts, exitCode }).toEqual({
+      stdout: expect.stringMatching(/^(bun test .*\n)?evaluating gated.ts\nevaluating gated.ts\n$/),
+      errors: ['note: unsettled top-level await in "a.test.ts"', 'note: unsettled top-level await in "gated.ts"'],
+      counts: [" 1 pass", " 1 fail"],
+      exitCode: 1,
+    });
+  });
+
+  const mockNeverSettles = {
+    "a.test.ts": `
+      import { test, mock } from "bun:test";
+      mock.module("./a.ts", async () => ({ ...(await import("./a.ts?actual")), a: await new Promise(() => {}) }));
+      await import("./b.ts");
+      test("never registered", () => {});
+    `,
+    "a.ts": `
+      import { b } from "./b.ts";
+      export const a = "real a";
+      export const viaB = () => b;
+    `,
+    "b.ts": `
+      import { a } from "./a.ts";
+      export const b = "real b";
+      export const viaA = () => a;
+    `,
+  };
+
+  test("a mock.module() factory that never settles, for a module in an import cycle", async () => {
+    const { stderr, counts, exitCode } = await runFiles(
+      { ...mockNeverSettles, "b.test.ts": passes },
+      "./a.test.ts",
+      "./b.test.ts",
+    );
+    expect(stderr).toContain("a.test.ts");
+    expect({ counts, exitCode }).toEqual({ counts: [" 1 pass", " 1 fail"], exitCode: 1 });
+  });
+
+  test("the next file gets the real modules of that cycle", async () => {
+    const { counts, exitCode } = await runFiles(
+      {
+        ...mockNeverSettles,
+        "b.test.ts": `
+          import { test, expect } from "bun:test";
+          import { viaA } from "./b.ts";
+          test("real", () => expect(viaA()).toBe("real a"));
+        `,
+      },
+      "./a.test.ts",
+      "./b.test.ts",
+    );
+    expect({ counts, exitCode }).toEqual({ counts: [" 1 pass", " 1 fail"], exitCode: 1 });
+  });
+
+  test("a mock.module() factory for a loaded module that never settles", async () => {
+    const { errors, counts, exitCode } = await runFiles(
+      {
+        "a.test.ts": `
+          import { test, mock } from "bun:test";
+          import "./dep.ts";
+          mock.module("./dep.ts", () => new Promise(() => {}));
+          test("never runs", () => console.log("ran"));
+        `,
+        "b.test.ts": passes,
+        "dep.ts": "export const dep = 1;",
+      },
+      "./a.test.ts",
+      "./b.test.ts",
+    );
+    expect({ errors, counts, exitCode }).toEqual({
+      errors: ['error: A mock.module() factory never settled in "a.test.ts"', nothingLeft],
+      counts: [" 1 pass", " 1 fail"],
+      exitCode: 1,
+    });
+  });
+
+  test("--preload", async () => {
+    const { errors, counts, exitCode } = await runFiles(
+      { "preload.ts": "await new Promise(() => {});", "a.test.ts": passes },
+      "--preload",
+      "./preload.ts",
+    );
+    expect({ errors, counts, exitCode }).toEqual({
+      errors: [
+        'error: preload "preload.ts" never finished loading',
+        nothingLeft,
+        'note: unsettled top-level await in "preload.ts"',
+      ],
+      counts: [" 0 pass", " 1 fail"],
+      exitCode: 1,
+    });
+  });
+
+  test("--bail", async () => {
+    const { stderr, errors, exitCode } = await runFiles(
+      { "a.test.ts": neverLoads, "b.test.ts": passes },
+      "--bail",
+      "./a.test.ts",
+      "./b.test.ts",
+    );
+    expect(errors[0]).toBe('error: "a.test.ts" never finished loading');
+    expect(stderr).toContain("Bailed out after 1 failure");
+    expect(stderr).not.toContain("b.test.ts");
+    expect(exitCode).toBe(1);
+  });
+
+  // On Windows faked timers share the ref'd timers' hold on the loop, which can't be told apart from any other ref.
+  test.skipIf(isWindows)("waiting on a fake timer that nothing fires", async () => {
+    const { errors, counts, exitCode } = await runFiles({
+      "a.test.ts": `
+        import { jest } from "bun:test";
+        jest.useFakeTimers();
+        await new Promise(resolve => setTimeout(resolve, 1));
+      `,
+    });
+    expect({ errors, counts, exitCode }).toEqual({
+      errors: [
+        'error: "a.test.ts" never finished loading',
+        nothingLeft,
+        'note: unsettled top-level await in "a.test.ts"',
+      ],
+      counts: [" 0 pass", " 1 fail"],
+      exitCode: 1,
+    });
+  });
+
+  test("a test environment that never finishes closing", async () => {
+    const { errors, counts, exitCode } = await runFiles(
+      {
+        "a.test.ts": passes,
+        "b.test.ts": passes,
+        "node_modules/happy-dom/package.json": JSON.stringify({ name: "happy-dom", main: "index.js" }),
+        "node_modules/happy-dom/index.js": `
+          exports.Window = class Window {
+            document = {};
+            happyDOM = { abort: () => new Promise(() => {}) };
+            close() {}
+          };
+        `,
+      },
+      "--environment=happy-dom",
+      "--isolate",
+    );
+    expect({ errors, counts, exitCode }).toEqual({
+      errors: [
+        "error: The test environment never finished closing",
+        nothingLeft,
+        "error: The test environment never finished closing",
+        nothingLeft,
+      ],
+      counts: [" 2 pass", " 0 fail"],
+      exitCode: 1,
+    });
+  });
+
+  // An unref'd handle can still settle a promise, so the runner must wait for it, as Jest and vitest do.
+  test.each(
+    Object.entries({
+      "timer": `await new Promise(resolve => setTimeout(resolve, 20, "ok"))`,
+      "unref'd timer": `await new Promise(resolve => setTimeout(resolve, 20, "ok").unref())`,
+      "unref'd interval": `await new Promise(resolve => {
+        const interval = setInterval(() => (clearInterval(interval), resolve("ok")), 5).unref();
+      })`,
+      "immediate": `await new Promise(resolve => setImmediate(resolve, "ok"))`,
+      "AbortSignal.timeout": `await new Promise(resolve => AbortSignal.timeout(20).addEventListener("abort", () => resolve("ok")))`,
+      "Atomics.waitAsync": `(await Atomics.waitAsync(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20).value) && "ok"`,
+      "subprocess": `(await Bun.spawn({ cmd: [process.execPath, "-e", ""], stdio: ["ignore", "ignore", "ignore"] }).exited) || "ok"`,
+      "unref'd subprocess": `await (async () => {
+        const child = Bun.spawn({ cmd: [process.execPath, "-e", ""], stdio: ["ignore", "ignore", "ignore"] });
+        child.unref();
+        return (await child.exited) || "ok";
+      })()`,
+      "output of an unref'd subprocess": `await (async () => {
+        const child = require("node:child_process").spawn(process.execPath, ["-e", "console.log('ok'); setInterval(() => {}, 1000)"], {
+          stdio: ["ignore", "pipe", "ignore"],
+        });
+        child.unref();
+        const output = await new Promise(resolve => child.stdout.once("data", data => resolve(String(data).trim())));
+        child.kill();
+        return output;
+      })()`,
+      "fetch": `await (async () => {
+        using server = Bun.serve({ port: 0, fetch: () => new Response("ok") });
+        return await (await fetch(server.url)).text();
+      })()`,
+      "unref'd socket": `await (async () => {
+        using server = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { open: socket => void socket.end("ok"), data() {} } });
+        server.unref();
+        const { promise, resolve } = Promise.withResolvers();
+        const socket = await Bun.connect({ hostname: "127.0.0.1", port: server.port, socket: { data: (_, data) => resolve(String(data)) } });
+        socket.unref();
+        return await promise;
+      })()`,
+      "worker": `await new Promise(resolve => {
+        new Worker(URL.createObjectURL(new Blob(["postMessage('ok')"]))).onmessage = event => resolve(event.data);
+      })`,
+      "unref'd worker": `await new Promise(resolve => {
+        const worker = new Worker(URL.createObjectURL(new Blob(["postMessage('ok')"])));
+        worker.unref();
+        worker.onmessage = event => resolve(event.data);
+      })`,
+      "file": `(await Bun.file(import.meta.path).text()) && "ok"`,
+      "transpiling a big module on another thread": `(await import("./big.ts")).ok`,
+    }),
+  )("a file still waiting on real work isn't reported: %s", async (_, expression) => {
+    const bigLine = "(function (a: number): number { return a + 1; });\n";
+    const { errors, counts, exitCode } = await runFiles({
+      "a.test.ts": `
+        import { test, expect } from "bun:test";
+        const result = ${expression};
+        test("result", () => expect(result).toBe("ok"));
+      `,
+      "big.ts": `export const ok = "ok";\n` + Buffer.alloc(bigLine.length * 4_000, bigLine).toString(),
+    });
+    expect({ errors, counts, exitCode }).toEqual({ errors: [], counts: [" 1 pass", " 0 fail"], exitCode: 0 });
+  });
+
+  // macOS watchers miss changes made before their event stream starts, so keep writing until the run ends.
+  // The writes come from here because a writer inside the test file would be one more thing to wait for.
+  test.each([[[]], [["--isolate"]], [["--isolate=modules"]]])(
+    "a file still waiting on real work isn't reported: unref'd fs.watch, with %j",
+    async flags => {
+      using dir = tempDir("bun-test-waits", {
+        "a.test.ts": `
+          import { test, expect } from "bun:test";
+          import { watch } from "node:fs";
+          const watcher = watch(import.meta.dir, { persistent: false });
+          const result = await new Promise(resolve => watcher.once("change", () => resolve("ok")));
+          watcher.close();
+          test("result", () => expect(result).toBe("ok"));
+        `,
+      });
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "test", ...flags],
+        env: bunEnv,
+        cwd: String(dir),
+        stdout: "ignore",
+        stderr: "pipe",
+      });
+      const stderr = proc.stderr.text();
+      let writes = 0;
+      do {
+        writeFileSync(join(String(dir), "changed.txt"), String(writes++));
+      } while ((await Promise.race([proc.exited, Bun.sleep(10)])) === undefined);
+      expect({ counts: (await stderr).match(/^ \d+ (pass|fail)$/gm), exitCode: await proc.exited }).toEqual({
+        counts: [" 1 pass", " 0 fail"],
+        exitCode: 0,
+      });
+    },
+  );
+
+  // Without pidfd_open(), a waiter thread waits for children instead of the event loop.
+  test.skipIf(!isLinux)("waits for an unref'd subprocess on the waiter thread, but only until it exits", async () => {
+    const { errors, counts, exitCode } = await runFilesWithEnv(
+      { BUN_FEATURE_FLAG_FORCE_WAITER_THREAD: "1" },
+      {
+        "a.test.ts": `
+          import { test, expect } from "bun:test";
+          const child = Bun.spawn({ cmd: [process.execPath, "-e", ""], stdio: ["ignore", "ignore", "ignore"] });
+          child.unref();
+          const exitCode = await child.exited;
+          test("exited", () => expect(exitCode).toBe(0));
+        `,
+        "b.test.ts": neverLoads,
+      },
+      "./a.test.ts",
+      "./b.test.ts",
+    );
+    expect({ errors, counts, exitCode }).toEqual({
+      errors: [
+        'error: "b.test.ts" never finished loading',
+        nothingLeft,
+        'note: unsettled top-level await in "b.test.ts"',
+      ],
+      counts: [" 1 pass", " 1 fail"],
+      exitCode: 1,
+    });
+  });
+
+  test("a file that loads after an unhandled error isn't reported", async () => {
+    const { errors, counts, exitCode } = await runFiles(
+      {
+        "a.test.ts": `
+          Promise.reject(new Error("unhandled"));
+        `,
+        "b.test.ts": `
+          import { test } from "bun:test";
+          await new Promise(resolve => setTimeout(resolve, 1));
+          test("passes", () => {});
+        `,
+      },
+      "./a.test.ts",
+      "./b.test.ts",
+    );
+    expect({ errors, counts, exitCode }).toEqual({
+      errors: ["error: unhandled"],
+      counts: [" 1 pass", " 0 fail"],
+      exitCode: 1,
+    });
+  });
+
+  // On Windows `bun test --watch` is a parent process that restarts the runner.
+  test.skipIf(isWindows)("--watch reports it and keeps watching", async () => {
+    using dir = tempDir("bun-test-waits-watch", { "a.test.ts": neverLoads });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "test", "--watch", "--no-clear-screen"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    const reader = proc.stderr.pipeThrough(new TextDecoderStream()).getReader();
+    let output = "";
+    async function waitFor(needle: string) {
+      while (!output.includes(needle)) {
+        const { value, done } = await reader.read();
+        if (done) throw new Error(`exited before printing ${JSON.stringify(needle)}:\n${output}`);
+        output += value;
+      }
+    }
+    await waitFor("Ran 1 test across 1 file.");
+    expect(output).toContain("never finished loading");
+    expect(output).toContain(" 1 fail");
+
+    output = "";
+    writeFileSync(join(String(dir), "a.test.ts"), passes);
+    await waitFor("Ran 1 test across 1 file.");
+    expect(output).toContain(" 1 pass");
+    expect(output).toContain(" 0 fail");
+  });
+});
+
+// No test timeout ends these waits either.
+describe.concurrent("a test file that can never finish running", () => {
+  const nothingLeft = "note: the event loop is empty, so nothing can settle it anymore";
+  const passes = `
+    import { test } from "bun:test";
+    test("passes", () => {});
+  `;
+
+  test("a describe() callback that never settles is reported and the run continues", async () => {
+    const { stdout, errors, counts, exitCode } = await runFiles(
+      {
+        "a.test.ts": `
+          import { describe, test } from "bun:test";
+          describe("never settles", async () => {
+            await new Promise(() => {});
+            test("never registered", () => {});
+          });
+          describe("settles", () => {
+            test("runs", () => console.log("ran"));
+          });
+        `,
+        "b.test.ts": passes,
+      },
+      "./a.test.ts",
+      "./b.test.ts",
+    );
+    expect({ stdout, errors, counts, exitCode }).toEqual({
+      stdout: expect.stringMatching(/^(bun test .*\n)?ran\n$/),
+      errors: ['error: A describe() callback never settled in "a.test.ts"', nothingLeft],
+      counts: [" 2 pass", " 0 fail"],
+      exitCode: 1,
+    });
+  });
+
+  test("tests without a timeout that never settle fail and the run continues", async () => {
+    const { stderr, errors, counts, exitCode } = await runFiles({
+      "a.test.ts": `
+        import { test } from "bun:test";
+        test("first", () => new Promise(() => {}), 0);
+        test("second", () => new Promise(() => {}), 0);
+        test("third", () => {});
+      `,
+    });
+    const neverSettled = ['error: A test or hook with no timeout never settled in "a.test.ts"', nothingLeft];
+    expect({ results: stderr.match(/^\((pass|fail)\) \w+/gm), errors, counts, exitCode }).toEqual({
+      results: ["(fail) first", "(fail) second", "(pass) third"],
+      errors: [...neverSettled, ...neverSettled],
+      counts: [" 1 pass", " 2 fail"],
+      exitCode: 1,
+    });
+  });
+
+  test.each([
+    [
+      "a hook",
+      `
+        import { afterEach, test } from "bun:test";
+        afterEach(() => new Promise(() => {}), 0);
+        test("first", () => {}, 0);
+        test("second", () => {}, 0);
+      `,
+    ],
+    [
+      "concurrent tests",
+      `
+        import { test } from "bun:test";
+        test.concurrent("first", () => new Promise(() => {}), 0);
+        test.concurrent("second", () => new Promise(() => {}), 0);
+      `,
+    ],
+  ])("the file stops at %s without a timeout that can never settle, and the run continues", async (_, contents) => {
+    const { errors, counts, exitCode } = await runFiles(
+      { "a.test.ts": contents, "b.test.ts": passes },
+      "./a.test.ts",
+      "./b.test.ts",
+    );
+    expect({ errors, counts, exitCode }).toEqual({
+      errors: ['error: A test or hook with no timeout never settled in "a.test.ts"', nothingLeft],
+      counts: [" 1 pass", " 0 fail"],
+      exitCode: 1,
+    });
+  });
+});
+
+describe.concurrent("the runner sleeps while it waits", () => {
+  const waitMs = 1000;
+  const cpuMs = (stdout: string) => Number(stdout.match(/^cpu (\d+)$/m)?.[1]);
+  const printCpu = `(usage => console.log("cpu " + Math.round((usage.user + usage.system) / 1000)))(process.cpuUsage(start))`;
+
+  test("for a load that only an unref'd timer can settle", async () => {
+    const { stdout, counts, exitCode } = await runFiles({
+      "a.test.ts": `
+        import { test } from "bun:test";
+        const start = process.cpuUsage();
+        await new Promise(resolve => setTimeout(resolve, ${waitMs}).unref());
+        ${printCpu};
+        test("passes", () => {});
+      `,
+    });
+    expect(cpuMs(stdout)).toBeLessThan(waitMs / 2);
+    expect({ counts, exitCode }).toEqual({ counts: [" 1 pass", " 0 fail"], exitCode: 0 });
+  });
+
+  test("for a test that times out with nothing on the event loop", async () => {
+    const { stdout, counts, exitCode } = await runFiles({
+      "a.test.ts": `
+        import { test } from "bun:test";
+        let start;
+        test("times out", async () => {
+          start = process.cpuUsage();
+          await new Promise(() => {});
+        }, ${waitMs});
+        test("passes", () => ${printCpu});
+      `,
+    });
+    expect(cpuMs(stdout)).toBeLessThan(waitMs / 2);
+    expect({ counts, exitCode }).toEqual({ counts: [" 1 pass", " 1 fail"], exitCode: 1 });
+  });
+
+  test("for a hook that times out after fake timers were switched off", async () => {
+    const { stdout, counts, exitCode } = await runFiles(
+      {
+        "a.test.ts": `
+          import { test, beforeEach, afterEach, afterAll, jest } from "bun:test";
+          let start;
+          beforeEach(() => void jest.useFakeTimers());
+          afterEach(async () => {
+            jest.useRealTimers();
+            start = process.cpuUsage();
+            await new Promise(() => {});
+          });
+          afterAll(() => ${printCpu});
+          test("arms a faked timer", () => void setTimeout(() => {}, 1));
+        `,
+      },
+      `--timeout=${waitMs}`,
+    );
+    expect(cpuMs(stdout)).toBeLessThan(waitMs / 2);
+    expect({ counts, exitCode }).toEqual({ counts: [" 0 pass", " 1 fail"], exitCode: 1 });
+  });
+});
+
+describe.concurrent("the next test doesn't start inside the call that ended the previous test", () => {
+  const results = (stderr: string) => stderr.match(/^\((pass|fail)\) [\w ]+/gm)?.map(line => line.trimEnd());
+
+  test.each(
+    Object.entries({
+      "reportError()": `reportError(new Error("reported"));`,
+      "done(error)": `done(new Error("reported"));`,
+      "dispatchEvent() to a listener that throws": `
+        const target = new EventTarget();
+        target.addEventListener("event", () => {
+          throw new Error("reported");
+        });
+        target.dispatchEvent(new Event("event"));
+      `,
+      "vi.advanceTimersByTime() to an abort listener that throws": `
+        vi.useFakeTimers();
+        AbortSignal.timeout(5).addEventListener("abort", () => {
+          throw new Error("reported");
+        });
+        vi.advanceTimersByTime(10);
+        vi.useRealTimers();
+      `,
+    }),
+  )("%s", async (_, call) => {
+    const { stderr, errors, exitCode } = await runFiles({
+      "a.test.ts": `
+        import { expect, test, vi } from "bun:test";
+        let isCalling = false;
+        test("ends", done => {
+          setTimeout(() => {
+            isCalling = true;
+            ${call}
+            isCalling = false;
+          });
+        });
+        test("next", () => expect(isCalling).toBe(false));
+      `,
+    });
+    expect({ results: results(stderr), errors, exitCode }).toEqual({
+      results: ["(fail) ends", "(pass) next"],
+      errors: ["error: reported"],
+      exitCode: 1,
+    });
+  });
+
+  test("Bun.spawnSync() that outlives the timeout of the test", async () => {
+    const { stderr, exitCode } = await runFiles({
+      "a.test.ts": `
+        import { expect, test } from "bun:test";
+        let isCalling = false;
+        test("ends", done => {
+          setTimeout(() => {
+            isCalling = true;
+            // The timeout of the test kills it.
+            Bun.spawnSync({ cmd: [process.execPath, "-e", "setInterval(() => {}, 1e6)"] });
+            isCalling = false;
+          });
+        }, 500);
+        test("next", () => expect(isCalling).toBe(false));
+      `,
+    });
+    expect({ results: results(stderr), exitCode }).toEqual({ results: ["(fail) ends", "(pass) next"], exitCode: 1 });
+  });
+
+  // Bun.build() ticks the event loop until the plugin's setup() settles, so the test's timeout fires inside that call.
+  test("Bun.build() that outlives the timeout of the test", async () => {
+    const { stderr, exitCode } = await runFiles({
+      "entry.ts": "",
+      "a.test.ts": `
+        import { expect, test } from "bun:test";
+        let isCalling = false;
+        test("ends", async () => {
+          await new Promise(resolve => setTimeout(resolve));
+          isCalling = true;
+          const build = Bun.build({
+            entrypoints: ["./entry.ts"],
+            plugins: [{ name: "slow", setup: () => new Promise(resolve => setTimeout(resolve, 300)) }],
+          });
+          isCalling = false;
+          await build;
+        }, 100);
+        test("next", () => expect(isCalling).toBe(false));
+      `,
+    });
+    expect({ results: results(stderr), exitCode }).toEqual({ results: ["(fail) ends", "(pass) next"], exitCode: 1 });
+  });
+
+  test("two rejections in one tick are both attributed to the running test", async () => {
+    const { stderr, errors, exitCode } = await runFiles({
+      "a.test.ts": `
+        import { test } from "bun:test";
+        test("rejects twice", done => {
+          setTimeout(() => {
+            Promise.reject(new Error("one"));
+            Promise.reject(new Error("two"));
+          });
+        });
+        test("next", async () => {
+          await new Promise(resolve => setTimeout(resolve));
+        });
+      `,
+    });
+    expect({ results: results(stderr), errors, exitCode }).toEqual({
+      results: ["(fail) rejects twice", "(pass) next"],
+      errors: ["error: one", "error: two"],
+      exitCode: 1,
+    });
+  });
+});
+
+describe.concurrent("an error that arrives while a test file loads", () => {
+  const results = (stderr: string) => stderr.match(/^\((pass|fail)\) [\w >]+/gm)?.map(line => line.trimEnd());
+  // Loading resumes one event-loop turn after the error.
+  const file = (error: string) => `
+    import { describe, test } from "bun:test";
+    test("registered before", () => {});
+    await new Promise(resolve => {
+      setTimeout(() => {
+        setTimeout(resolve);
+        ${error}
+      });
+    });
+    test("registered after", () => {});
+    test("fails", () => {
+      throw new Error("of the test");
+    });
+    describe("block", () => {
+      test("test", () => {});
+    });
+  `;
+  const all = ["(pass) registered before", "(pass) registered after", "(fail) fails", "(pass) block > test"];
+
+  test.each(
+    Object.entries({
+      "an unhandled rejection": `Promise.reject(new Error("stray"));`,
+      "an uncaught exception": `throw new Error("stray");`,
+      "reportError()": `reportError(new Error("stray"));`,
+    }),
+  )("%s is reported, and the file's tests run", async (_, error) => {
+    const { stderr, errors, exitCode } = await runFiles({ "a.test.ts": file(error) });
+    expect({ results: results(stderr), errors, exitCode }).toEqual({
+      results: all,
+      errors: ["error: stray", "error: of the test"],
+      exitCode: 1,
+    });
+    expect(stderr).toContain("Unhandled error between tests");
+  });
+
+  test("from code the previous file left behind is reported, and the file's tests run", async () => {
+    const { stderr, errors, exitCode } = await runFiles(
+      {
+        "a.test.ts": `
+          import { test } from "bun:test";
+          test("leaves a function", () => {
+            globalThis.left = () => Promise.reject(new Error("stray"));
+          });
+        `,
+        "b.test.ts": file(`globalThis.left();`),
+      },
+      "./a.test.ts",
+      "./b.test.ts",
+    );
+    expect({ results: results(stderr), errors, exitCode }).toEqual({
+      results: ["(pass) leaves a function", ...all],
+      errors: ["error: stray", "error: of the test"],
+      exitCode: 1,
+    });
+  });
+});
+
+describe.concurrent("a test file that fails to load", () => {
+  const turn = `await new Promise(resolve => setTimeout(resolve));`;
+  const files = {
+    "preload.ts": `
+      import { afterAll, beforeAll } from "bun:test";
+      beforeAll(async () => {
+        ${turn}
+        console.log("beforeAll");
+        globalThis.isReady = true;
+      });
+      afterAll(async () => {
+        ${turn}
+        console.log("afterAll");
+      });
+    `,
+    "missing.test.ts": `
+      import { test } from "bun:test";
+      import "./missing.ts";
+      test("never registered", () => {});
+    `,
+    "throws.test.ts": `
+      import { afterAll, beforeAll, describe, test } from "bun:test";
+      beforeAll(() => console.log("unreachable"));
+      afterAll(() => console.log("unreachable"));
+      test("registered", () => console.log("unreachable"));
+      describe("registered", () => {
+        console.log("unreachable");
+      });
+      throw new Error("thrown by the file");
+    `,
+    "one.test.ts": `
+      import { test } from "bun:test";
+      test("one", () => console.log("one:", globalThis.isReady));
+    `,
+    "two.test.ts": `
+      import { test } from "bun:test";
+      test("two", () => console.log("two:", globalThis.isReady));
+    `,
+  };
+  const both = ["beforeAll", "one: true", "two: true", "afterAll"];
+
+  test.each([
+    [["missing", "one", "two"], both],
+    [["one", "missing", "two"], both],
+    [["one", "two", "missing"], both],
+    [["throws", "one", "two"], both],
+    [["one", "two", "throws"], both],
+    [["missing"], ["beforeAll", "afterAll"]],
+    [
+      ["missing", "throws"],
+      ["beforeAll", "afterAll"],
+    ],
+    [
+      ["--isolate", "missing", "one"],
+      ["beforeAll", "afterAll", "beforeAll", "one: true", "afterAll"],
+    ],
+    [
+      ["--parallel=1", "missing", "one"],
+      ["beforeAll", "afterAll", "beforeAll", "one: true", "afterAll"],
+    ],
+    [
+      ["--rerun-each=2", "missing", "one"],
+      ["beforeAll", "one: true", "afterAll", "one: true", "afterAll"],
+    ],
+    [["--bail=1", "missing", "one"], ["beforeAll"]],
+    [
+      ["--bail=1", "one", "missing"],
+      ["beforeAll", "one: true", "afterAll"],
+    ],
+  ])("runs none of its tests, but still runs the preload's beforeAll and afterAll: %j", async (args, expected) => {
+    const { stdout, exitCode } = await runFiles(
+      files,
+      "--preload=./preload.ts",
+      ...args.map(arg => (arg.startsWith("-") ? arg : `./${arg}.test.ts`)),
+    );
+    expect({ stdout: stdout.split(/\r?\n/).filter(line => line && !line.startsWith("bun test ")), exitCode }).toEqual({
+      stdout: expected,
+      exitCode: 1,
+    });
+  });
+
+  test.each([[[]], [["--parallel=2"]]])('is listed under "tests failed:" %j', async args => {
+    const { stderr, exitCode } = await runFiles(
+      {
+        "missing.test.ts": files["missing.test.ts"],
+        // The list is only printed after more than 20 passes.
+        "many.test.ts": `
+          import { test } from "bun:test";
+          for (let i = 0; i < 21; i++) test("passes " + i, () => {});
+        `,
+      },
+      ...args,
+    );
+    expect(stderr.slice(stderr.indexOf("tests failed:")).split(/\r?\n/).slice(0, 2)).toEqual([
+      "tests failed:",
+      "(fail) missing.test.ts",
+    ]);
+    expect(exitCode).toBe(1);
+  });
+});
+
+describe.concurrent("an error whose message getter throws", () => {
+  test.each(
+    Object.entries({
+      "an own getter": `Object.defineProperty(new Error("unreadable"), "message", { get() { throw new Error("thrown by the getter"); } })`,
+      "a getter of its class": `new (class extends Error { get message() { return this.details.join(); } })()`,
+    }),
+  )("%s: the tests after it still run", async (_, error) => {
+    const { stdout, stderr, exitCode } = await runFiles({
+      "a.test.ts": `
+        import { afterEach, test } from "bun:test";
+        const ran: string[] = [];
+        let attempts = 0;
+        afterEach(() => void ran.push("afterEach"));
+        test("throws it from a timer", async () => {
+          ran.push("attempt " + ++attempts);
+          if (attempts > 1) throw new Error("of attempt 2");
+          await new Promise(resolve => {
+            setTimeout(() => {
+              setTimeout(resolve);
+              throw ${error};
+            });
+          });
+        }, { retry: 1 });
+        test("fails", () => {
+          ran.push("fails");
+          throw new Error("of the test");
+        });
+        test("passes", () => console.log([...ran, "passes"].join()));
+      `,
+    });
+    expect({
+      stdout: stdout.split(/\r?\n/).filter(line => line && !line.startsWith("bun test ")),
+      results: stderr.match(/^\((pass|fail)\) [\w ]+/gm)?.map(line => line.trimEnd()),
+      exitCode,
+    }).toEqual({
+      stdout: ["attempt 1,afterEach,attempt 2,afterEach,fails,afterEach,passes"],
+      results: ["(fail) throws it from a timer", "(fail) fails", "(pass) passes"],
+      exitCode: 1,
+    });
+  });
+});
+
+test("reports a bunfig [test] root longer than the path buffer like a missing directory", async () => {
+  const root = Buffer.alloc(100_000, "r").toString();
+  using dir = tempDir("bunfig-root-too-long", {
+    "bunfig.toml": `[test]\nroot = "${root}"\n`,
+    "top.test.ts": `import { test } from "bun:test"; test("top", () => {});`,
+  });
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "test"],
+    env: bunEnv,
+    cwd: String(dir),
+    stderr: "pipe",
+  });
+  const [stderr, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
+
+  expect(stderr).toContain("Failed to scan non-existent root directory for tests:");
+  expect(stderr).toContain(root);
+  expect(exitCode).toBe(1);
+});
+
+test("hooks throw in a Worker", async () => {
+  using dir = tempDir("bun-test-hooks-in-worker", {
+    "hooks.test.ts": `
+      import { afterAll, afterEach, onTestFinished, test } from "bun:test";
+      import { isMainThread, parentPort, Worker } from "node:worker_threads";
+      if (isMainThread) {
+        test("starts a Worker", async () => {
+          const worker = new Worker(import.meta.filename);
+          worker.on("message", console.log);
+          await new Promise(resolve => worker.once("exit", resolve));
+        });
+      } else {
+        for (const hook of [afterEach, afterAll, onTestFinished]) {
+          try {
+            hook(() => {});
+          } catch (e) {
+            parentPort.postMessage(e.message);
+          }
+        }
+      }
+    `,
+  });
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "test", "hooks.test.ts"],
+    env: bunEnv,
+    cwd: String(dir),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  expect(stdout).toContain(
+    "Cannot use afterEach() in a Worker.\nCannot use afterAll() in a Worker.\nCannot use onTestFinished() in a Worker.\n",
+  );
+  expect(stderr).toContain(" 1 pass");
+  expect(exitCode).toBe(0);
+});

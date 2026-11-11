@@ -1,0 +1,3127 @@
+import { describe, expect, test } from "bun:test";
+import { bunEnv, bunExe, isASAN, nodeExe, tls } from "harness";
+import { once } from "node:events";
+import http2 from "node:http2";
+import https from "node:https";
+import { join } from "node:path";
+import nodetls from "node:tls";
+import zlib from "node:zlib";
+
+// allowHTTP1: false forces the server to reject anything that didn't
+// negotiate "h2" via ALPN, so these tests only pass when fetch actually
+// speaks HTTP/2 on the wire.
+//
+// Subprocesses pool their h2 connection and are then SIGKILLed at exit, so
+// the server-side TLS socket sees ECONNRESET. http2's tlsClientError handler
+// forwards that to socket.destroy(err) when there's no clientError listener,
+// which surfaces as an unhandled 'error' event in the test process — swallow
+// those on every test server.
+function makeH2Server(
+  opts: http2.SecureServerOptions = {},
+  handler?: (req: http2.Http2ServerRequest, res: http2.Http2ServerResponse) => void,
+) {
+  const server = http2.createSecureServer({ ...tls, allowHTTP1: false, ...opts }, handler);
+  server.on("clientError", () => {});
+  server.on("secureConnection", s => s.on("error", () => {}));
+  return server;
+}
+
+async function withH2Server(
+  handler: (req: http2.Http2ServerRequest, res: http2.Http2ServerResponse) => void,
+  fn: (url: string, server: http2.Http2SecureServer) => Promise<void>,
+) {
+  const server = makeH2Server({}, handler);
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address() as import("node:net").AddressInfo;
+  try {
+    await fn(`https://localhost:${port}`, server);
+  } finally {
+    server.close();
+  }
+}
+
+// --- Raw HTTP/2 frame server -------------------------------------------------
+// Minimal TLS+ALPN(h2) server that speaks the wire format directly so tests
+// can inject frames that a conforming server (nghttp2) would never emit.
+
+function frame(type: number, flags: number, streamId: number, payload: Uint8Array | Buffer = Buffer.alloc(0)) {
+  const buf = Buffer.alloc(9 + payload.length);
+  buf.writeUIntBE(payload.length, 0, 3);
+  buf[3] = type;
+  buf[4] = flags;
+  buf.writeUInt32BE(streamId & 0x7fffffff, 5);
+  Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength).copy(buf, 9);
+  return buf;
+}
+const u32be = (n: number) => {
+  const b = Buffer.alloc(4);
+  b.writeUInt32BE(n >>> 0);
+  return b;
+};
+
+// HPACK static-table indices we need.
+const hpackStatus = (code: 100 | 200 | 204 | 404) =>
+  code === 100
+    ? Buffer.concat([Buffer.from([0x10, 7]), Buffer.from(":status"), Buffer.from([3]), Buffer.from("100")])
+    : Buffer.from([0x80 | { 200: 8, 204: 9, 404: 13 }[code]]);
+// Literal field never-indexed, new name (4-bit prefix 0001 0000): len(name) name len(value) value.
+const hpackLit = (name: string, value: string) =>
+  Buffer.concat([Buffer.from([0x10, name.length]), Buffer.from(name), Buffer.from([value.length]), Buffer.from(value)]);
+
+type RawConn = {
+  socket: nodetls.TLSSocket;
+  settings(): void;
+  headers(streamId: number, block: Buffer, opts?: { endStream?: boolean; endHeaders?: boolean }): void;
+  data(streamId: number, chunk: string | Buffer, endStream?: boolean): void;
+  rst(streamId: number, code: number): void;
+  goaway(lastId: number, code: number): void;
+};
+
+type RawState = {
+  connections: number;
+  rst: Array<{ id: number; code: number }>;
+  /** Called for each PING from the client. The helper never ACKs a PING; a test does it. */
+  onPing?: (conn: RawConn, payload: Buffer) => void;
+  /** Called for each request, before `onStream`. */
+  onRequest?: () => void;
+  /** Resolves once every accepted socket has emitted `close` — i.e. all
+   *  in-flight client frames have been delivered to the `data` handler.
+   *  Tests asserting on server-side capture (`state.rst`) should await this
+   *  instead of racing the subprocess exit. */
+  allClosed: () => Promise<void>;
+};
+
+async function withRawH2Server(
+  onStream: (conn: RawConn, streamId: number, connIndex: number) => void,
+  fn: (url: string, state: RawState) => Promise<void>,
+) {
+  const closed: Promise<unknown>[] = [];
+  const state: RawState = {
+    connections: 0,
+    rst: [],
+    allClosed: () => Promise.all(closed).then(() => {}),
+  };
+  const server = nodetls.createServer({ ...tls, ALPNProtocols: ["h2"] }, socket => {
+    const connIndex = state.connections++;
+    // Track teardown with a promise that resolves on "close" even when the
+    // client tears the connection down abortively (RST → ECONNRESET emits an
+    // "error" first). `once(socket, "close")` would reject in that case,
+    // making allClosed() throw and leaving unhandled rejections behind.
+    closed.push(new Promise(resolve => socket.once("close", resolve)));
+    const conn: RawConn = {
+      socket,
+      settings: () => socket.write(frame(4, 0, 0)),
+      headers: (id, block, o = {}) =>
+        socket.write(frame(1, (o.endHeaders === false ? 0 : 4) | (o.endStream ? 1 : 0), id, block)),
+      data: (id, chunk, end = false) =>
+        socket.write(frame(0, end ? 1 : 0, id, typeof chunk === "string" ? Buffer.from(chunk) : chunk)),
+      rst: (id, code) => socket.write(frame(3, 0, id, u32be(code))),
+      goaway: (lastId, code) => socket.write(frame(7, 0, 0, Buffer.concat([u32be(lastId), u32be(code)]))),
+    };
+    let buf = Buffer.alloc(0);
+    let prefaceSeen = false;
+    socket.on("data", (chunk: Buffer) => {
+      buf = Buffer.concat([buf, chunk]);
+      if (!prefaceSeen) {
+        if (buf.length < 24) return;
+        buf = buf.subarray(24);
+        prefaceSeen = true;
+        conn.settings();
+      }
+      while (buf.length >= 9) {
+        const len = buf.readUIntBE(0, 3);
+        if (buf.length < 9 + len) return;
+        const type = buf[3],
+          flags = buf[4],
+          id = buf.readUInt32BE(5) & 0x7fffffff;
+        const payload = buf.subarray(9, 9 + len);
+        buf = buf.subarray(9 + len);
+        if (type === 4 && !(flags & 1)) socket.write(frame(4, 1, 0)); // ack their SETTINGS
+        if (type === 1) state.onRequest?.();
+        if (type === 1) onStream(conn, id, connIndex); // HEADERS opens a stream
+        if (type === 3) state.rst.push({ id, code: payload.readUInt32BE(0) });
+        if (type === 6 && !(flags & 1)) state.onPing?.(conn, payload);
+      }
+    });
+    socket.on("error", () => {});
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address() as import("node:net").AddressInfo;
+  try {
+    await fn(`https://localhost:${port}`, state);
+  } finally {
+    server.close();
+  }
+}
+
+// Each test spawns a fresh subprocess so the BUN_FEATURE_FLAG_EXPERIMENTAL_HTTP2_CLIENT
+// env var is read at startup. With describe.concurrent + max_concurrency=20 that
+// peaks at ~8GB of debug subprocesses, which under ASAN (~2-3x) OOM-kills the
+// 16GB/0-swap runner; fully serialising under ASAN instead pushes the 50+ spawns
+// past the 3-minute file timeout. Cap live subprocesses to a few under ASAN so
+// describe.concurrent can still overlap them without exhausting memory. Non-ASAN
+// keeps the cap at max_concurrency so the semaphore is a no-op.
+const slotLimit = isASAN ? 4 : 20;
+let live = 0;
+const waiters: Array<() => void> = [];
+async function spawnCapped(options: Bun.SpawnOptions.SpawnOptions<"ignore", "pipe", "pipe"> & { cmd: string[] }) {
+  if (live >= slotLimit) {
+    await new Promise<void>(r => waiters.push(r)); // slot handed off to us, `live` already counts it
+  } else {
+    live++;
+  }
+  const proc = Bun.spawn(options);
+  proc.exited.finally(() => {
+    const next = waiters.shift();
+    if (next)
+      next(); // hand the slot off directly; `live` stays as-is
+    else live--;
+  });
+  return proc;
+}
+
+function spawnFetch(script: string, options: { env?: Record<string, string>; ipc?: () => void } = {}) {
+  return spawnCapped({
+    cmd: [bunExe(), "--no-warnings", "-e", script],
+    env: {
+      ...bunEnv,
+      BUN_FEATURE_FLAG_EXPERIMENTAL_HTTP2_CLIENT: "1",
+      NODE_TLS_REJECT_UNAUTHORIZED: "0",
+      ...options.env,
+    },
+    ipc: options.ipc,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+}
+
+describe.concurrent("fetch() over HTTP/2 (BUN_FEATURE_FLAG_EXPERIMENTAL_HTTP2_CLIENT)", () => {
+  test("GET: status, headers and body round-trip", async () => {
+    await withH2Server(
+      (req, res) => {
+        res.setHeader("x-seen-path", req.url);
+        res.setHeader("x-seen-method", req.method);
+        res.setHeader("x-seen-foo", String(req.headers["x-foo"]));
+        res.setHeader("x-http-version", req.httpVersion);
+        res.writeHead(201, { "content-type": "text/plain" });
+        res.end("hello over h2");
+      },
+      async url => {
+        await using proc = await spawnFetch(`
+          const res = await fetch(${JSON.stringify(url)} + "/hello?x=1", {
+            headers: { "X-Foo": "bar" },
+            tls: { rejectUnauthorized: false },
+          });
+          const body = await res.text();
+          console.log(JSON.stringify({
+            status: res.status,
+            ct: res.headers.get("content-type"),
+            seenPath: res.headers.get("x-seen-path"),
+            seenMethod: res.headers.get("x-seen-method"),
+            seenFoo: res.headers.get("x-seen-foo"),
+            httpVersion: res.headers.get("x-http-version"),
+            body,
+          }));
+        `);
+        const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+        expect(stderr).toBe("");
+        const out = JSON.parse(stdout);
+        expect(out).toEqual({
+          status: 201,
+          ct: "text/plain",
+          seenPath: "/hello?x=1",
+          seenMethod: "GET",
+          seenFoo: "bar",
+          httpVersion: "2.0",
+          body: "hello over h2",
+        });
+        expect(exitCode).toBe(0);
+      },
+    );
+  });
+
+  test("POST: request body is delivered as DATA frames", async () => {
+    await withH2Server(
+      (req, res) => {
+        let body = "";
+        req.setEncoding("utf8");
+        req.on("data", c => (body += c));
+        req.on("end", () => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ got: body, method: req.method }));
+        });
+      },
+      async url => {
+        await using proc = await spawnFetch(`
+          const res = await fetch(${JSON.stringify(url)} + "/echo", {
+            method: "POST",
+            body: "the payload",
+            tls: { rejectUnauthorized: false },
+          });
+          process.stdout.write(await res.text());
+        `);
+        const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+        expect(stderr).toBe("");
+        expect(JSON.parse(stdout)).toEqual({ got: "the payload", method: "POST" });
+        expect(exitCode).toBe(0);
+      },
+    );
+  });
+
+  test("response body larger than one DATA frame", async () => {
+    const big = Buffer.alloc(70_000, "a").toString();
+    await withH2Server(
+      (_req, res) => {
+        res.writeHead(200);
+        res.end(big);
+      },
+      async url => {
+        await using proc = await spawnFetch(`
+          const res = await fetch(${JSON.stringify(url)}, { tls: { rejectUnauthorized: false } });
+          const buf = await res.arrayBuffer();
+          console.log(buf.byteLength);
+        `);
+        const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+        expect(stderr).toBe("");
+        expect(stdout.trim()).toBe(String(big.length));
+        expect(exitCode).toBe(0);
+      },
+    );
+  });
+
+  test("gzip content-encoding is decompressed", async () => {
+    const payload = "compressed body via h2";
+    const gz = zlib.gzipSync(payload);
+    await withH2Server(
+      (_req, res) => {
+        res.writeHead(200, { "content-encoding": "gzip", "content-type": "text/plain" });
+        res.end(gz);
+      },
+      async url => {
+        await using proc = await spawnFetch(`
+          const res = await fetch(${JSON.stringify(url)}, { tls: { rejectUnauthorized: false } });
+          process.stdout.write(await res.text());
+        `);
+        const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+        expect(stderr).toBe("");
+        expect(stdout).toBe(payload);
+        expect(exitCode).toBe(0);
+      },
+    );
+  });
+
+  test("concurrent requests multiplex on one h2 session", async () => {
+    let sessions = 0;
+    const held: [http2.ServerHttp2Stream, string][] = [];
+    const server = makeH2Server();
+    server.on("session", () => sessions++);
+    server.on("stream", (stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders) => {
+      const path = String(headers[":path"]);
+      if (path === "/warmup") {
+        stream.respond({ ":status": 200 });
+        stream.end(path);
+        return;
+      }
+      // Answer only once all 8 streams are open at once.
+      held.push([stream, path]);
+      if (held.length < 8) return;
+      for (const [heldStream, heldPath] of held) {
+        heldStream.respond({ ":status": 200 });
+        heldStream.end(heldPath);
+      }
+    });
+    server.listen(0);
+    await once(server, "listening");
+    const { port } = server.address() as import("node:net").AddressInfo;
+    try {
+      await using proc = await spawnFetch(`
+        const url = "https://localhost:${port}";
+        const opts = { tls: { rejectUnauthorized: false } };
+        // Warmup so the session exists before the concurrent burst.
+        await fetch(url + "/warmup", opts).then(r => r.text());
+        const results = await Promise.all(
+          Array.from({ length: 8 }, (_, i) => fetch(url + "/" + i, opts).then(r => r.text()))
+        );
+        console.log(results.join(","));
+      `);
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stderr).toBe("");
+      expect(stdout.trim()).toBe("/0,/1,/2,/3,/4,/5,/6,/7");
+      expect(exitCode).toBe(0);
+      expect(sessions).toBe(1);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("POST with ReadableStream body streams as raw DATA frames", async () => {
+    let received = "";
+    await withH2Server(
+      (req, res) => {
+        req.setEncoding("utf8");
+        req.on("data", c => (received += c));
+        req.on("end", () => {
+          res.writeHead(200, { "x-len": String(received.length) });
+          res.end(received);
+        });
+      },
+      async url => {
+        await using proc = await spawnFetch(`
+          const chunks = ["alpha-", "bravo-", "charlie-", "delta-", "echo"];
+          const body = new ReadableStream({
+            async pull(ctrl) {
+              for (const c of chunks) {
+                ctrl.enqueue(new TextEncoder().encode(c));
+                await new Promise(r => setTimeout(r, 5));
+              }
+              ctrl.close();
+            },
+          });
+          const res = await fetch("${url}/stream", {
+            method: "POST",
+            body,
+            duplex: "half",
+            tls: { rejectUnauthorized: false },
+          });
+          console.log(res.status, res.headers.get("x-len"), await res.text());
+        `);
+        const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+        expect(stderr).toBe("");
+        expect(stdout.trim()).toBe("200 30 alpha-bravo-charlie-delta-echo");
+        expect(exitCode).toBe(0);
+        // No chunked-encoding artifacts leaked into the framed body.
+        expect(received).toBe("alpha-bravo-charlie-delta-echo");
+      },
+    );
+  });
+
+  test("ReadableStream body that does not match its declared content-length rejects", async () => {
+    await withH2Server(
+      (req, res) => {
+        req.on("error", () => {});
+        req.resume();
+        req.on("end", () => res.end("unreachable"));
+      },
+      async url => {
+        await using proc = await spawnFetch(`
+          for (const declared of ["2", "50"]) {
+            const body = new ReadableStream({
+              start(ctrl) { ctrl.enqueue(new TextEncoder().encode("nr1-nr2")); ctrl.close(); },
+            });
+            const outcome = await fetch("${url}/upload", {
+              method: "POST",
+              body,
+              duplex: "half",
+              headers: { "content-length": declared },
+              tls: { rejectUnauthorized: false },
+            }).then(r => r.status, e => e.code);
+            console.log(declared, outcome);
+          }
+        `);
+        const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+        expect(stderr).toBe("");
+        expect(stdout.trim().split("\n")).toEqual([
+          "2 ERR_HTTP_CONTENT_LENGTH_MISMATCH",
+          "50 ERR_HTTP_CONTENT_LENGTH_MISMATCH",
+        ]);
+        expect(exitCode).toBe(0);
+      },
+    );
+  });
+
+  test("303 on a ReadableStream POST: the follow-up GET carries no framing header from the caller", async () => {
+    await withH2Server(
+      (req, res) => {
+        if (req.url === "/upload") {
+          req.resume();
+          req.on("end", () => {
+            res.writeHead(303, { location: "/target" });
+            res.end();
+          });
+          return;
+        }
+        res.end(
+          JSON.stringify({
+            method: req.method,
+            contentLength: req.headers["content-length"] ?? null,
+            transferEncoding: req.headers["transfer-encoding"] ?? null,
+          }),
+        );
+      },
+      async url => {
+        await using proc = await spawnFetch(`
+          for (const headers of [{ "content-length": "7" }, { "transfer-encoding": "gzip, chunked" }, {}]) {
+            const body = new ReadableStream({
+              start(ctrl) { ctrl.enqueue(new TextEncoder().encode("nr1-nr2")); ctrl.close(); },
+            });
+            const res = await fetch("${url}/upload", {
+              method: "POST",
+              body,
+              duplex: "half",
+              headers,
+              tls: { rejectUnauthorized: false },
+            });
+            console.log(res.status, res.redirected, await res.text());
+          }
+        `);
+        const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+        expect(stderr).toBe("");
+        const followUp = '200 true {"method":"GET","contentLength":null,"transferEncoding":null}';
+        expect(stdout.trim().split("\n")).toEqual([followUp, followUp, followUp]);
+        expect(exitCode).toBe(0);
+      },
+    );
+  });
+
+  test("concurrent ReadableStream uploads route each chunk to its own stream", async () => {
+    // Exercises the async_http_id -> stream index on the client session: each
+    // JS-side body chunk wakes the HTTP thread which must resolve the target
+    // stream without crossing the other 23 in-flight uploads.
+    let sessions = 0;
+    const server = makeH2Server();
+    server.on("session", () => sessions++);
+    server.on("stream", (stream: http2.ServerHttp2Stream) => {
+      const chunks: Buffer[] = [];
+      stream.on("data", (c: Buffer) => chunks.push(c));
+      stream.on("end", () => {
+        stream.respond({ ":status": 200 });
+        stream.end(Buffer.concat(chunks));
+      });
+    });
+    server.listen(0);
+    await once(server, "listening");
+    const { port } = server.address() as import("node:net").AddressInfo;
+    try {
+      await using proc = await spawnFetch(`
+        const url = "https://localhost:${port}/";
+        const opts = { tls: { rejectUnauthorized: false } };
+        const N = 24, M = 24;
+        // Warmup so the h2 session exists and SETTINGS have been exchanged
+        // before the concurrent burst; otherwise requests can fan out to
+        // additional connections while the first is still handshaking.
+        await fetch(url, { ...opts, method: "POST", body: "warmup" }).then(r => r.text());
+        const results = await Promise.all(
+          Array.from({ length: N }, (_, i) => {
+            let k = 0;
+            const body = new ReadableStream({
+              pull(ctrl) {
+                if (k < M) {
+                  ctrl.enqueue(new TextEncoder().encode(i + ":" + k + ","));
+                  k++;
+                } else ctrl.close();
+              },
+            });
+            return fetch(url, { ...opts, method: "POST", body, duplex: "half" }).then(r => r.text());
+          }),
+        );
+        const bad = results
+          .map((got, i) => {
+            const want = Array.from({ length: M }, (_, k) => i + ":" + k + ",").join("");
+            return got === want ? null : i + " got=" + JSON.stringify(got);
+          })
+          .filter(Boolean);
+        if (bad.length) throw new Error("mismatch: " + bad.join(" | "));
+        console.log("ok", results.length);
+      `);
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stderr).toBe("");
+      expect(stdout.trim()).toBe("ok 24");
+      expect(exitCode).toBe(0);
+      expect(sessions).toBe(1);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("POST with ReadableStream body larger than initial send window", async () => {
+    await withH2Server(
+      (req, res) => {
+        let total = 0;
+        req.on("data", c => (total += c.length));
+        req.on("end", () => {
+          res.writeHead(200);
+          res.end(String(total));
+        });
+      },
+      async url => {
+        await using proc = await spawnFetch(`
+          // 256 KiB > 64 KiB default INITIAL_WINDOW_SIZE: requires the
+          // client to honour the server's WINDOW_UPDATE before continuing.
+          const buf = new Uint8Array(256 * 1024).fill(0x61);
+          const body = new ReadableStream({
+            start(ctrl) {
+              for (let i = 0; i < 4; i++) ctrl.enqueue(buf.subarray(i * 65536, (i + 1) * 65536));
+              ctrl.close();
+            },
+          });
+          const res = await fetch("${url}/big", {
+            method: "POST",
+            body,
+            duplex: "half",
+            tls: { rejectUnauthorized: false },
+          });
+          console.log(res.status, await res.text());
+        `);
+        const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+        expect(stderr).toBe("");
+        expect(stdout.trim()).toBe("200 262144");
+        expect(exitCode).toBe(0);
+      },
+    );
+  });
+
+  test("upload larger than the write-buffer high-water mark when the peer window never runs out", async () => {
+    // The peer advertises a 1 MiB stream window and a 16 MiB connection
+    // window, so flow control never pauses a 2 MB body; the client must keep
+    // framing after a flush that fully drains instead of waiting for a
+    // writable event that never comes.
+    const received = new Map<number, number>();
+    const server = nodetls.createServer({ ...tls, ALPNProtocols: ["h2"] }, socket => {
+      let buf = Buffer.alloc(0);
+      let prefaceSeen = false;
+      socket.on("error", () => {});
+      socket.on("data", (chunk: Buffer) => {
+        buf = Buffer.concat([buf, chunk]);
+        if (!prefaceSeen) {
+          if (buf.length < 24) return;
+          buf = buf.subarray(24);
+          prefaceSeen = true;
+          // SETTINGS_INITIAL_WINDOW_SIZE (0x4) = 1 MiB, then open the connection window by 16 MiB.
+          socket.write(frame(4, 0, 0, Buffer.concat([Buffer.from([0, 4]), u32be(1 << 20)])));
+          socket.write(frame(8, 0, 0, u32be(1 << 24)));
+        }
+        while (buf.length >= 9) {
+          const len = buf.readUIntBE(0, 3);
+          if (buf.length < 9 + len) return;
+          const type = buf[3],
+            flags = buf[4],
+            id = buf.readUInt32BE(5) & 0x7fffffff;
+          buf = buf.subarray(9 + len);
+          if (type === 4 && !(flags & 1)) socket.write(frame(4, 1, 0));
+          if (type === 0) {
+            received.set(id, (received.get(id) ?? 0) + len);
+            // Top the stream window back up in 1 MiB steps so it is never the limiter.
+            if ((received.get(id)! & ((1 << 20) - 1)) < len) socket.write(frame(8, 0, id, u32be(1 << 20)));
+            if (flags & 1) {
+              socket.write(frame(1, 4, id, hpackStatus(200)));
+              socket.write(frame(0, 1, id, Buffer.from(String(received.get(id)))));
+            }
+          }
+        }
+      });
+    });
+    server.listen(0);
+    await once(server, "listening");
+    const { port } = server.address() as import("node:net").AddressInfo;
+    try {
+      await using proc = await spawnFetch(`
+        const opts = { method: "POST", tls: { rejectUnauthorized: false } };
+        const one = await fetch("https://localhost:${port}/", { ...opts, body: new Blob([new Uint8Array(2_000_000)]) });
+        console.log(one.status, await one.text());
+        const many = await Promise.all(
+          Array.from({ length: 4 }, () =>
+            fetch("https://localhost:${port}/", { ...opts, body: new Blob([new Uint8Array(512 * 1024)]) }).then(r => r.text()),
+          ),
+        );
+        console.log(many.join(","));
+      `);
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stderr).toBe("");
+      expect(stdout.trim()).toBe("200 2000000\n524288,524288,524288,524288");
+      expect(exitCode).toBe(0);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("cold-start: parallel requests coalesce onto one TLS connect", async () => {
+    let sessions = 0;
+    const server = makeH2Server();
+    server.on("session", () => sessions++);
+    server.on("stream", (stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders) => {
+      stream.respond({ ":status": 200 });
+      stream.end(String(headers[":path"]));
+    });
+    server.listen(0);
+    await once(server, "listening");
+    const { port } = server.address() as import("node:net").AddressInfo;
+    try {
+      await using proc = await spawnFetch(`
+        const url = "https://localhost:${port}";
+        const opts = { tls: { rejectUnauthorized: false } };
+        // No warmup: all 12 race the same fresh handshake.
+        const results = await Promise.all(
+          Array.from({ length: 12 }, (_, i) => fetch(url + "/" + i, opts).then(r => r.text()))
+        );
+        console.log(results.sort().join(","));
+      `);
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stderr).toBe("");
+      expect(stdout.trim()).toBe("/0,/1,/10,/11,/2,/3,/4,/5,/6,/7,/8,/9");
+      expect(exitCode).toBe(0);
+      expect(sessions).toBe(1);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("abort sends RST_STREAM; siblings on the session survive", async () => {
+    let sessions = 0;
+    const { promise: slowClosed, resolve: resolveSlowClosed } = Promise.withResolvers<number>();
+    const server = makeH2Server();
+    server.on("session", () => sessions++);
+    server.on("stream", (stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders) => {
+      if (headers[":path"] === "/slow") {
+        stream.on("close", () => resolveSlowClosed(stream.rstCode));
+        // never respond; client will abort
+      } else {
+        stream.respond({ ":status": 200 });
+        stream.end("survivor");
+      }
+    });
+    server.listen(0);
+    await once(server, "listening");
+    const { port } = server.address() as import("node:net").AddressInfo;
+    try {
+      await using proc = await spawnFetch(`
+        const url = "https://localhost:${port}";
+        const opts = { tls: { rejectUnauthorized: false } };
+        // Warmup so /slow, /fast, /after share one session.
+        await fetch(url + "/warmup", opts).then(r => r.text());
+        const ac = new AbortController();
+        const slow = fetch(url + "/slow", { ...opts, signal: ac.signal }).catch(e => "aborted:" + e.name);
+        const fast = fetch(url + "/fast", opts).then(r => r.text());
+        await fast;
+        ac.abort();
+        await slow;
+        const after = await fetch(url + "/after", opts).then(r => r.text());
+        console.log([await slow, await fast, after].join(","));
+      `);
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stderr).toBe("");
+      expect(stdout.trim()).toBe("aborted:AbortError,survivor,survivor");
+      expect(exitCode).toBe(0);
+      // Aborting one stream must not tear down the connection: all four
+      // requests rode one session, and /slow's stream closed (RST_STREAM)
+      // while /fast and /after on the same session completed.
+      expect(sessions).toBe(1);
+      await slowClosed;
+    } finally {
+      server.close();
+    }
+  });
+
+  test("server SETTINGS_MAX_CONCURRENT_STREAMS=1 is honoured per session", async () => {
+    const perSessionMax: number[] = [];
+    const server = makeH2Server({ settings: { maxConcurrentStreams: 1 } });
+    server.on("session", s => {
+      const idx = perSessionMax.push(0) - 1;
+      let open = 0;
+      s.on("stream", stream => {
+        open++;
+        perSessionMax[idx] = Math.max(perSessionMax[idx], open);
+        stream.on("close", () => open--);
+        setTimeout(() => {
+          stream.respond({ ":status": 200 });
+          stream.end("x");
+        }, 30);
+      });
+    });
+    server.listen(0);
+    await once(server, "listening");
+    const { port } = server.address() as import("node:net").AddressInfo;
+    try {
+      await using proc = await spawnFetch(`
+        const url = "https://localhost:${port}";
+        const opts = { tls: { rejectUnauthorized: false } };
+        // First request alone so the server's SETTINGS arrives before the
+        // burst, then fire 4 concurrently against the cap.
+        await fetch(url, opts).then(r => r.text());
+        await Promise.all(Array.from({ length: 4 }, () => fetch(url, opts).then(r => r.text())));
+        console.log("ok");
+      `);
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stderr).toBe("");
+      expect(stdout.trim()).toBe("ok");
+      expect(exitCode).toBe(0);
+      // The cap is per-connection: no session may ever see >1 open stream.
+      // Excess concurrent requests fan out to additional connections.
+      for (const max of perSessionMax) expect(max).toBe(1);
+      expect(perSessionMax.length).toBeGreaterThanOrEqual(1);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("keep-alive: sequential requests reuse one h2 session", async () => {
+    let sessions = 0;
+    const seen: number[] = [];
+    const server = makeH2Server();
+    server.on("session", () => sessions++);
+    server.on("stream", (stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders) => {
+      seen.push(stream.id!);
+      stream.respond({ ":status": 200, "content-type": "text/plain" });
+      stream.end(`req=${headers[":path"]}`);
+    });
+    server.listen(0);
+    await once(server, "listening");
+    const { port } = server.address() as import("node:net").AddressInfo;
+    try {
+      await using proc = await spawnFetch(`
+        const url = "https://localhost:${port}";
+        const opts = { tls: { rejectUnauthorized: false } };
+        for (let i = 0; i < 4; i++) {
+          const r = await fetch(url + "/" + i, opts);
+          console.log(await r.text());
+        }
+      `);
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stderr).toBe("");
+      expect(stdout.trim().split("\n")).toEqual(["req=/0", "req=/1", "req=/2", "req=/3"]);
+      expect(exitCode).toBe(0);
+      expect(sessions).toBe(1);
+      // stream ids must be fresh odd numbers on the reused session
+      expect(seen).toEqual([1, 3, 5, 7]);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("GOAWAY after a request: next request reconnects", async () => {
+    let sessions = 0;
+    const server = makeH2Server();
+    server.on("session", () => sessions++);
+    server.on("stream", (stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders) => {
+      const session = stream.session!;
+      stream.respond({ ":status": 200 });
+      stream.end("ok");
+      if (headers[":path"] === "/first") {
+        session.goaway(http2.constants.NGHTTP2_NO_ERROR, stream.id);
+      }
+    });
+    server.listen(0);
+    await once(server, "listening");
+    const { port } = server.address() as import("node:net").AddressInfo;
+    try {
+      await using proc = await spawnFetch(`
+        const url = "https://localhost:${port}";
+        const opts = { tls: { rejectUnauthorized: false } };
+        const a = await (await fetch(url + "/first", opts)).text();
+        await Bun.sleep(50);
+        const b = await (await fetch(url + "/second", opts)).text();
+        console.log(a + "," + b);
+      `);
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stderr).toBe("");
+      expect(stdout.trim()).toBe("ok,ok");
+      expect(exitCode).toBe(0);
+      expect(sessions).toBe(2);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("response body larger than initial window triggers WINDOW_UPDATE", async () => {
+    const big = Buffer.alloc(20 * 1024 * 1024, 0x61);
+    await withH2Server(
+      (_req, res) => {
+        res.writeHead(200);
+        res.end(big);
+      },
+      async url => {
+        await using proc = await spawnFetch(`
+          const res = await fetch(${JSON.stringify(url)}, { tls: { rejectUnauthorized: false } });
+          const buf = new Uint8Array(await res.arrayBuffer());
+          let ok = buf.length === ${big.length};
+          for (let i = 0; ok && i < buf.length; i += 4096) ok = buf[i] === 0x61;
+          console.log(ok ? "ok" : "bad:" + buf.length);
+        `);
+        const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+        expect(stderr).toBe("");
+        expect(stdout.trim()).toBe("ok");
+        expect(exitCode).toBe(0);
+      },
+    );
+  });
+
+  test("response trailers are consumed without breaking the body", async () => {
+    const server = makeH2Server();
+    server.on("stream", (stream: http2.ServerHttp2Stream) => {
+      stream.respond({ ":status": 200, "content-type": "text/plain" }, { waitForTrailers: true });
+      stream.on("wantTrailers", () => stream.sendTrailers({ "x-trailer": "hello" }));
+      stream.end("body-text");
+    });
+    server.listen(0);
+    await once(server, "listening");
+    const { port } = server.address() as import("node:net").AddressInfo;
+    try {
+      await using proc = await spawnFetch(`
+        const r = await fetch("https://localhost:${port}", { tls: { rejectUnauthorized: false } });
+        console.log(r.status, await r.text());
+      `);
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stderr).toBe("");
+      expect(stdout.trim()).toBe("200 body-text");
+      expect(exitCode).toBe(0);
+    } finally {
+      server.close();
+    }
+  });
+
+  // Bun's node:http2 server currently emits an empty DATA+END_STREAM for
+  // stream.close(code) rather than RST_STREAM, so this also covers the
+  // RFC 9113 §8.1 "DATA before HEADERS" stream-error case.
+  test("server-reset stream fails that request; sibling on the session survives", async () => {
+    let sessions = 0;
+    const server = makeH2Server();
+    server.on("session", () => sessions++);
+    server.on("stream", (stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders) => {
+      stream.on("error", () => {});
+      if (headers[":path"] === "/bad") {
+        stream.close(http2.constants.NGHTTP2_PROTOCOL_ERROR);
+        return;
+      }
+      setTimeout(() => {
+        stream.respond({ ":status": 200 });
+        stream.end("ok");
+      }, 50);
+    });
+    server.listen(0);
+    await once(server, "listening");
+    const { port } = server.address() as import("node:net").AddressInfo;
+    try {
+      await using proc = await spawnFetch(`
+        const url = "https://localhost:${port}";
+        const opts = { tls: { rejectUnauthorized: false } };
+        const [good, bad] = await Promise.allSettled([
+          fetch(url + "/good", opts).then(r => r.text()),
+          fetch(url + "/bad", opts).then(r => r.text()),
+        ]);
+        console.log(good.status, good.value, bad.status);
+      `);
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stderr).toBe("");
+      expect(stdout.trim()).toBe("fulfilled ok rejected");
+      expect(exitCode).toBe(0);
+      expect(sessions).toBe(1);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("connection-specific request headers are stripped before HPACK", async () => {
+    let seen: string[] = [];
+    const server = makeH2Server();
+    server.on("stream", (stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders) => {
+      seen = Object.keys(headers).filter(k => !k.startsWith(":"));
+      stream.respond({ ":status": 200 });
+      stream.end();
+    });
+    server.listen(0);
+    await once(server, "listening");
+    const { port } = server.address() as import("node:net").AddressInfo;
+    try {
+      await using proc = await spawnFetch(`
+        const r = await fetch("https://localhost:${port}", {
+          headers: {
+            "x-keep": "me",
+            "Connection": "keep-alive",
+            "Keep-Alive": "timeout=5",
+            "Proxy-Connection": "x",
+            "Transfer-Encoding": "chunked",
+            "Upgrade": "ws",
+          },
+          tls: { rejectUnauthorized: false },
+        });
+        console.log(r.status);
+      `);
+      const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stdout.trim()).toBe("200");
+      expect(exitCode).toBe(0);
+      expect(seen).toContain("x-keep");
+      for (const bad of ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"]) {
+        expect(seen).not.toContain(bad);
+      }
+    } finally {
+      server.close();
+    }
+  });
+
+  test("multiple Set-Cookie response headers survive HPACK decode", async () => {
+    const server = makeH2Server();
+    server.on("stream", (stream: http2.ServerHttp2Stream) => {
+      stream.respond({ ":status": 200, "set-cookie": ["a=b", "c=d", "e=f"] });
+      stream.end();
+    });
+    server.listen(0);
+    await once(server, "listening");
+    const { port } = server.address() as import("node:net").AddressInfo;
+    try {
+      await using proc = await spawnFetch(`
+        const r = await fetch("https://localhost:${port}", { tls: { rejectUnauthorized: false } });
+        console.log(JSON.stringify(r.headers.getSetCookie()));
+      `);
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stderr).toBe("");
+      expect(stdout.trim()).toBe(`["a=b","c=d","e=f"]`);
+      expect(exitCode).toBe(0);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("a 204, a 205 and the response to a HEAD request have a null body", async () => {
+    const server = makeH2Server();
+    server.on("stream", (stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders) => {
+      stream.on("error", () => {});
+      if (headers[":method"] === "HEAD") {
+        stream.respond({ ":status": 200, "content-length": "5" }, { endStream: true });
+      } else if (headers[":path"] === "/204") {
+        stream.respond({ ":status": 204 }, { endStream: true });
+      } else {
+        // RFC 9110 section 15.3.6 forbids content on a 205. A server that sends
+        // some anyway must not get it into the body.
+        stream.respond({ ":status": 205 });
+        stream.end("hello");
+      }
+    });
+    server.listen(0);
+    await once(server, "listening");
+    const { port } = server.address() as import("node:net").AddressInfo;
+    try {
+      await using proc = await spawnFetch(`
+        const results = [];
+        for (const [path, init] of [["/204", {}], ["/205", {}], ["/head", { method: "HEAD" }]]) {
+          const r = await fetch("https://localhost:${port}" + path, { ...init, tls: { rejectUnauthorized: false } });
+          results.push({
+            status: r.status,
+            contentLength: r.headers.get("content-length"),
+            body: r.body,
+            text: await r.text(),
+            bodyUsed: r.bodyUsed,
+            cloneBody: r.clone().body,
+          });
+        }
+        console.log(JSON.stringify(results));
+      `);
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stderr).toBe("");
+      expect(JSON.parse(stdout)).toEqual([
+        { status: 204, contentLength: null, body: null, text: "", bodyUsed: false, cloneBody: null },
+        { status: 205, contentLength: null, body: null, text: "", bodyUsed: false, cloneBody: null },
+        { status: 200, contentLength: "5", body: null, text: "", bodyUsed: false, cloneBody: null },
+      ]);
+      expect(exitCode).toBe(0);
+    } finally {
+      server.close();
+    }
+  });
+
+  describe("raw frame server", () => {
+    test("REFUSED_STREAM is transparently retried on the same connection", async () => {
+      let attempts = 0;
+      await withRawH2Server(
+        (conn, id) => {
+          attempts++;
+          if (attempts === 1) return conn.rst(id, http2.constants.NGHTTP2_REFUSED_STREAM);
+          conn.headers(id, hpackStatus(204), { endStream: true });
+        },
+        async (url, state) => {
+          await using proc = await spawnFetch(`
+            const r = await fetch("${url}", { tls: { rejectUnauthorized: false } });
+            console.log(r.status);
+          `);
+          const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stderr).toBe("");
+          expect(stdout.trim()).toBe("204");
+          expect(exitCode).toBe(0);
+          expect(attempts).toBe(2);
+          expect(state.connections).toBe(1);
+        },
+      );
+    });
+
+    test("RST_STREAM(NO_ERROR) after a complete response keeps the response; a later RST is ignored", async () => {
+      // RFC 9113 §8.1: the server may finish the response before the request
+      // body and reset with NO_ERROR; DATA we had in flight can then draw a
+      // second RST_STREAM(STREAM_CLOSED), which must not clobber the result.
+      await withRawH2Server(
+        (conn, id) => {
+          conn.headers(id, hpackStatus(200));
+          conn.data(id, "early", true);
+          conn.rst(id, http2.constants.NGHTTP2_NO_ERROR);
+          conn.rst(id, http2.constants.NGHTTP2_STREAM_CLOSED);
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            const body = new ReadableStream({ start(c) { c.enqueue(new Uint8Array(1024)); /* never closes */ } });
+            const r = await fetch("${url}", { method: "POST", body, duplex: "half", tls: { rejectUnauthorized: false } });
+            console.log(r.status, await r.text());
+          `);
+          const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stderr).toBe("");
+          expect(stdout.trim()).toBe("200 early");
+          expect(exitCode).toBe(0);
+        },
+      );
+    });
+
+    test("REFUSED_STREAM gives up after max retries", async () => {
+      let attempts = 0;
+      await withRawH2Server(
+        (conn, id) => {
+          attempts++;
+          conn.rst(id, http2.constants.NGHTTP2_REFUSED_STREAM);
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            try { await fetch("${url}", { tls: { rejectUnauthorized: false } }); console.log("ok"); }
+            catch (e) { console.log("rejected", String(e).includes("Refused")); }
+          `);
+          const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stdout.trim()).toBe("rejected true");
+          expect(exitCode).toBe(0);
+          // initial + 5 retries
+          expect(attempts).toBe(6);
+        },
+      );
+    });
+
+    test("RST_STREAM PROTOCOL_ERROR is not retried", async () => {
+      let attempts = 0;
+      await withRawH2Server(
+        (conn, id) => {
+          attempts++;
+          conn.rst(id, http2.constants.NGHTTP2_PROTOCOL_ERROR);
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            try { await fetch("${url}", { tls: { rejectUnauthorized: false } }); console.log("ok"); }
+            catch (e) { console.log("rejected"); }
+          `);
+          const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stdout.trim()).toBe("rejected");
+          expect(exitCode).toBe(0);
+          expect(attempts).toBe(1);
+        },
+      );
+    });
+
+    test("graceful GOAWAY past our id retries on a fresh connection", async () => {
+      await withRawH2Server(
+        (conn, id, connIndex) => {
+          if (connIndex === 0) {
+            // First connection: refuse via GOAWAY(NO_ERROR, lastId=0).
+            conn.goaway(0, 0);
+            conn.socket.end();
+            return;
+          }
+          conn.headers(id, hpackStatus(200), { endStream: false });
+          conn.data(id, "second-conn", true);
+        },
+        async (url, state) => {
+          await using proc = await spawnFetch(`
+            const r = await fetch("${url}", { tls: { rejectUnauthorized: false } });
+            console.log(r.status, await r.text());
+          `);
+          const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stderr).toBe("");
+          expect(stdout.trim()).toBe("200 second-conn");
+          expect(exitCode).toBe(0);
+          expect(state.connections).toBe(2);
+        },
+      );
+    });
+
+    test("REFUSED_STREAM with a streaming body errors instead of retrying", async () => {
+      let attempts = 0;
+      await withRawH2Server(
+        (conn, id) => {
+          attempts++;
+          conn.rst(id, http2.constants.NGHTTP2_REFUSED_STREAM);
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            const body = new ReadableStream({ start(c) { c.enqueue(new Uint8Array([1,2,3])); c.close(); } });
+            try {
+              await fetch("${url}", { method: "POST", body, duplex: "half", tls: { rejectUnauthorized: false } });
+              console.log("ok");
+            } catch (e) { console.log("rejected"); }
+          `);
+          const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stdout.trim()).toBe("rejected");
+          expect(exitCode).toBe(0);
+          expect(attempts).toBe(1);
+        },
+      );
+    });
+
+    test("padded DATA: pad bytes are stripped and credited against flow control", async () => {
+      await withRawH2Server(
+        (conn, id) => {
+          conn.headers(id, hpackStatus(200));
+          // PADDED flag = 0x8; payload = padLen(1) + body + pad zeros.
+          const body = Buffer.from("padded-body");
+          const padLen = 200;
+          const payload = Buffer.concat([Buffer.from([padLen]), body, Buffer.alloc(padLen)]);
+          conn.socket.write(frame(0, 0x8 | 0x1, id, payload));
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            const r = await fetch("${url}", { tls: { rejectUnauthorized: false } });
+            console.log(r.status, await r.text());
+          `);
+          const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stderr).toBe("");
+          expect(stdout.trim()).toBe("200 padded-body");
+          expect(exitCode).toBe(0);
+        },
+      );
+    });
+
+    test("1xx informational HEADERS are skipped, final response delivered", async () => {
+      await withRawH2Server(
+        (conn, id) => {
+          // Single write so 100 and 200 land in the same onData pass; HPACK
+          // must decode both in order.
+          conn.socket.write(
+            Buffer.concat([
+              frame(1, 4, id, hpackStatus(100)),
+              frame(1, 4, id, Buffer.concat([hpackStatus(200), hpackLit("x-after", "100")])),
+              frame(0, 1, id, Buffer.from("final")),
+            ]),
+          );
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            const r = await fetch("${url}", { tls: { rejectUnauthorized: false } });
+            console.log(r.status, r.headers.get("x-after"), await r.text());
+          `);
+          const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stderr).toBe("");
+          expect(stdout.trim()).toBe("200 100 final");
+          expect(exitCode).toBe(0);
+        },
+      );
+    });
+
+    test("1xx HEADERS with END_STREAM is a stream PROTOCOL_ERROR (RFC 9113 §8.1)", async () => {
+      await withRawH2Server(
+        (conn, id) => conn.headers(id, hpackStatus(100), { endStream: true }),
+        async url => {
+          await using proc = await spawnFetch(`
+            try {
+              await fetch("${url}", { tls: { rejectUnauthorized: false } });
+              console.log("resolved");
+            } catch (e) { console.log("rejected", e?.code ?? e?.name); }
+          `);
+          const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stderr).toBe("");
+          expect(stdout.trim()).toBe("rejected HTTP2ProtocolError");
+          expect(exitCode).toBe(0);
+        },
+      );
+    });
+
+    test("DATA after only a 1xx HEADERS is a stream PROTOCOL_ERROR (RFC 9113 §8.1)", async () => {
+      await withRawH2Server(
+        (conn, id) => {
+          conn.socket.write(Buffer.concat([frame(1, 4, id, hpackStatus(100)), frame(0, 1, id, Buffer.from("body"))]));
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            try {
+              await fetch("${url}", { tls: { rejectUnauthorized: false } });
+              console.log("resolved");
+            } catch (e) { console.log("rejected", e?.code ?? e?.name); }
+          `);
+          const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stderr).toBe("");
+          expect(stdout.trim()).toBe("rejected HTTP2ProtocolError");
+          expect(exitCode).toBe(0);
+        },
+      );
+    });
+
+    test("response + trailers in a single packet keep HPACK in sync", async () => {
+      await withRawH2Server(
+        (conn, id) => {
+          conn.socket.write(
+            Buffer.concat([
+              frame(1, 4, id, Buffer.concat([hpackStatus(200), hpackLit("x-real", "yes")])),
+              frame(0, 0, id, Buffer.from("body")),
+              frame(1, 4 | 1, id, hpackLit("x-trailer", "ignored")),
+            ]),
+          );
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            const r = await fetch("${url}", { tls: { rejectUnauthorized: false } });
+            console.log(r.status, r.headers.get("x-real"), await r.text());
+          `);
+          const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stderr).toBe("");
+          expect(stdout.trim()).toBe("200 yes body");
+          expect(exitCode).toBe(0);
+        },
+      );
+    });
+
+    test("Expect: 100-continue withholds the body until 100 arrives", async () => {
+      const seen: { id: number; type: number; len: number }[] = [];
+      const server = nodetls.createServer({ ...tls, ALPNProtocols: ["h2"] }, socket => {
+        let buf = Buffer.alloc(0);
+        let prefaceSeen = false;
+        let sent100 = false;
+        socket.on("data", (chunk: Buffer) => {
+          buf = Buffer.concat([buf, chunk]);
+          if (!prefaceSeen) {
+            if (buf.length < 24) return;
+            buf = buf.subarray(24);
+            prefaceSeen = true;
+            socket.write(frame(4, 0, 0));
+          }
+          while (buf.length >= 9) {
+            const len = buf.readUIntBE(0, 3);
+            if (buf.length < 9 + len) return;
+            const type = buf[3],
+              flags = buf[4],
+              id = buf.readUInt32BE(5) & 0x7fffffff;
+            buf = buf.subarray(9 + len);
+            if (id !== 0) seen.push({ id, type, len });
+            if (type === 4 && !(flags & 1)) socket.write(frame(4, 1, 0));
+            if (type === 1 && !sent100) {
+              sent100 = true;
+              // Prove no DATA preceded the 100 by responding only after a tick.
+              setTimeout(() => socket.write(frame(1, 4, id, hpackStatus(100))), 20);
+            }
+            if (type === 0 && flags & 1) {
+              socket.write(frame(1, 4, id, hpackStatus(200)));
+              socket.write(frame(0, 1, id, Buffer.from("got-body")));
+            }
+          }
+        });
+        socket.on("error", () => {});
+      });
+      server.listen(0);
+      await once(server, "listening");
+      const { port } = server.address() as import("node:net").AddressInfo;
+      try {
+        await using proc = await spawnFetch(`
+          const r = await fetch("https://localhost:${port}", {
+            method: "POST",
+            headers: { Expect: "100-continue" },
+            body: "twenty-chars-body!!!",
+            tls: { rejectUnauthorized: false },
+          });
+          console.log(r.status, await r.text());
+        `);
+        const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+        expect(stderr).toBe("");
+        expect(stdout.trim()).toBe("200 got-body");
+        expect(exitCode).toBe(0);
+        // First per-stream frame must be HEADERS; no DATA until after the 100.
+        expect(seen[0].type).toBe(1);
+        const firstData = seen.findIndex(f => f.type === 0);
+        expect(firstData).toBeGreaterThan(0);
+        expect(seen[firstData].len).toBe(20);
+      } finally {
+        server.close();
+      }
+    });
+
+    test("Expect: 100-continue with final status before 100 skips body upload", async () => {
+      let dataBytes = 0;
+      await withRawH2Server(
+        (conn, id) => {
+          // Reject immediately without 100; client should half-close with
+          // an empty DATA+END_STREAM rather than uploading the body.
+          conn.headers(id, hpackStatus(404), { endStream: true });
+          conn.socket.on("data", (chunk: Buffer) => {
+            // crude: count any DATA frame payloads on this socket after reject
+            let b = chunk;
+            while (b.length >= 9) {
+              const len = b.readUIntBE(0, 3);
+              if (b[3] === 0 && (b.readUInt32BE(5) & 0x7fffffff) === id) dataBytes += len;
+              b = b.subarray(9 + len);
+            }
+          });
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            const r = await fetch("${url}", {
+              method: "POST",
+              headers: { Expect: "100-continue" },
+              body: Buffer.alloc(50000, "x").toString(),
+              tls: { rejectUnauthorized: false },
+            });
+            console.log(r.status);
+          `);
+          const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stdout.trim()).toBe("404");
+          expect(exitCode).toBe(0);
+          // Body was withheld; only the empty END_STREAM DATA frame allowed.
+          expect(dataBytes).toBe(0);
+        },
+      );
+    });
+
+    test("Content-Length / DATA mismatch rejects", async () => {
+      await withRawH2Server(
+        (conn, id) => {
+          conn.headers(id, Buffer.concat([hpackStatus(200), hpackLit("content-length", "42")]));
+          conn.data(id, "short", true);
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            try {
+              const r = await fetch("${url}", { tls: { rejectUnauthorized: false } });
+              await r.text();
+              console.log("ok");
+            } catch (e) { console.log("rejected", String(e).includes("ContentLength")); }
+          `);
+          const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stdout.trim()).toBe("rejected true");
+          expect(exitCode).toBe(0);
+        },
+      );
+    });
+
+    test("Content-Length with END_STREAM on HEADERS and zero DATA rejects", async () => {
+      // RFC 9113 §8.1.1: declared length must equal sum of DATA payloads even
+      // when that sum is zero. Previously this hit the early-finish branch
+      // and resolved with an empty body.
+      await withRawH2Server(
+        (conn, id) => {
+          conn.headers(id, Buffer.concat([hpackStatus(200), hpackLit("content-length", "42")]), { endStream: true });
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            try {
+              const r = await fetch("${url}", { tls: { rejectUnauthorized: false } });
+              console.log("ok", r.status, (await r.text()).length);
+            } catch (e) { console.log("rejected", String(e).includes("ContentLength")); }
+          `);
+          const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stdout.trim()).toBe("rejected true");
+          expect(exitCode).toBe(0);
+        },
+      );
+    });
+
+    test("response missing :status pseudo-header rejects cleanly", async () => {
+      await withRawH2Server(
+        (conn, id) => {
+          conn.headers(id, hpackLit("content-type", "text/plain"), { endStream: true });
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            try { await fetch("${url}", { tls: { rejectUnauthorized: false } }); console.log("ok"); }
+            catch (e) { console.log("rejected"); }
+          `);
+          const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stdout.trim()).toBe("rejected");
+          expect(exitCode).toBe(0);
+        },
+      );
+    });
+
+    test("Content-Length satisfied before END_STREAM doesn't dereference a freed client", async () => {
+      // Server sends body in one DATA frame without END_STREAM, then a
+      // separate empty DATA(END_STREAM). The first frame fully satisfies
+      // Content-Length, so progressUpdate fires and the JS callback frees
+      // the AsyncHTTP; the second frame must not touch a stale client ptr.
+      await withRawH2Server(
+        (conn, id) => {
+          conn.headers(id, Buffer.concat([hpackStatus(200), hpackLit("content-length", "5")]));
+          conn.data(id, "hello", false);
+          // brief gap so the two frames hit separate onData calls
+          setTimeout(() => conn.data(id, "", true), 30);
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            const r = await fetch("${url}", { tls: { rejectUnauthorized: false } });
+            console.log(r.status, await r.text());
+            await Bun.sleep(80);
+            console.log("survived");
+          `);
+          const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stdout.trim()).toBe("200 hello\nsurvived");
+          expect(exitCode).toBe(0);
+        },
+      );
+    });
+
+    test("SETTINGS_MAX_FRAME_SIZE below 16384 is rejected as a connection error", async () => {
+      // RFC 9113 §6.5.2: values outside [16384, 2^24-1] are PROTOCOL_ERROR.
+      // Without the lower bound a MAX_FRAME_SIZE of 0 made writeHeaderBlock
+      // loop forever emitting zero-length frames; with it the connection
+      // should fail promptly.
+      await withRawH2Server(
+        (conn, id) => {
+          conn.socket.write(frame(4, 0, 0, Buffer.concat([Buffer.from([0, 5]), u32be(0)])));
+          conn.headers(id, hpackStatus(200), { endStream: true });
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            try {
+              const r = await fetch("${url}", { tls: { rejectUnauthorized: false } });
+              console.log("status", r.status);
+            } catch (e) { console.log("rejected", e.code); }
+          `);
+          const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stdout.trim()).toBe("rejected HTTP2ProtocolError");
+          expect(exitCode).toBe(0);
+        },
+      );
+    });
+
+    test("SETTINGS_INITIAL_WINDOW_SIZE above 2^31-1 is a connection FLOW_CONTROL_ERROR", async () => {
+      // RFC 9113 §6.5.2.
+      await withRawH2Server(
+        (conn, id) => {
+          // setting type 4 (INITIAL_WINDOW_SIZE), value 0x80000000
+          conn.socket.write(frame(4, 0, 0, Buffer.concat([Buffer.from([0, 4]), u32be(0x80000000)])));
+          conn.headers(id, hpackStatus(200), { endStream: true });
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            try { await fetch("${url}", { tls: { rejectUnauthorized: false } }); console.log("ok"); }
+            catch (e) { console.log("rejected", e.code); }
+          `);
+          const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stdout.trim()).toBe("rejected HTTP2FlowControlError");
+          expect(exitCode).toBe(0);
+        },
+      );
+    });
+
+    test("WINDOW_UPDATE with zero increment on stream 0 is a connection PROTOCOL_ERROR", async () => {
+      // RFC 9113 §6.9.
+      await withRawH2Server(
+        (conn, id) => {
+          conn.socket.write(frame(8, 0, 0, u32be(0)));
+          conn.headers(id, hpackStatus(200), { endStream: true });
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            try { await fetch("${url}", { tls: { rejectUnauthorized: false } }); console.log("ok"); }
+            catch (e) { console.log("rejected", e.code); }
+          `);
+          const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stdout.trim()).toBe("rejected HTTP2ProtocolError");
+          expect(exitCode).toBe(0);
+        },
+      );
+    });
+
+    test("HEADERS on a stream id we never opened is a connection PROTOCOL_ERROR", async () => {
+      // RFC 9113 §5.1: receiving a frame on an idle stream (id >= our next
+      // odd id) or an even (server-initiated) id while push is disabled is a
+      // connection error, not a discardable orphan.
+      await withRawH2Server(
+        (conn, id) => {
+          conn.headers(2, hpackStatus(200), { endStream: true });
+          conn.headers(id, hpackStatus(200), { endStream: true });
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            try { await fetch("${url}", { tls: { rejectUnauthorized: false } }); console.log("ok"); }
+            catch (e) { console.log("rejected", e.code); }
+          `);
+          const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stdout.trim()).toBe("rejected HTTP2ProtocolError");
+          expect(exitCode).toBe(0);
+        },
+      );
+    });
+
+    test("frame larger than the local SETTINGS_MAX_FRAME_SIZE is a connection FRAME_SIZE_ERROR", async () => {
+      // RFC 9113 §4.2. We never advertise above the 16384 default, so a peer
+      // declaring a 16385-byte payload is a connection error and must not be
+      // buffered (the unbounded path would let a peer balloon read_buffer to
+      // ~16 MiB).
+      await withRawH2Server(
+        (conn, id) => {
+          void id;
+          conn.socket.write(frame(0, 0, 1, Buffer.alloc(16385)));
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            try { await fetch("${url}", { tls: { rejectUnauthorized: false } }); console.log("ok"); }
+            catch (e) { console.log("rejected", e.code); }
+          `);
+          const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stdout.trim()).toBe("rejected HTTP2FrameSizeError");
+          expect(exitCode).toBe(0);
+        },
+      );
+    });
+
+    test("SETTINGS frame on a non-zero stream id is a connection PROTOCOL_ERROR", async () => {
+      // RFC 9113 §6.5.
+      await withRawH2Server(
+        (conn, id) => {
+          conn.socket.write(frame(4, 0, 1));
+          conn.headers(id, hpackStatus(200), { endStream: true });
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            try { await fetch("${url}", { tls: { rejectUnauthorized: false } }); console.log("ok"); }
+            catch (e) { console.log("rejected", e.code); }
+          `);
+          const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stdout.trim()).toBe("rejected HTTP2ProtocolError");
+          expect(exitCode).toBe(0);
+        },
+      );
+    });
+
+    test("RST_STREAM on an idle stream is a connection PROTOCOL_ERROR", async () => {
+      // RFC 9113 §6.4.
+      await withRawH2Server(
+        (conn, id) => {
+          conn.rst(id + 2, 0);
+          conn.headers(id, hpackStatus(200), { endStream: true });
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            try { await fetch("${url}", { tls: { rejectUnauthorized: false } }); console.log("ok"); }
+            catch (e) { console.log("rejected", e.code); }
+          `);
+          const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stdout.trim()).toBe("rejected HTTP2ProtocolError");
+          expect(exitCode).toBe(0);
+        },
+      );
+    });
+
+    test("PING with length != 8 is a connection FRAME_SIZE_ERROR", async () => {
+      // RFC 9113 §6.7.
+      await withRawH2Server(
+        (conn, id) => {
+          conn.socket.write(frame(6, 0, 0, Buffer.alloc(4)));
+          conn.headers(id, hpackStatus(200), { endStream: true });
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            try { await fetch("${url}", { tls: { rejectUnauthorized: false } }); console.log("ok"); }
+            catch (e) { console.log("rejected", e.code); }
+          `);
+          const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stdout.trim()).toBe("rejected HTTP2FrameSizeError");
+          expect(exitCode).toBe(0);
+        },
+      );
+    });
+
+    test("PING on a non-zero stream id is a connection PROTOCOL_ERROR", async () => {
+      // RFC 9113 §6.7.
+      await withRawH2Server(
+        (conn, id) => {
+          conn.socket.write(frame(6, 0, 1, Buffer.alloc(8)));
+          conn.headers(id, hpackStatus(200), { endStream: true });
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            try { await fetch("${url}", { tls: { rejectUnauthorized: false } }); console.log("ok"); }
+            catch (e) { console.log("rejected", e.code); }
+          `);
+          const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stdout.trim()).toBe("rejected HTTP2ProtocolError");
+          expect(exitCode).toBe(0);
+        },
+      );
+    });
+
+    test("303 redirect on a streaming-body POST RSTs the half-open upload stream", async () => {
+      // The redirect detaches stream 1 before END_STREAM is ever written for
+      // the request body. Without an RST_STREAM(CANCEL) the server is left
+      // holding it half-open against MAX_CONCURRENT_STREAMS.
+      await withRawH2Server(
+        (conn, id) => {
+          if (id === 1) {
+            conn.headers(id, Buffer.concat([hpackLit(":status", "303"), hpackLit("location", "/target")]), {
+              endStream: true,
+            });
+          } else {
+            conn.headers(id, hpackStatus(200), { endStream: true });
+          }
+        },
+        async (url, state) => {
+          await using proc = await spawnFetch(`
+            const body = new ReadableStream({
+              async start(ctrl) { ctrl.enqueue(new Uint8Array([1,2,3])); await new Promise(r => setTimeout(r, 60_000)); },
+            });
+            const r = await fetch("${url}/upload", { method: "POST", body, duplex: "half", tls: { rejectUnauthorized: false } });
+            console.log(r.status, r.url.endsWith("/target"));
+            process.exit(0);
+          `);
+          const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stderr).toBe("");
+          expect(stdout.trim()).toBe("200 true");
+          await state.allClosed();
+          expect(state.rst).toEqual([{ id: 1, code: 8 }]);
+          expect(exitCode).toBe(0);
+        },
+      );
+    });
+
+    test("client RSTs the stream when it abandons on a local error", async () => {
+      // handleResponseBody throws on invalid gzip; the catch path must send
+      // RST_STREAM(CANCEL) so the server doesn't keep the stream open
+      // counting against MAX_CONCURRENT_STREAMS.
+      await withRawH2Server(
+        (conn, id) => {
+          if (id === 1) {
+            conn.headers(id, Buffer.concat([hpackStatus(200), hpackLit("content-encoding", "gzip")]));
+            conn.data(id, Buffer.from("not gzip"));
+          } else {
+            // Barrier request — see subprocess comment below.
+            conn.headers(id, hpackStatus(204), { endStream: true });
+          }
+        },
+        async (url, state) => {
+          await using proc = await spawnFetch(`
+            const tls = { rejectUnauthorized: false };
+            try { await (await fetch("${url}", { tls })).arrayBuffer(); console.log("ok"); }
+            catch (e) { console.log("rejected", e.code ?? e.message); }
+            // Second request on the same pooled session acts as a delivery
+            // barrier: RST_STREAM(1) is queued ahead of HEADERS(3) on the one
+            // socket, so the 204 arriving back proves the RST reached the
+            // server. Without this the subprocess can exit while the RST is
+            // still in the TLS/TCP send buffer, which Windows drops on
+            // process death (abortive close) — leaving state.rst empty.
+            console.log((await fetch("${url}", { tls })).status);
+          `);
+          const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          const out = stdout.trim().split("\n");
+          expect(out[0]).toContain("rejected");
+          expect(out[1]).toBe("204");
+          expect(exitCode).toBe(0);
+          await state.allClosed();
+          // 0x8 = CANCEL. connections=1 proves the barrier rode the same
+          // socket, so ordering actually applies.
+          expect({ rst: state.rst, connections: state.connections }).toEqual({
+            rst: [{ id: 1, code: 8 }],
+            connections: 1,
+          });
+        },
+      );
+    });
+
+    test("a deflate body whose first DATA frame holds one byte is decoded", async () => {
+      const payload = Buffer.alloc(2000, "zlib-wrapped deflate via h2. ").toString();
+      const body = zlib.deflateSync(payload);
+      let first: RawConn | undefined;
+      await withRawH2Server(
+        (conn, id) => {
+          if (!first) {
+            first = conn;
+            // One write, so the client reads HEADERS and the one-byte DATA frame together.
+            conn.socket.write(
+              Buffer.concat([
+                frame(1, 4, id, Buffer.concat([hpackStatus(200), hpackLit("content-encoding", "deflate")])),
+                frame(0, 0, id, body.subarray(0, 1)),
+              ]),
+            );
+          } else {
+            // The client sends this request after the first fetch() resolved: it has the first byte.
+            first.data(1, body.subarray(1), true);
+            conn.headers(id, hpackStatus(204), { endStream: true });
+          }
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            const tls = { rejectUnauthorized: false };
+            const res = await fetch("${url}", { tls });
+            await fetch("${url}", { tls });
+            process.stdout.write(await res.text());
+          `);
+          const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect({ stdout, stderr, exitCode }).toEqual({ stdout: payload, stderr: "", exitCode: 0 });
+        },
+      );
+    });
+
+    // An abort sends a liveness PING only if its request waited a second with no bytes
+    // from the server. Nothing observable marks that moment, so these tests sleep past it,
+    // starting when the server has seen the request: the client opened the stream before that.
+    async function runLiveness(url: string, states: RawState[], script: string, env?: Record<string, string>) {
+      await using proc = await spawnFetch(
+        `
+        import { once } from "node:events";
+        const tls = { rejectUnauthorized: false };
+        let sent = 0;
+        let seen = 0;
+        process.on("message", () => void seen++);
+        const request = (init, url = "${url}") => (sent++, fetch(url, { tls, ...init }));
+        const get = init => request(init).then(r => r.status);
+        const abortAfter = async (ms, init, url) => {
+          const ac = new AbortController();
+          const aborted = request({ ...init, signal: ac.signal }, url).then(r => r.status, e => e.name);
+          for (const mine = sent; seen < mine; ) await once(process, "message");
+          await Bun.sleep(ms);
+          ac.abort();
+          return aborted;
+        };
+        ${script}
+        process.exit(0);
+      `,
+        { env, ipc() {} },
+      );
+      for (const state of states) state.onRequest = () => proc.send("request");
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      return { stdout: stdout.trim().split("\n"), stderr, exitCode };
+    }
+    const pingAck = (payload: Buffer) => frame(6, 1, 0, payload);
+
+    test("after an abort on a silent connection, requests avoid it until it answers a PING", async () => {
+      const served: string[] = [];
+      let pings = 0;
+      let ack: (() => void) | undefined;
+      let otherConnectionUsed = false;
+      await withRawH2Server(
+        (conn, id, connIndex) => {
+          served.push(connIndex + ":" + id);
+          if (connIndex === 0 && id === 1) return conn.headers(id, hpackStatus(200));
+          if (connIndex === 0 && (id === 3 || id === 7)) return;
+          conn.headers(id, hpackStatus(204), { endStream: true });
+          if (connIndex === 1) {
+            otherConnectionUsed = true;
+            ack?.();
+          }
+        },
+        async (url, state) => {
+          state.onPing = (conn, payload) => {
+            const send = () => {
+              conn.socket.write(pingAck(payload));
+              conn.data(1, "acked");
+            };
+            if (++pings > 1 || otherConnectionUsed) send();
+            else ack = send;
+          };
+          const result = await runLiveness(
+            url,
+            [state],
+            `
+            const reader = (await request({ timeout: false })).body.getReader();
+            const read = async () => new TextDecoder().decode((await reader.read()).value);
+            console.log(await abortAfter(1100));
+            console.log(await get());
+            console.log(await read());
+            console.log(await get());
+            // The responses since the first PING allow a second one.
+            console.log(await abortAfter(1100));
+            console.log(await read());
+            `,
+          );
+          expect({ ...result, served, pings }).toEqual({
+            stdout: ["AbortError", "204", "acked", "204", "AbortError", "acked"],
+            stderr: "",
+            exitCode: 0,
+            served: ["0:1", "0:3", "1:1", "0:5", "0:7"],
+            pings: 2,
+          });
+        },
+      );
+    }, 30_000);
+
+    test("an abort of the only request on a silent connection does not pool the connection", async () => {
+      const served: string[] = [];
+      await withRawH2Server(
+        (conn, id, connIndex) => {
+          served.push(connIndex + ":" + id);
+          if (connIndex === 0 && id === 3) return;
+          conn.headers(id, hpackStatus(204), { endStream: true });
+        },
+        async (url, state) => {
+          const result = await runLiveness(
+            url,
+            [state],
+            `
+            console.log(await get());
+            console.log(await abortAfter(1100));
+            console.log(await get());
+            `,
+          );
+          expect({ ...result, served }).toEqual({
+            stdout: ["204", "AbortError", "204"],
+            stderr: "",
+            exitCode: 0,
+            served: ["0:1", "0:3", "1:1"],
+          });
+        },
+      );
+    }, 30_000);
+
+    test("an abort of a request that has not waited a second sends no PING", async () => {
+      const served: string[] = [];
+      let pings = 0;
+      await withRawH2Server(
+        (conn, id) => {
+          served.push(String(id));
+          if (id !== 3) conn.headers(id, hpackStatus(204), { endStream: true });
+        },
+        async (url, state) => {
+          state.onPing = () => pings++;
+          const result = await runLiveness(
+            url,
+            [state],
+            `
+            console.log(await get());
+            await Bun.sleep(1100);
+            console.log(await abortAfter(0));
+            console.log(await get());
+            `,
+          );
+          expect({ ...result, served, pings, connections: state.connections }).toEqual({
+            stdout: ["204", "AbortError", "204"],
+            stderr: "",
+            exitCode: 0,
+            served: ["1", "3", "5"],
+            pings: 0,
+            connections: 1,
+          });
+        },
+      );
+    }, 30_000);
+
+    test("a second abort with no response since the PING retires the connection without another PING", async () => {
+      const served: string[] = [];
+      let pings = 0;
+      await withRawH2Server(
+        (conn, id, connIndex) => {
+          served.push(connIndex + ":" + id);
+          if (connIndex === 0 && id > 1) return;
+          conn.headers(id, hpackStatus(204), { endStream: true });
+        },
+        async (url, state) => {
+          state.onPing = (conn, payload) => {
+            pings++;
+            conn.socket.write(pingAck(payload));
+          };
+          const result = await runLiveness(
+            url,
+            [state],
+            `
+            console.log(await get());
+            // The ACK of the first abort's PING counts as bytes from the server.
+            console.log((await Promise.all([abortAfter(1100), abortAfter(3100)])).join());
+            console.log(await get());
+            `,
+          );
+          expect({ ...result, served, pings }).toEqual({
+            stdout: ["204", "AbortError,AbortError", "204"],
+            stderr: "",
+            exitCode: 0,
+            served: ["0:1", "0:3", "0:5", "1:1"],
+            pings: 1,
+          });
+        },
+      );
+    }, 30_000);
+
+    // A server counts PINGs per connection, so the keep-alive pool does not give the PING back.
+    test("a connection that answered the PING and was pooled gets no second PING", async () => {
+      const served: string[] = [];
+      let pings = 0;
+      await withRawH2Server(
+        (conn, id, connIndex) => {
+          served.push(connIndex + ":" + id);
+          if (connIndex === 0 && id > 1) return;
+          conn.headers(id, hpackStatus(204), { endStream: true });
+        },
+        async (url, state) => {
+          state.onPing = (conn, payload) => {
+            pings++;
+            conn.socket.write(pingAck(payload));
+          };
+          const result = await runLiveness(
+            url,
+            [state],
+            `
+            console.log(await get());
+            for (let i = 0; i < 2; i++) {
+              console.log(await abortAfter(1100));
+              // Nothing shows that the client has read the ACK and pooled the connection.
+              await Bun.sleep(1000);
+            }
+            console.log(await get());
+            `,
+          );
+          expect({ ...result, served, pings }).toEqual({
+            stdout: ["204", "AbortError", "AbortError", "204"],
+            stderr: "",
+            exitCode: 0,
+            served: ["0:1", "0:3", "0:5", "1:1"],
+            pings: 1,
+          });
+        },
+      );
+    }, 30_000);
+
+    test("HEADERS that crossed the RST_STREAM count as a response: the next abort can send a PING", async () => {
+      const served: string[] = [];
+      let pings = 0;
+      await withRawH2Server(
+        (conn, id, connIndex) => {
+          served.push(connIndex + ":" + id);
+          if (id === 3 || id === 5) return;
+          conn.headers(id, hpackStatus(204), { endStream: true });
+        },
+        async (url, state) => {
+          state.onPing = (conn, payload) => {
+            if (++pings === 1) conn.headers(3, hpackStatus(200));
+            conn.socket.write(pingAck(payload));
+          };
+          const result = await runLiveness(
+            url,
+            [state],
+            `
+            console.log(await get());
+            for (let i = 0; i < 2; i++) {
+              console.log(await abortAfter(1100));
+              // Nothing shows that the client has read the ACK and pooled the connection.
+              await Bun.sleep(1000);
+            }
+            console.log(await get());
+            `,
+          );
+          expect({ ...result, served, pings }).toEqual({
+            stdout: ["204", "AbortError", "AbortError", "204"],
+            stderr: "",
+            exitCode: 0,
+            served: ["0:1", "0:3", "0:5", "0:7"],
+            pings: 2,
+          });
+        },
+      );
+    }, 30_000);
+
+    // BUN_CONFIG_HTTP_IDLE_TIMEOUT=1 shortens the wait for the ACK from 16 to 20 s to 4 to 8 s,
+    // the shortest the timer wheel has. Both servers hold a stream with no timeout; the one
+    // that answers the PING sends its body after the other was closed.
+    test("a connection that does not answer the PING is closed; one that does keeps its streams", async () => {
+      const onStream = (conn: RawConn, id: number) => {
+        if (id === 1) conn.headers(id, hpackStatus(200));
+      };
+      await withRawH2Server(onStream, async (silentUrl, silent) => {
+        await withRawH2Server(onStream, async (liveUrl, live) => {
+          live.onPing = (conn, payload) => {
+            conn.socket.write(pingAck(payload));
+            silent.allClosed().then(() => conn.data(1, "alive", true));
+          };
+          const result = await runLiveness(
+            silentUrl,
+            [silent, live],
+            `
+            const run = async url => {
+              const held = await request({ timeout: false }, url);
+              await abortAfter(1100, {}, url);
+              return held.text().catch(e => e.code);
+            };
+            console.log((await Promise.all([run("${silentUrl}"), run("${liveUrl}")])).join());
+            `,
+            { BUN_CONFIG_HTTP_IDLE_TIMEOUT: "1" },
+          );
+          expect({ ...result, silent: silent.connections, live: live.connections }).toEqual({
+            stdout: ["ECONNRESET,alive"],
+            stderr: "",
+            exitCode: 0,
+            silent: 1,
+            live: 1,
+          });
+        });
+      });
+    }, 30_000);
+
+    // The request's timer fires after 4 to 8 s, the wait for the ACK would end after 16 to 20 s.
+    test("a request's own timeout is still reported as a timeout while a PING is unanswered", async () => {
+      await withRawH2Server(
+        (conn, id) => {
+          if (id === 1) conn.headers(id, hpackStatus(200));
+        },
+        async (url, state) => {
+          const result = await runLiveness(
+            url,
+            [state],
+            `
+            const held = await request({ timeout: 1000 });
+            console.log(await abortAfter(1100));
+            console.log(await held.text().catch(e => e.name));
+            `,
+          );
+          expect(result).toEqual({ stdout: ["AbortError", "TimeoutError"], stderr: "", exitCode: 0 });
+        },
+      );
+    }, 30_000);
+
+    test("FetchSession.close() closes a connection that waits for the ACK of a PING", async () => {
+      let ack: (() => void) | undefined;
+      const sessionConnectionClosed = Promise.withResolvers<void>();
+      await withRawH2Server(
+        (conn, id, connIndex) => {
+          if (connIndex === 0) {
+            if (id !== 1) return;
+            conn.socket.once("close", () => sessionConnectionClosed.resolve());
+            return conn.headers(id, hpackStatus(204), { endStream: true });
+          }
+          // The request after close(): an ACK from here on must not get the connection pooled.
+          ack?.();
+          sessionConnectionClosed.promise.then(() => conn.headers(id, hpackStatus(204), { endStream: true }));
+        },
+        async (url, state) => {
+          state.onPing = (conn, payload) => {
+            ack = () => conn.socket.write(pingAck(payload));
+          };
+          const result = await runLiveness(
+            url,
+            [state],
+            `
+            const session = new Bun.FetchSession();
+            console.log(await get({ session }));
+            console.log(await abortAfter(1100, { session }));
+            session.close();
+            console.log(await get());
+            `,
+          );
+          expect(result).toEqual({ stdout: ["204", "AbortError", "204"], stderr: "", exitCode: 0 });
+        },
+      );
+    }, 30_000);
+
+    test("RST_STREAM(NO_ERROR) before final HEADERS fails the request instead of hanging", async () => {
+      await withRawH2Server(
+        (conn, id) => {
+          conn.rst(id, 0);
+        },
+        async url => {
+          await using proc = await spawnFetch(`
+            try {
+              await fetch("${url}", { tls: { rejectUnauthorized: false } });
+              console.log("ok");
+            } catch (e) { console.log("rejected", e.code); }
+          `);
+          const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          expect(stdout.trim()).toBe("rejected HTTP2StreamReset");
+          expect(exitCode).toBe(0);
+        },
+      );
+    });
+  });
+
+  test("flag off: ALPN does not offer h2", async () => {
+    let alpn = null as string | false | null;
+    const server = nodetls.createServer({ ...tls, ALPNProtocols: ["h2", "http/1.1"] }, sock => {
+      alpn = sock.alpnProtocol;
+      sock.end("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok");
+    });
+    server.on("tlsClientError", () => {});
+    server.listen(0);
+    await once(server, "listening");
+    const { port } = server.address() as import("node:net").AddressInfo;
+    try {
+      await using proc = await spawnCapped({
+        cmd: [
+          bunExe(),
+          "--no-warnings",
+          "-e",
+          `console.log(await fetch("https://localhost:${port}", { tls: { rejectUnauthorized: false } }).then(r => r.text()));`,
+        ],
+        env: { ...bunEnv, NODE_TLS_REJECT_UNAUTHORIZED: "0" },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stderr).toBe("");
+      expect(stdout.trim()).toBe("ok");
+      // The server prefers h2; if the client had offered it, ALPN would have
+      // selected it and the HTTP/1.1 response above would have failed parse.
+      expect(alpn).toBe("http/1.1");
+      expect(exitCode).toBe(0);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("--experimental-http2-fetch enables h2 without the env flag", async () => {
+    await withH2Server(
+      (req, res) => {
+        res.writeHead(200);
+        res.end(req.httpVersion);
+      },
+      async url => {
+        // No BUN_FEATURE_FLAG_EXPERIMENTAL_HTTP2_CLIENT in env; the CLI flag
+        // alone should make ALPN offer h2.
+        await using proc = await spawnCapped({
+          cmd: [
+            bunExe(),
+            "--no-warnings",
+            "--experimental-http2-fetch",
+            "-e",
+            `const r = await fetch("${url}", { tls: { rejectUnauthorized: false } });
+             console.log(r.status, await r.text());`,
+          ],
+          env: { ...bunEnv, NODE_TLS_REJECT_UNAUTHORIZED: "0" },
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+        expect(stderr).toBe("");
+        expect(stdout.trim()).toBe("200 2.0");
+        expect(exitCode).toBe(0);
+      },
+    );
+  });
+
+  test("protocol:'http2' forces h2 without the env flag", async () => {
+    await withH2Server(
+      (req, res) => {
+        res.writeHead(200);
+        res.end(req.httpVersion);
+      },
+      async url => {
+        // No BUN_FEATURE_FLAG_EXPERIMENTAL_HTTP2_CLIENT in env.
+        await using proc = await spawnCapped({
+          cmd: [
+            bunExe(),
+            "--no-warnings",
+            "-e",
+            `const r = await fetch("${url}", { protocol: "http2", tls: { rejectUnauthorized: false } });
+             console.log(r.status, await r.text());`,
+          ],
+          env: { ...bunEnv, NODE_TLS_REJECT_UNAUTHORIZED: "0" },
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+        expect(stderr).toBe("");
+        expect(stdout.trim()).toBe("200 2.0");
+        expect(exitCode).toBe(0);
+      },
+    );
+  });
+
+  test("protocol:'http2' with rejectUnauthorized: false goes ahead without an advisory checkServerIdentity", async () => {
+    await withH2Server(
+      (req, res) => {
+        res.writeHead(200);
+        res.end(req.httpVersion);
+      },
+      async url => {
+        await using proc = await spawnCapped({
+          cmd: [
+            bunExe(),
+            "--no-warnings",
+            "-e",
+            `let calls = 0;
+             const tls = { rejectUnauthorized: false, checkServerIdentity: () => void calls++ };
+             const r = await fetch("${url}", { protocol: "http2", tls });
+             console.log(r.status, await r.text(), calls);
+             // Enforced, it cannot run over h2, so the request is refused.
+             console.log(await fetch("${url}", { protocol: "http2", tls: { ...tls, rejectUnauthorized: true } }).then(r => r.status, e => e.code));`,
+          ],
+          env: bunEnv,
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+        expect(stderr).toBe("");
+        expect(stdout.trim().split("\n")).toEqual(["200 2.0 0", "HTTP2Unsupported"]);
+        expect(exitCode).toBe(0);
+      },
+    );
+  });
+
+  test("an address in the URL with Host and tls.serverName: :authority, SNI and verification follow the name", async () => {
+    const server = makeH2Server({}, (req, res) => {
+      res.end(JSON.stringify({ authority: req.authority, sni: (req.socket as nodetls.TLSSocket).servername }));
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const { port } = server.address() as import("node:net").AddressInfo;
+    try {
+      await using proc = await spawnCapped({
+        cmd: [
+          bunExe(),
+          "--no-warnings",
+          "-e",
+          `const pinned = serverName =>
+             fetch("https://127.0.0.1:${port}/", {
+               protocol: "http2",
+               headers: { Host: "localhost" },
+               tls: { ca: ${JSON.stringify(tls.cert)}, serverName },
+               proxy: false,
+             }).then(r => r.json(), e => e.code);
+           console.log(JSON.stringify([await pinned("localhost"), await pinned("pinned.invalid")]));`,
+        ],
+        env: bunEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stderr).toBe("");
+      expect(JSON.parse(stdout)).toEqual([
+        { authority: "localhost", sni: "localhost" },
+        "ERR_TLS_CERT_ALTNAME_INVALID",
+      ]);
+      expect(exitCode).toBe(0);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("each FetchSession has its own h2 session", async () => {
+    let sessions = 0;
+    const server = makeH2Server({}, (req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", () => res.end(String(Buffer.concat(chunks).length)));
+    });
+    server.on("session", () => sessions++);
+    server.listen(0);
+    await once(server, "listening");
+    const { port } = server.address() as import("node:net").AddressInfo;
+    try {
+      await using proc = await spawnCapped({
+        cmd: [
+          bunExe(),
+          "--no-warnings",
+          "-e",
+          `const url = "https://localhost:${port}/";
+           using one = new Bun.FetchSession({ tls: { rejectUnauthorized: false } });
+           using other = new Bun.FetchSession({ tls: { rejectUnauthorized: false } });
+           const post = session =>
+             fetch(url, { protocol: "http2", session, method: "POST", body: Buffer.alloc(5000, "x") }).then(r => r.text());
+           console.log(JSON.stringify([await post(one), await post(one), await post(other)]));`,
+        ],
+        env: bunEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stderr).toBe("");
+      expect(
+        stdout
+          .trim()
+          .split("\n")
+          .map(line => JSON.parse(line)),
+      ).toEqual([["5000", "5000", "5000"]]);
+      expect(sessions).toBe(2);
+      expect(exitCode).toBe(0);
+    } finally {
+      server.close();
+    }
+  });
+
+  test.each([
+    ["small (shared-buffer fast path)", 32 * 1024],
+    ["large (zlib-streaming spill path)", 600 * 1024],
+  ])("compress: gzip request body over h2 — %s", async (_, size) => {
+    await withH2Server(
+      (req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+          const raw = Buffer.concat(chunks);
+          res.writeHead(200, {
+            "x-recv-len": String(raw.length),
+            "x-recv-encoding": req.headers["content-encoding"] ?? "",
+            "x-recv-content-length": req.headers["content-length"] ?? "",
+          });
+          res.end(zlib.gunzipSync(raw));
+        });
+      },
+      async url => {
+        await using proc = await spawnCapped({
+          cmd: [
+            bunExe(),
+            "--no-warnings",
+            "-e",
+            `const payload = Buffer.alloc(${size}, "abcdefghij");
+             const r = await fetch("${url}", {
+               method: "POST",
+               body: payload,
+               compress: "gzip",
+               protocol: "http2",
+               tls: { rejectUnauthorized: false },
+             });
+             const decoded = Buffer.from(await r.arrayBuffer());
+             console.log(JSON.stringify({
+               recvLen: Number(r.headers.get("x-recv-len")),
+               encoding: r.headers.get("x-recv-encoding"),
+               contentLength: r.headers.get("x-recv-content-length"),
+               match: decoded.equals(payload),
+             }));`,
+          ],
+          env: { ...bunEnv, NODE_TLS_REJECT_UNAUTHORIZED: "0" },
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+        expect(stderr).toBe("");
+        const out = JSON.parse(stdout.trim());
+        expect(out.encoding).toBe("gzip");
+        expect(out.recvLen).toBeLessThan(size);
+        expect(out.contentLength).toBe(String(out.recvLen));
+        expect(out.match).toBe(true);
+        expect(exitCode).toBe(0);
+      },
+    );
+  });
+
+  test("protocol:'http2' against an h1-only server fails with HTTP2Unsupported", async () => {
+    const server = https.createServer({ ...tls }, (_req, res) => res.end("h1"));
+    server.listen(0);
+    await once(server, "listening");
+    const { port } = server.address() as import("node:net").AddressInfo;
+    try {
+      await using proc = await spawnCapped({
+        cmd: [
+          bunExe(),
+          "--no-warnings",
+          "-e",
+          `try {
+             await fetch("https://localhost:${port}", { protocol: "http2", tls: { rejectUnauthorized: false } });
+             console.log("unexpected-ok");
+           } catch (e) { console.log(e.code || String(e)); }`,
+        ],
+        env: { ...bunEnv, NODE_TLS_REJECT_UNAUTHORIZED: "0" },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stdout.trim()).toContain("HTTP2Unsupported");
+      expect(exitCode).toBe(0);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("ALPN h1 result re-dispatches coalesced waiters in parallel, not serial", async () => {
+    // h1-only TLS server: leader's ALPN resolves to http/1.1, so waiters
+    // re-dispatch. Each must open its own connection on the same loop turn
+    // rather than re-coalescing onto the first waiter's new PendingConnect.
+    let active = 0;
+    let peak = 0;
+    const { promise, resolve } = Promise.withResolvers<void>();
+    const server = https.createServer({ ...tls }, (req, res) => {
+      active++;
+      peak = Math.max(peak, active);
+      if (active === 5) resolve();
+      promise.then(() => {
+        res.end("ok");
+        active--;
+      });
+    });
+    server.listen(0);
+    await once(server, "listening");
+    const { port } = server.address() as import("node:net").AddressInfo;
+    try {
+      await using proc = await spawnFetch(`
+        const url = "https://localhost:${port}/";
+        const tls = { rejectUnauthorized: false };
+        const rs = await Promise.all(Array.from({ length: 5 }, () => fetch(url, { tls }).then(r => r.text())));
+        console.log(rs.join(","));
+      `);
+      const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stdout.trim()).toBe("ok,ok,ok,ok,ok");
+      expect(exitCode).toBe(0);
+      // If waiters re-coalesced, peak would be 1 (sequential); 5 means all
+      // five connections were open before any response was written.
+      expect(peak).toBe(5);
+    } finally {
+      server.close();
+    }
+  });
+
+  test('protocol: "http1.1" overrides the env flag and pins ALPN to http/1.1', async () => {
+    // Server is h2-only: the unpinned fetch (env flag on) negotiates h2, while
+    // the pinned fetch advertises only http/1.1 and is rejected at ALPN —
+    // proving the pin actually reached the ClientHello.
+    await withH2Server(
+      (req, res) => res.end(req.httpVersion),
+      async url => {
+        await using proc = await spawnFetch(`
+          const tls = { rejectUnauthorized: false };
+          const a = await fetch("${url}", { tls }).then(r => r.text());
+          const b = await fetch("${url}", { protocol: "http1.1", tls }).then(r => r.text(), e => "rejected");
+          console.log(a, b);
+        `);
+        const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+        expect(stderr).toBe("");
+        expect(stdout.trim()).toBe("2.0 rejected");
+        expect(exitCode).toBe(0);
+      },
+    );
+  });
+
+  test('protocol: "http2" on a plain http:// URL fails with HTTP2Unsupported', async () => {
+    // h2c is out of scope; without an explicit check the request would
+    // silently complete over HTTP/1.1.
+    await using proc = await spawnCapped({
+      cmd: [
+        bunExe(),
+        "--no-warnings",
+        "-e",
+        `try {
+           await fetch("http://127.0.0.1:1/", { protocol: "http2" });
+           console.log("unexpected-ok");
+         } catch (e) { console.log(e.code || String(e)); }`,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stdout.trim()).toContain("HTTP2Unsupported");
+    expect(exitCode).toBe(0);
+  });
+
+  test("abort while coalesced onto an in-flight TLS connect resolves promptly", async () => {
+    // Leader's TLS handshake never completes (server is plain TCP), so its
+    // PendingConnect stays open. The waiter has no abort-tracker entry and
+    // would otherwise wait for the leader before observing the abort.
+    await using proc = await spawnCapped({
+      cmd: [
+        bunExe(),
+        "--no-warnings",
+        "-e",
+        `import net from "node:net";
+         let conns = 0;
+         const { promise: accepted, resolve } = Promise.withResolvers();
+         const server = net.createServer(sock => { conns++; sock.on("error", () => {}); resolve(); });
+         server.listen(0, "127.0.0.1");
+         await new Promise(r => server.on("listening", r));
+         const url = "https://127.0.0.1:" + server.address().port + "/";
+         const opts = { protocol: "http2", tls: { rejectUnauthorized: false } };
+         const leader = fetch(url, opts).catch(() => {});
+         const ac = new AbortController();
+         const waiter = fetch(url, { ...opts, signal: ac.signal }).then(
+           () => "unexpected-ok",
+           e => e?.name || String(e),
+         );
+         // Once the server has accepted the leader's TCP connection both
+         // fetches have been processed on the http thread (PendingConnect
+         // creation is synchronous in connect()). The settle window lets a
+         // non-coalesced waiter's connect land so conns reflects it.
+         await accepted;
+         await Bun.sleep(100);
+         ac.abort();
+         console.log(await waiter, "conns=" + conns);
+         void leader;
+         process.exit(0);`,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stderr).toBe("");
+    expect(stdout.trim()).toBe("AbortError conns=1");
+    expect(exitCode).toBe(0);
+  });
+
+  test("fetch rejects when a TLS 1.3 server sends a fatal alert after the handshake", async () => {
+    // The client finishes its handshake, with h2 selected, before the server's
+    // certificate_required alert arrives.
+    const server = nodetls.createServer({
+      ...tls,
+      requestCert: true,
+      rejectUnauthorized: true,
+      minVersion: "TLSv1.3",
+      ALPNProtocols: ["h2"],
+    });
+    server.on("tlsClientError", () => {});
+    server.listen(0);
+    await once(server, "listening");
+    const { port } = server.address() as import("node:net").AddressInfo;
+    try {
+      await using proc = await spawnFetch(`
+        const get = () =>
+          fetch("https://localhost:${port}", { tls: { rejectUnauthorized: false } }).then(() => "unexpected-ok", e => e.code);
+        console.log(await get(), await get());
+      `);
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect({ stdout: stdout.trim(), stderr, exitCode }).toEqual({ stdout: "EPROTO EPROTO", stderr: "", exitCode: 0 });
+    } finally {
+      server.close();
+    }
+  });
+
+  // Node is the peer because BoringSSL cannot start a renegotiation from the server side.
+  test.skipIf(!nodeExe())("fetch rejects when the server renegotiates TLS 1.2 on an HTTP/2 connection", async () => {
+    await using peer = Bun.spawn({
+      cmd: [nodeExe()!, join(import.meta.dir, "fetch-http2-renegotiation-peer-fixture.mjs")],
+      env: { ...bunEnv, SERVER_CERT: tls.cert, SERVER_KEY: tls.key },
+      stdout: "pipe",
+      stderr: "inherit",
+    });
+    let port = "";
+    for await (const chunk of peer.stdout) {
+      port += new TextDecoder().decode(chunk);
+      if (port.includes("\n")) break;
+    }
+    expect(port).toMatch(/^\d+\n$/);
+    await using proc = await spawnFetch(`
+      const get = () =>
+        fetch("https://127.0.0.1:${port.trim()}", { tls: { rejectUnauthorized: false } }).then(() => "unexpected-ok", e => e.code);
+      console.log(await get(), await get());
+    `);
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout: stdout.trim(), stderr, exitCode }).toEqual({
+      stdout: "HTTP2ProtocolError HTTP2ProtocolError",
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  test("SETTINGS_HEADER_TABLE_SIZE=0: encoder emits a Dynamic Table Size Update so request 2+ decodes", async () => {
+    // RFC 9113 §4.3.1 / RFC 7541 §6.3: a server that shrinks the encoder's
+    // dynamic table expects the next header block to begin with a 0x20-prefix
+    // size-update opcode. nghttp2 (which backs node:http2) enforces this and
+    // closes the connection with COMPRESSION_ERROR if the opcode is missing,
+    // so requests after the first hang/fail without the fix.
+    const server = makeH2Server({ settings: { headerTableSize: 0 } }, (_req, res) => {
+      res.writeHead(200);
+      res.end("ok");
+    });
+    server.on("sessionError", () => {});
+    server.listen(0);
+    await once(server, "listening");
+    const { port } = server.address() as import("node:net").AddressInfo;
+    try {
+      await using proc = await spawnFetch(`
+        const url = "https://localhost:${port}";
+        const tls = { rejectUnauthorized: false };
+        for (let i = 0; i < 3; i++) {
+          const res = await fetch(url, { tls });
+          console.log(i, res.status, await res.text());
+        }
+      `);
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stderr).toBe("");
+      expect(stdout.trim()).toBe("0 200 ok\n1 200 ok\n2 200 ok");
+      expect(exitCode).toBe(0);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("303 to a streaming POST over HTTP/1.1 closes the socket instead of pooling it mid-chunked-body", async () => {
+    // Regression for the doRedirect change in this PR: dropping the
+    // closeAndFail(UnexpectedRedirect) guard let a 303 with a streaming
+    // body fall through to the keep-alive pool even though the chunked
+    // upload's terminating 0\r\n\r\n was never written. The follow-up GET
+    // must open a fresh connection.
+    await using proc = await spawnCapped({
+      cmd: [
+        bunExe(),
+        "--no-warnings",
+        "-e",
+        `import net from "node:net";
+         let conns = 0;
+         const server = net.createServer(sock => {
+           const idx = conns++;
+           let buf = "";
+           sock.on("data", c => {
+             buf += c;
+             if (idx === 0 && buf.includes("\\r\\n\\r\\n") && !sock.replied) {
+               sock.replied = true;
+               sock.write("HTTP/1.1 303 See Other\\r\\nLocation: /target\\r\\nConnection: keep-alive\\r\\nContent-Length: 0\\r\\n\\r\\n");
+             }
+             if (buf.includes("GET /target")) {
+               sock.end("HTTP/1.1 200 OK\\r\\nConnection: close\\r\\nContent-Length: 6\\r\\n\\r\\nconn=" + idx);
+             }
+           });
+           sock.on("error", () => {});
+         });
+         server.listen(0, "127.0.0.1");
+         await new Promise(r => server.on("listening", r));
+         const url = "http://127.0.0.1:" + server.address().port;
+         const body = new ReadableStream({
+           async start(ctrl) {
+             ctrl.enqueue(new Uint8Array([1, 2, 3, 4]));
+             // Never close — the 303 cancels the upload.
+             await new Promise(r => setTimeout(r, 60_000));
+           },
+         });
+         const res = await fetch(url + "/upload", { method: "POST", body, duplex: "half" });
+         console.log(res.status, await res.text(), "conns=" + conns);
+         process.exit(0);`,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stderr).toBe("");
+    // conn=1 (zero-indexed) and conns=2 prove the follow-up GET opened a
+    // fresh socket; the bug would show conn=0 or hang.
+    expect(stdout.trim()).toBe("200 conn=1 conns=2");
+    expect(exitCode).toBe(0);
+  });
+
+  test("leader abort does not fail a coalesced force_http2 waiter with HTTP2Unsupported", async () => {
+    // Regression for resolvePendingH2 conflating "ALPN chose h1" with
+    // "leader failed pre-handshake". Server never speaks TLS, so the leader
+    // sits in handshake; the waiter coalesces onto its PendingConnect. When
+    // the leader is aborted, the waiter must retry as the new leader (a
+    // second TCP connect) rather than be told the server lacks h2.
+    await using proc = await spawnCapped({
+      cmd: [
+        bunExe(),
+        "--no-warnings",
+        "-e",
+        `import net from "node:net";
+         let conns = 0;
+         const { promise: accepted, resolve } = Promise.withResolvers();
+         const server = net.createServer(sock => { conns++; sock.on("error", () => {}); resolve(); });
+         server.listen(0, "127.0.0.1");
+         await new Promise(r => server.on("listening", r));
+         const url = "https://127.0.0.1:" + server.address().port + "/";
+         const opts = { protocol: "http2", tls: { rejectUnauthorized: false } };
+         const leaderAc = new AbortController();
+         const leader = fetch(url, { ...opts, signal: leaderAc.signal }).catch(e => e?.name || String(e));
+         const waiterAc = new AbortController();
+         const waiter = fetch(url, { ...opts, signal: waiterAc.signal }).then(
+           () => "unexpected-ok",
+           e => (typeof e?.code === "string" ? e.code : e?.name) || String(e),
+         );
+         await accepted;
+         await Bun.sleep(100);
+         const before = conns;
+         leaderAc.abort();
+         await leader;
+         await Bun.sleep(100);
+         const after = conns;
+         waiterAc.abort();
+         console.log(await waiter, "before=" + before, "after=" + after);
+         process.exit(0);`,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stderr).toBe("");
+    // before=1 proves the waiter coalesced; after=2 proves it retried as
+    // the new leader instead of being failed with HTTP2Unsupported.
+    expect(stdout.trim()).toBe("AbortError before=1 after=2");
+    expect(exitCode).toBe(0);
+  });
+
+  // Cloudflare sends its SETTINGS frame as TLS 1.3 0.5-RTT data, so the
+  // client's first SSL_read that returns app data is also the call that
+  // completes the handshake. ssl_on_data must fire on_handshake there or the
+  // socket never gets re-tagged for h2 and the frame bytes hit the HTTP/1.1
+  // parser as Malformed_HTTP_Response. Neither node:tls nor Bun.listen exposes
+  // the 0.5-RTT write window, so this hits a real Cloudflare-fronted origin —
+  // tolerate network blips by only failing on the specific regression code.
+  test("GET https://registry.npmjs.org over protocol: http2", async () => {
+    await using proc = await spawnFetch(`
+      try {
+        const r = await fetch("https://registry.npmjs.org", { protocol: "http2" });
+        console.log("status", r.status);
+      } catch (e) { console.log("error", e?.code ?? e?.name ?? String(e)); }
+    `);
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stderr).toBe("");
+    expect(exitCode).toBe(0);
+    const out = stdout.trim();
+    // The bug under test surfaces as Malformed_HTTP_Response — DNS/connect
+    // failures or 5xx are environmental, not regressions.
+    expect(out).not.toContain("Malformed_HTTP_Response");
+    if (!out.startsWith("status")) {
+      console.warn(`skipping live h2 assertion: ${out}`);
+      return;
+    }
+    expect(out).toBe("status 200");
+  });
+});
+
+// Serial: this test reads the subprocess's stderr stream mid-flight to gate
+// the server-side body write, which interferes with sibling tests' TLS
+// handshakes under describe.concurrent on aarch64/musl.
+test("await fetch() over HTTP/2 resolves on headers, before a content-length body is fully received", async () => {
+  let heldStream: http2.ServerHttp2Stream | undefined;
+  const server = makeH2Server();
+  server.on("stream", (stream: http2.ServerHttp2Stream) => {
+    stream.on("error", () => {});
+    stream.respond({ ":status": 200, "content-length": "262144" });
+    stream.write(Buffer.alloc(64 * 1024));
+    // The remaining 192 KiB is written from the test body once the
+    // subprocess proves it already has the Response and a first read.
+    heldStream = stream;
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address() as import("node:net").AddressInfo;
+  try {
+    await using proc = await spawnFetch(`
+      const r = await fetch("https://localhost:${port}", { tls: { rejectUnauthorized: false } });
+      const reader = r.body.getReader();
+      let n = 0;
+      const { value } = await reader.read();
+      n += value.byteLength;
+      // Signal the server (via stderr so the test can unblock the rest).
+      process.stderr.write("first-chunk\\n");
+      while (true) {
+        const { value, done } = await reader.read();
+        if (value) n += value.byteLength;
+        if (done) break;
+      }
+      console.log(r.status, r.headers.get("content-length"), n);
+    `);
+    // Wait for the subprocess to prove it received the Response + first chunk
+    // BEFORE the server has written the full body.
+    let stderr = "";
+    for await (const chunk of proc.stderr) {
+      stderr += Buffer.from(chunk).toString();
+      if (stderr.includes("first-chunk")) break;
+    }
+    heldStream!.end(Buffer.alloc(192 * 1024));
+    const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+    expect(stdout.trim()).toBe("200 262144 262144");
+    expect(exitCode).toBe(0);
+  } finally {
+    heldStream?.destroy();
+    server.close();
+  }
+});
+
+// https://github.com/oven-sh/bun/issues/16682 (h2 aggregate path): the
+// session's shared socket timer is the max over every attached client's
+// effective idle deadline.
+test("h2: per-request `timeout` extends the session idle deadline, and {timeout:false} is not killed by a sibling's shorter explicit timeout", async () => {
+  const HOLD_MS = 10_000;
+  const holdTimers = new Set<ReturnType<typeof setTimeout>>();
+  const server = makeH2Server({}, (_req, res) => {
+    // Hold every request idle past uSockets' worst-case firing window for a
+    // 1s short-tick timer (~5s), then respond.
+    const timer = setTimeout(() => {
+      holdTimers.delete(timer);
+      try {
+        res.end("hello");
+      } catch {}
+    }, HOLD_MS);
+    holdTimers.add(timer);
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address() as import("node:net").AddressInfo;
+  try {
+    const run = async (idleDefault: string, body: string) => {
+      await using proc = Bun.spawn({
+        cmd: [
+          bunExe(),
+          "--no-warnings",
+          "-e",
+          /* js */ `
+            const url = "https://localhost:${port}";
+            const get = init => fetch(url, { tls: { rejectUnauthorized: false }, ...init })
+              .then(r => r.text(), e => "ERR:" + (e?.code ?? e?.name ?? e));
+            ${body}
+          `,
+        ],
+        env: {
+          ...bunEnv,
+          BUN_FEATURE_FLAG_EXPERIMENTAL_HTTP2_CLIENT: "1",
+          BUN_CONFIG_HTTP_IDLE_TIMEOUT: idleDefault,
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      return { stdout: stdout.trim(), stderr, exitCode };
+    };
+    const [extendsDefault, floorsSibling, disarmsOnGlobalZero] = await Promise.all([
+      // Global idle default = 1s. `{timeout:60000}` must extend the shared
+      // socket's deadline past the 10s hold; the `{timeout:false}` sibling
+      // coalesces onto the same session and rides along.
+      run(
+        "1",
+        /* js */ `
+          const [longTimeout, noTimeout] = await Promise.all([
+            get({ timeout: 60_000 }),
+            get({ timeout: false }),
+          ]);
+          console.log(JSON.stringify({ longTimeout, noTimeout }));
+        `,
+      ),
+      // Global idle default = 20s. `{timeout:false}` contributes 0 to the
+      // session max and the `{timeout:1000}` sibling contributes 1s; the
+      // session must floor at the 20s global default so the no-timeout
+      // stream is not killed by the sibling's short explicit deadline.
+      run(
+        "20",
+        /* js */ `
+          const [noTimeout, shortTimeout] = await Promise.all([
+            get({ timeout: false }),
+            get({ timeout: 1000 }),
+          ]);
+          console.log(JSON.stringify({ noTimeout, shortTimeout }));
+        `,
+      ),
+      // Global idle default = 0 (disabled). A plain fetch with no `timeout`
+      // option inherits effective deadline 0 without setting the
+      // `disable_timeout` flag; the session must still disarm rather than
+      // letting the `{timeout:1000}` sibling arm the shared socket.
+      run(
+        "0",
+        /* js */ `
+          const [plain, shortTimeout] = await Promise.all([
+            get(undefined),
+            get({ timeout: 1000 }),
+          ]);
+          console.log(JSON.stringify({ plain, shortTimeout }));
+        `,
+      ),
+    ]);
+    expect(extendsDefault).toEqual({
+      stdout: JSON.stringify({ longTimeout: "hello", noTimeout: "hello" }),
+      stderr: "",
+      exitCode: 0,
+    });
+    expect(floorsSibling).toEqual({
+      stdout: JSON.stringify({ noTimeout: "hello", shortTimeout: "hello" }),
+      stderr: "",
+      exitCode: 0,
+    });
+    expect(disarmsOnGlobalZero).toEqual({
+      stdout: JSON.stringify({ plain: "hello", shortTimeout: "hello" }),
+      stderr: "",
+      exitCode: 0,
+    });
+  } finally {
+    for (const timer of holdTimers) clearTimeout(timer);
+    server.close();
+  }
+}, 60_000);
+
+// The HTTP client caches 60 custom TLS contexts. A request whose context was
+// evicted holds the last ref to it, so the context dies with that request. The
+// request ends inside a callback of a socket that the context owns (for h2,
+// the session's socket). Reads of the freed context only show under ASAN.
+// Serial: each test fills the context cache, which would evict the context a
+// concurrent test depends on.
+describe.skipIf(!isASAN)("request whose custom TLS context was evicted from the cache", () => {
+  type Held = { socket: nodetls.TLSSocket; stream?: http2.ServerHttp2Stream };
+
+  async function run(protocol: "http2" | "http1.1", terminateInChild: string, afterEvicted?: (held: Held) => void) {
+    let heldStream: http2.ServerHttp2Stream | undefined;
+    let server: http2.Http2SecureServer | https.Server;
+    if (protocol === "http2") {
+      server = makeH2Server();
+      server.on("sessionError", () => {});
+      server.on("stream", (stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders) => {
+        stream.on("error", () => {});
+        stream.respond({ ":status": 200 });
+        if (headers[":path"] === "/hold") {
+          stream.write("chunk");
+          heldStream = stream;
+          return;
+        }
+        stream.end("ok");
+      });
+    } else {
+      server = https.createServer(tls, (req, res) => {
+        res.writeHead(200);
+        if (req.url === "/hold") res.write("chunk");
+        else res.end("ok");
+      });
+      server.on("clientError", (_err, socket) => socket.destroy());
+    }
+    // The child awaits the held response first, so its connection is sockets[0].
+    const sockets: nodetls.TLSSocket[] = [];
+    server.on("secureConnection", socket => {
+      socket.on("error", () => {});
+      sockets.push(socket);
+    });
+    server.listen(0);
+    await once(server, "listening");
+    const { port } = server.address() as import("node:net").AddressInfo;
+    try {
+      await using proc = await spawnFetch(`
+        const url = "https://localhost:${port}";
+        const ac = new AbortController();
+        // serverName gives this request its own TLS context.
+        const held = await fetch(url + "/hold", {
+          protocol: "${protocol}",
+          signal: ac.signal,
+          tls: { serverName: "localhost", rejectUnauthorized: false },
+        });
+        const reader = held.body.getReader();
+        await reader.read();
+        // 61 more configs overflow the 60-entry cache.
+        for (let i = 0; i < 61; i += 8) {
+          const batch = [];
+          for (let j = i; j < Math.min(i + 8, 61); j++) {
+            batch.push(
+              fetch(url, { tls: { serverName: "evict-" + j + ".test", rejectUnauthorized: false } })
+                .then(r => r.arrayBuffer())
+                .catch(() => {}),
+            );
+          }
+          await Promise.all(batch);
+        }
+        process.stderr.write("evicted\\n");
+        ${terminateInChild}
+        await reader.read().catch(() => {});
+        // The HTTP thread still serves requests.
+        const after = await fetch(url, { tls: { rejectUnauthorized: false } });
+        await after.arrayBuffer();
+        console.log("ok");
+        process.exit(0);
+      `);
+      // One reader for all of stderr, so that a crash report written after
+      // "evicted" lands in the assertion below.
+      const errReader = proc.stderr.getReader();
+      const decoder = new TextDecoder();
+      let stderr = "";
+      async function readStderr(until?: string) {
+        while (until === undefined || !stderr.includes(until)) {
+          const { value, done } = await errReader.read();
+          if (value) stderr += decoder.decode(value, { stream: true });
+          if (done) break;
+        }
+      }
+      await readStderr("evicted");
+      afterEvicted?.({ socket: sockets[0], stream: heldStream });
+      await readStderr();
+      const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+      expect({ stdout: stdout.trim(), stderr: stderr.trim(), exitCode }).toEqual({
+        stdout: "ok",
+        stderr: "evicted",
+        exitCode: 0,
+      });
+    } finally {
+      heldStream?.destroy();
+      server.close();
+    }
+  }
+
+  // 30 s: each child makes 62 TLS handshakes under ASAN, and a regression
+  // needs time to print its report.
+  test("an abort does not use the freed session", async () => {
+    await run("http2", "ac.abort();");
+  }, 30_000);
+
+  // The abort sends a liveness PING that gets no ACK, so the session still waits, with no
+  // request left to hold the context, when the context is freed.
+  test("a session that waits for a PING ACK does not outlive the freed context", async () => {
+    let pings = 0;
+    await withRawH2Server(
+      (conn, id, connIndex) => {
+        if (connIndex > 0) return conn.headers(id, hpackStatus(204), { endStream: true });
+        conn.headers(id, hpackStatus(200));
+        conn.data(id, "chunk");
+      },
+      async (url, state) => {
+        state.onPing = () => pings++;
+        await using proc = await spawnFetch(`
+          const get = serverName => fetch("${url}", { tls: { serverName, rejectUnauthorized: false } });
+          const ac = new AbortController();
+          const held = await fetch("${url}", {
+            signal: ac.signal,
+            tls: { serverName: "localhost", rejectUnauthorized: false },
+          });
+          const reader = held.body.getReader();
+          await reader.read();
+          // 61 more configs overflow the 60-entry cache.
+          for (let i = 0; i < 61; i += 8) {
+            await Promise.all(Array.from({ length: Math.min(8, 61 - i) }, (_, j) => get("evict-" + (i + j) + ".test")));
+          }
+          // The PING needs a second with no bytes from the server, and nothing observable marks it.
+          await Bun.sleep(1100);
+          ac.abort();
+          await reader.read().catch(() => {});
+          // The HTTP thread still serves requests.
+          console.log((await get(undefined)).status);
+          process.exit(0);
+        `);
+        const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+        expect({ stdout: stdout.trim(), stderr, exitCode, pings }).toEqual({
+          stdout: "204",
+          stderr: "",
+          exitCode: 0,
+          pings: 1,
+        });
+      },
+    );
+  }, 30_000);
+
+  test("a server RST_STREAM does not free the stream the deliver loop holds", async () => {
+    await run("http2", "", held => held.stream!.close(http2.constants.NGHTTP2_CANCEL));
+  }, 30_000);
+
+  // uSockets reads the socket's group, which the context embeds, right after
+  // the close callback returns.
+  test.each(["http2", "http1.1"] as const)(
+    "a connection that the server closes does not free the context inside the close callback (%s)",
+    async protocol => {
+      await run(protocol, "", held => held.socket.destroy());
+    },
+    30_000,
+  );
+});
+
+// The HTTP thread frees a context with no ref left between two loop ticks, not
+// inside the socket callback that gave up the last ref. This checks that the
+// free still happens: a freed context closes the idle socket in its keep-alive
+// pool.
+test("an evicted custom TLS context is freed when its last request ends", async () => {
+  const sockets: nodetls.TLSSocket[] = [];
+  let busySocket: nodetls.TLSSocket | undefined;
+  const server = nodetls.createServer({ ...tls, ALPNProtocols: ["http/1.1"] }, socket => {
+    sockets.push(socket);
+    socket.on("error", () => {});
+    let request = "";
+    socket.on("data", chunk => {
+      request += chunk;
+      if (!request.endsWith("\r\n\r\n")) return;
+      if (request.startsWith("GET /hold ")) {
+        busySocket = socket;
+        socket.write("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nchunk\r\n");
+      } else {
+        socket.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+      }
+      request = "";
+    });
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address() as import("node:net").AddressInfo;
+  const url = `https://localhost:${port}`;
+  // serverName gives these two requests their own TLS context.
+  const own = { serverName: "localhost", rejectUnauthorized: false };
+  try {
+    // The first connection stays busy, so the second request opens another
+    // one, which then sits idle in the context's keep-alive pool.
+    const busy = await fetch(url + "/hold", { tls: own });
+    const reader = busy.body!.getReader();
+    await reader.read();
+    expect(await (await fetch(url, { tls: own })).text()).toBe("ok");
+    expect(sockets.length).toBe(2);
+    const idle = sockets[1];
+    // Not once(): the pool closes with a reset, and once() rejects on "error".
+    const idleClosed = new Promise(resolve => idle.once("close", resolve));
+    // 61 more configs overflow the 60-entry cache.
+    const evicting = Array.from({ length: 61 }, (_, i) =>
+      fetch(url, { tls: { serverName: `evict-${i}.test`, rejectUnauthorized: false } }).then(res => res.text()),
+    );
+    expect(await Promise.all(evicting)).toEqual(evicting.map(() => "ok"));
+    // The busy request keeps the evicted context alive, and its pool with it.
+    expect(idle.destroyed).toBe(false);
+    busySocket!.write("0\r\n\r\n");
+    while (!(await reader.read()).done);
+    await idleClosed;
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    server.close();
+  }
+  // 30 s: both ends of 63 TLS handshakes run in this process.
+}, 30_000);

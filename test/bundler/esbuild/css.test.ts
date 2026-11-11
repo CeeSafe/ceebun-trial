@@ -1,0 +1,3391 @@
+import { describe, expect } from "bun:test";
+import { join } from "node:path";
+import { itBundled } from "../expectBundled";
+
+// Tests ported from:
+// https://github.com/evanw/esbuild/blob/main/internal/bundler_tests/bundler_css_test.go
+
+// For debug, all files are written to $TEMP/bun-bundle-tests/css
+
+describe("bundler", () => {
+  itBundled("css/CSSEntryPoint", {
+    files: {
+      "/entry.css": /* css */ `
+          body {
+            background: white;
+            color: black }
+        `,
+    },
+    outfile: "/out.js",
+    onAfterBundle(api) {
+      api.expectFile("/out.js").toEqualIgnoringWhitespace(`
+  /* entry.css */
+  body {
+          color: #000;
+          background: #fff;
+  }`);
+    },
+  });
+
+  itBundled("css/CSSEntryPointEmpty", {
+    files: {
+      "/entry.css": /* css */ `\n`,
+    },
+    outfile: "/out.js",
+    onAfterBundle(api) {
+      api.expectFile("/out.js").toEqualIgnoringWhitespace(`
+  /* entry.css */`);
+    },
+  });
+
+  itBundled("css/CSSNesting", {
+    target: "bun",
+    files: {
+      "/entry.css": /* css */ `
+  body {
+  	h1 {
+  		color: white;
+  	}
+  }`,
+    },
+    outfile: "/out.js",
+    onAfterBundle(api) {
+      api.expectFile("/out.js").toEqualIgnoringWhitespace(`
+  /* entry.css */
+  body {
+  	&h1 {
+  		color: #fff;
+  	}
+  }
+  `);
+    },
+  });
+
+  itBundled("css/CSSAtImportMissing", {
+    files: {
+      "/entry.css": `@import "./missing.css";`,
+    },
+    bundleErrors: {
+      "/entry.css": ['Could not resolve: "./missing.css"'],
+    },
+  });
+
+  itBundled("css/CSSAtImportSimple", {
+    // GENERATED
+    files: {
+      "/entry.css": /* css */ `
+          @import "./internal.css";
+        `,
+      "/internal.css": /* css */ `
+          .before { color: red }
+        `,
+    },
+    outfile: "/out.css",
+    onAfterBundle(api) {
+      api.expectFile("/out.css").toEqualIgnoringWhitespace(`
+  /* internal.css */
+  .before {
+    color: red;
+  }
+  /* entry.css */
+  `);
+    },
+  });
+
+  itBundled("css/CSSAtImportDiamond", {
+    // GENERATED
+    files: {
+      "/a.css": /* css */ `
+          @import "./b.css";
+          @import "./c.css";
+          .last { color: red }
+        `,
+      "/b.css": /* css */ `
+          @import "./d.css";
+          .first { color: red }
+        `,
+      "/c.css": /* css */ `
+          @import "./d.css";
+          .third { color: red }
+        `,
+      "/d.css": /* css */ `
+          .second { color: red }
+        `,
+    },
+    outfile: "/out.css",
+    onAfterBundle(api) {
+      api.expectFile("/out.css").toEqualIgnoringWhitespace(`
+  /* b.css */
+  .first {
+    color: red;
+  }
+  /* d.css */
+  .second {
+    color: red;
+  }
+  /* c.css */
+  .third {
+    color: red;
+  }
+  /* a.css */
+  .last {
+    color: red;
+  }
+  `);
+    },
+  });
+
+  itBundled("css/CSSAtImportCycle", {
+    files: {
+      "/a.css": /* css */ `
+          @import "./a.css";
+          .hehe { color: red }
+        `,
+    },
+    outfile: "/out.css",
+    onAfterBundle(api) {
+      api.expectFile("/out.css").toEqualIgnoringWhitespace(`
+  /* a.css */
+  .hehe {
+    color: red;
+  }
+  `);
+    },
+  });
+
+  itBundled("css/CSSUrlImport", {
+    files: {
+      "/a.css": /* css */ `
+          .hello {
+            background-image: url(./hi.svg)
+          }
+        `,
+      "/hi.svg": /* svg */ `
+  <svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="50" cy="50" r="40" fill="blue" />
+  </svg>
+        `,
+    },
+    outdir: "/out",
+    onAfterBundle(api) {
+      api.expectFile("/out/a.css").toEqualIgnoringWhitespace(`
+  /* a.css */
+  .hello {
+    background-image: url("data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTAwIiBoZWlnaHQ9IjEwMCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KICA8Y2lyY2xlIGN4PSI1MCIgY3k9IjUwIiByPSI0MCIgZmlsbD0iYmx1ZSIgLz4KPC9zdmc+");
+  }
+  `);
+    },
+  });
+
+  // TODO: re-enable these tests when we do minify local css identifiers
+  // itBundled("css/TestImportLocalCSSFromJSMinifyIdentifiersAvoidGlobalNames", {
+  //   files: {
+  //     "/entry.js": /* js */ `
+  //       import "./global.css";
+  //       import "./local.module.css";
+  //     `,
+  //     "/global.css": /* css */ `
+  //     :is(.a, .b, .c, .d, .e, .f, .g, .h, .i, .j, .k, .l, .m, .n, .o, .p, .q, .r, .s, .t, .u, .v, .w, .x, .y, .z),
+  //     :is(.A, .B, .C, .D, .E, .F, .G, .H, .I, .J, .K, .L, .M, .N, .O, .P, .Q, .R, .S, .T, .U, .V, .W, .X, .Y, .Z),
+  //     ._ { color: red }
+  //   `,
+  //     "/local.module.css": /* css */ `
+  //     .rename-this { color: blue }
+  //   `,
+  //   },
+  //   entryPoints: ["/entry.js"],
+  //   outdir: "/out",
+  //   minifyIdentifiers: true,
+  // });
+
+  // // See: https://github.com/evanw/esbuild/issues/3295
+  // itBundled("css/ImportLocalCSSFromJSMinifyIdentifiersMultipleEntryPoints", {
+  //   files: {
+  //     "/a.js": /* js */ `
+  //       import { foo, bar } from "./a.module.css";
+  //       console.log(foo, bar);
+  //     `,
+  //     "/a.module.css": /* css */ `
+  //       .foo { color: #001; }
+  //       .bar { color: #002; }
+  //     `,
+  //     "/b.js": /* js */ `
+  //       import { foo, bar } from "./b.module.css";
+  //       console.log(foo, bar);
+  //     `,
+  //     "/b.module.css": /* css */ `
+  //       .foo { color: #003; }
+  //       .bar { color: #004; }
+  //     `,
+  //   },
+  //   entryPoints: ["/a.js", "/b.js"],
+  //   outdir: "/out",
+  //   minifyIdentifiers: true,
+  // });
+
+  // TODO: some classes are commented out bc we don't support :global or :local yet
+  itBundled("css/ImportCSSFromJSComposes", {
+    files: {
+      "/entry.js": /* js */ `
+          import styles from "./styles.module.css"
+          console.log(styles)
+        `,
+      "/global.css": /* css */ `
+          .GLOBAL1 {
+            color: black;
+          }
+        `,
+      "/styles.module.css": /* css */ `
+          @import "global.css";
+          /* .local0 {
+            composes: local1;
+            :global {
+              composes: GLOBAL1 GLOBAL2;
+            }
+          } */
+          .local0 {
+            composes: GLOBAL2 GLOBAL3 from global;
+            composes: local1 local2;
+            background: green;
+          }
+          /* .local0 :global {
+            composes: GLOBAL4;
+          } */
+          .local3 {
+            border: 1px solid black;
+            composes: local4;
+          }
+          .local4 {
+            opacity: 0.5;
+          }
+          .local1 {
+            color: red;
+            composes: local3;
+          }
+          .fromOtherFile {
+            composes: local0 from "other1.module.css";
+            composes: local0 from "other2.module.css";
+          }
+        `,
+      "/other1.module.css": /* css */ `
+          .local0 {
+            composes: base1 base2 from "base.module.css";
+            color: blue;
+          }
+        `,
+      "/other2.module.css": /* css */ `
+          .local0 {
+            composes: base1 base3 from "base.module.css";
+            background: purple;
+          }
+        `,
+      "/base.module.css": /* css */ `
+          .base1 {
+            cursor: pointer;
+          }
+          .base2 {
+            display: inline;
+          }
+          .base3 {
+            float: left;
+          }
+        `,
+    },
+    entryPoints: ["/entry.js"],
+    outdir: "/out",
+    bundleErrors: {
+      "/styles.module.css": [
+        'The name "local2" never appears in "styles.module.css" as a CSS modules locally scoped class name. Note that "composes" only works with single class selectors.',
+      ],
+    },
+    onAfterBundle(api) {
+      api.expectFile("/out/entry.js").toMatchInlineSnapshot(`
+          "// styles.module.css
+          var styles_module_default = {
+            local0: "GLOBAL2 GLOBAL3 local4_-MSaAA local3_-MSaAA local1_-MSaAA local0_-MSaAA",
+            local3: "local4_-MSaAA local3_-MSaAA",
+            local4: "local4_-MSaAA",
+            local1: "local4_-MSaAA local3_-MSaAA local1_-MSaAA",
+            fromOtherFile: "base1_1Cz41w base2_1Cz41w local0_qwJuwA base3_1Cz41w local0_AgBO5Q fromOtherFile_-MSaAA"
+          };
+
+          // entry.js
+          console.log(styles_module_default);
+          "
+        `);
+      api.expectFile("/out/entry.css").toMatchInlineSnapshot(`
+          "/* global.css */
+          .GLOBAL1 {
+            color: #000;
+          }
+
+          /* other1.module.css */
+          .local0_qwJuwA {
+            color: #00f;
+          }
+
+          /* base.module.css */
+          .base1_1Cz41w {
+            cursor: pointer;
+          }
+
+          .base2_1Cz41w {
+            display: inline;
+          }
+
+          .base3_1Cz41w {
+            float: left;
+          }
+
+          /* other2.module.css */
+          .local0_AgBO5Q {
+            background: purple;
+          }
+
+          /* styles.module.css */
+          .local0_-MSaAA {
+            background: green;
+          }
+
+          .local3_-MSaAA {
+            border: 1px solid #000;
+          }
+
+          .local4_-MSaAA {
+            opacity: .5;
+          }
+
+          .local1_-MSaAA {
+            color: red;
+          }
+
+          .fromOtherFile_-MSaAA {
+          }
+          "
+        `);
+    },
+  });
+
+  itBundled("css/ImportCSSFromJSComposesFromMissingImport", {
+    files: {
+      "/entry.js": `
+          import styles from "./styles.module.css"
+          console.log(styles)
+        `,
+      "/styles.module.css": `
+          .foo {
+            composes: x from "file.module.css";
+            composes: y from "file.module.css";
+            composes: z from "file.module.css";
+            composes: x from "file.css";
+          }
+        `,
+      "/file.module.css": `
+          .x {
+            color: red;
+          }
+          :global(.y) {
+            color: blue;
+          }
+        `,
+      "/file.css": `
+          .x {
+            color: red;
+          }
+        `,
+    },
+    entryPoints: ["/entry.js"],
+    outdir: "/out",
+    bundleErrors: {
+      "/styles.module.css": [
+        // TODO: renable when we support :local and :global
+        // 'Cannot use global name "y" with "composes"',
+        // 'Cannot use global name "x" with "composes"',
+      ],
+      "/file.module.css": [
+        'The name "y" never appears in "file.module.css"',
+        'The name "z" never appears in "file.module.css"',
+      ],
+      "/file.css": ['The name "x" never appears in "file.css"'],
+    },
+    bundleWarnings: {
+      "/styles.module.css": [
+        // TODO: renable when we support :local and :global
+        // 'The global name "y" is defined in file.module.css. Use the ":local" selector to change "y" into a local name.',
+        // 'The global name "x" is defined in file.css. Use the "local-css" loader for "file.css" to enable local names.',
+      ],
+    },
+  });
+
+  itBundled("css/ImportCSSFromJSComposesFromNotCSS", {
+    files: {
+      "/entry.js": `
+          import styles from "./styles.module.css"
+          console.log(styles)
+        `,
+      "/styles.module.css": `
+          .foo {
+            composes: bar from "file.txt";
+          }
+        `,
+      "/file.txt": `
+          .bar {
+            color: red;
+          }
+        `,
+    },
+    loader: {
+      ".txt": "text",
+    },
+    entryPoints: ["/entry.js"],
+    outdir: "/out",
+    bundleErrors: {
+      "/styles.module.css": ['Cannot use the "composes" property with the "file.txt" file (it is not a CSS file)'],
+    },
+  });
+
+  itBundled("css/ImportCSSFromJSComposesCircular", {
+    files: {
+      "/entry.js": `
+        import styles from "./styles.module.css"
+        console.log(styles)
+      `,
+      "/styles.module.css": `
+        .foo {
+          composes: bar;
+        }
+        .bar {
+          composes: foo;
+        }
+        .baz {
+          composes: baz;
+        }
+      `,
+    },
+    entryPoints: ["/entry.js"],
+    outdir: "/out",
+
+    onAfterBundle(api) {
+      api.expectFile("/out/entry.js").toMatchInlineSnapshot(`
+        "// styles.module.css
+        var styles_module_default = {
+          foo: "bar_-MSaAA foo_-MSaAA",
+          bar: "foo_-MSaAA bar_-MSaAA",
+          baz: "baz_-MSaAA"
+        };
+
+        // entry.js
+        console.log(styles_module_default);
+        "
+      `);
+      api.expectFile("/out/entry.css").toMatchInlineSnapshot(`
+        "/* styles.module.css */
+        .foo_-MSaAA {
+        }
+
+        .bar_-MSaAA {
+        }
+
+        .baz_-MSaAA {
+        }
+        "
+      `);
+    },
+  });
+
+  itBundled("css/ImportCSSFromJSComposesFromCircular", {
+    files: {
+      "/entry.js": `
+        import styles from "./styles.module.css"
+        console.log(styles)
+      `,
+      "/styles.module.css": `
+        .foo {
+          composes: bar from "other.module.css";
+        }
+        .bar {
+          composes: bar from "styles.module.css";
+        }
+      `,
+      "/other.module.css": `
+        .bar {
+          composes: foo from "styles.module.css";
+        }
+      `,
+    },
+    entryPoints: ["/entry.js"],
+    outdir: "/out",
+
+    onAfterBundle(api) {
+      api.expectFile("/out/entry.js").toMatchInlineSnapshot(`
+        "// styles.module.css
+        var styles_module_default = {
+          foo: "bar_NlEjJA foo_-MSaAA",
+          bar: "bar_-MSaAA"
+        };
+
+        // entry.js
+        console.log(styles_module_default);
+        "
+      `);
+      api.expectFile("/out/entry.css").toMatchInlineSnapshot(`
+        "/* other.module.css */
+        .bar_NlEjJA {
+        }
+
+        /* styles.module.css */
+        .foo_-MSaAA {
+        }
+
+        .bar_-MSaAA {
+        }
+        "
+      `);
+    },
+  });
+
+  // Define all the invalid cases
+  type InvalidComposesTest = { name: string; cssContent: string; expectedError?: string; expectedWarning?: string };
+  const invalidComposesTests: InvalidComposesTest[] = [
+    {
+      name: "IDSelector",
+      cssContent: `
+        /* Invalid: ID selector */
+        .withId {
+          composes: #invalid;
+          color: red;
+        }
+      `,
+      expectedError: "Invalid declaration",
+    },
+    {
+      name: "ElementSelector",
+      cssContent: `
+        /* Invalid: Element selector */
+        .withElement {
+          composes: div;
+          color: blue;
+        }
+      `,
+      expectedError:
+        'The name "div" never appears in "styles.module.css" as a CSS modules locally scoped class name. Note that "composes" only works with single class selectors.',
+    },
+    {
+      name: "CompoundSelector",
+      cssContent: `
+        /* Invalid: Compound selector */
+        .withCompound {
+          composes: .valid.invalid;
+          color: green;
+        }
+      `,
+      expectedError: "Invalid declaration",
+    },
+    {
+      name: "ComplexSelector",
+      cssContent: `
+        /* Invalid: Complex selector */
+        .withComplex {
+          composes: .parent > .child;
+          color: purple;
+        }
+      `,
+      expectedError: "Invalid declaration",
+    },
+    {
+      name: "PseudoClass",
+      cssContent: `
+        /* Invalid: Pseudo-class */
+        .withPseudo {
+          composes: .valid:hover;
+          color: orange;
+        }
+      `,
+      expectedError: "Invalid declaration",
+    },
+    {
+      name: "AttributeSelector",
+      cssContent: `
+        /* Invalid: Attribute selector */
+        .withAttribute {
+          composes: [disabled];
+          color: yellow;
+        }
+      `,
+      expectedError: "Invalid declaration",
+    },
+    {
+      name: "ImportedNonClass",
+      cssContent: `
+        /* Invalid: Imported non-class */
+        .withImportedNonClass {
+          composes: element from "other.module.css";
+          color: magenta;
+        }
+      `,
+      expectedError:
+        'The name "element" never appears in "other.module.css" as a CSS modules locally scoped class name. Note that "composes" only works with single class selectors.',
+    },
+  ];
+
+  // Create a separate test for each invalid case
+  for (const testCase of invalidComposesTests) {
+    itBundled(`css/ImportCSSFromJSComposes${testCase.name}`, {
+      files: {
+        "/entry.js": /* js */ `
+          import styles from "./styles.module.css"
+          console.log(styles)
+        `,
+        "/styles.module.css": /* css */ testCase.cssContent,
+        "/other.module.css": /* css */ `
+          /* Non-class selectors in another file */
+          div {
+            color: brown;
+          }
+          
+          #id {
+            color: teal;
+          }
+          
+          .valid {
+            color: pink;
+          }
+          
+          element {
+            color: gray;
+          }
+        `,
+      },
+      entryPoints: ["/entry.js"],
+      outdir: "/out",
+      bundleErrors: testCase.expectedError
+        ? testCase.name === "ImportedNonClass"
+          ? { "/other.module.css": [testCase.expectedError] }
+          : { "/styles.module.css": [testCase.expectedError] }
+        : undefined,
+      bundleWarnings: testCase.expectedWarning ? { "/styles.module.css": [testCase.expectedWarning] } : undefined,
+      onAfterBundle(api) {
+        // Check that the output files were generated correctly
+        api.expectFile("/out/entry.js").toMatchSnapshot();
+        api.expectFile("/out/entry.css").toMatchSnapshot();
+      },
+    });
+  }
+
+  itBundled("css/ComposesWithSharedPropertiesError", {
+    files: {
+      "/entry.js": `
+      import styles from "./styles.module.css"
+      console.log(styles)
+    `,
+      "/styles.module.css": `
+      .button {
+        color: blue;
+        composes: otherButton from "./other.module.css";
+      }
+    `,
+      "/other.module.css": `
+      .otherButton {
+        color: red;
+        font-size: 16px;
+      }
+    `,
+    },
+    entryPoints: ["/entry.js"],
+    outdir: "/out",
+    bundleWarnings: true,
+    onAfterBundle(api) {
+      // Check that the output files were generated correctly
+      api.expectFile("/out/entry.js").toMatchSnapshot();
+      api.expectFile("/out/entry.css").toMatchSnapshot();
+    },
+  });
+
+  itBundled("css/ComposesSameFile", {
+    files: {
+      "/entry.js": `
+      import styles from "./styles.module.css"
+      console.log(styles)
+    `,
+      "/styles.module.css": `
+      .button {
+        color: blue;
+        composes: otherButton from "./styles.module.css";
+      }
+
+      .otherButton {
+        color: red;
+        font-size: 16px;
+      }
+    `,
+    },
+    entryPoints: ["/entry.js"],
+    outdir: "/out",
+    bundleWarnings: true,
+    onAfterBundle(api) {
+      // Check that the output files were generated correctly
+      api.expectFile("/out/entry.js").toMatchInlineSnapshot(`
+        "// styles.module.css
+        var styles_module_default = {
+          button: "otherButton_-MSaAA button_-MSaAA",
+          otherButton: "otherButton_-MSaAA"
+        };
+
+        // entry.js
+        console.log(styles_module_default);
+        "
+      `);
+      api.expectFile("/out/entry.css").toMatchInlineSnapshot(`
+        "/* styles.module.css */
+        .button_-MSaAA {
+          color: #00f;
+        }
+
+        .otherButton_-MSaAA {
+          color: red;
+          font-size: 16px;
+        }
+        "
+      `);
+    },
+  });
+
+  itBundled("css/ComposesSameFileSameClass", {
+    files: {
+      "/entry.js": `
+      import styles from "./styles.module.css"
+      console.log(styles)
+    `,
+      "/styles.module.css": `
+      .button {
+        color: blue;
+        composes: button from "./styles.module.css";
+      }
+    `,
+    },
+    entryPoints: ["/entry.js"],
+    outdir: "/out",
+    bundleWarnings: true,
+    onAfterBundle(api) {
+      // Check that the output files were generated correctly
+      api.expectFile("/out/entry.js").toMatchInlineSnapshot(`
+        "// styles.module.css
+        var styles_module_default = {
+          button: "button_-MSaAA"
+        };
+
+        // entry.js
+        console.log(styles_module_default);
+        "
+      `);
+      api.expectFile("/out/entry.css").toMatchInlineSnapshot(`
+        "/* styles.module.css */
+        .button_-MSaAA {
+          color: #00f;
+        }
+        "
+      `);
+    },
+  });
+});
+
+describe("esbuild-bundler", () => {
+  itBundled("css/CSSEntryPoint", {
+    // GENERATED
+    files: {
+      "/entry.css": /* css */ `
+        body {
+          background: white;
+          color: black }
+      `,
+    },
+  });
+  itBundled("css/CSSAtImportMissing", {
+    files: {
+      "/entry.css": `@import "./missing.css";`,
+    },
+    bundleErrors: {
+      "/entry.css": ['Could not resolve: "./missing.css"'],
+    },
+  });
+  itBundled("css/CSSAtImportExternal", {
+    external: ["./external1.css", "./external2.css", "./external3.css", "./external4.css", "./external5.css"],
+    // GENERATED
+    files: {
+      "/entry.css": /* css */ `
+        @import "./internal.css";
+        @import "./external1.css";
+        @import "./external2.css";
+        @import "./charset1.css";
+        @import "./charset2.css";
+        @import "./external5.css" screen;
+      `,
+      "/internal.css": /* css */ `
+        @import "./external5.css" print;
+        .before { color: red }
+      `,
+      "/charset1.css": /* css */ `
+        @charset "UTF-8";
+        @import "./external3.css";
+        @import "./external4.css";
+        @import "./external5.css";
+        @import "https://www.example.com/style1.css";
+        @import "https://www.example.com/style2.css";
+        @import "https://www.example.com/style3.css" print;
+        .middle { color: green }
+      `,
+      "/charset2.css": /* css */ `
+        @charset "UTF-8";
+        @import "./external3.css";
+        @import "./external5.css" screen;
+        @import "https://www.example.com/style1.css";
+        @import "https://www.example.com/style3.css";
+        .after { color: blue }
+      `,
+    },
+    outfile: "/out/out.css",
+    onAfterBundle(api) {
+      api.expectFile("/out/out.css").toEqualIgnoringWhitespace(/* css */ `@import "./external1.css";
+@import "./external2.css";
+@import "./external4.css";
+@import "./external5.css";
+@import "https://www.example.com/style2.css";
+@import "./external3.css";
+@import "https://www.example.com/style1.css";
+@import "https://www.example.com/style3.css";
+@import "./external5.css" screen;
+
+/* internal.css */
+.before {
+          color: red;
+        }
+
+/* charset1.css */
+.middle {
+          color: green;
+        }
+
+/* charset2.css */
+.after {
+  color: #00f;
+}
+
+/* entry.css */`);
+    },
+  });
+  itBundled("css/CSSAtImport", {
+    // GENERATED
+    files: {
+      "/entry.css": /* css */ `
+        @import "./a.css";
+        @import "./b.css";
+        .entry { color: red }
+      `,
+      "/a.css": /* css */ `
+        @import "./shared.css";
+        .a { color: green }
+      `,
+      "/b.css": /* css */ `
+        @import "./shared.css";
+        .b { color: blue }
+      `,
+      "/shared.css": `.shared { color: black }`,
+    },
+  });
+  itBundled("css/CSSFromJSMissingImport", {
+    // GENERATED
+    files: {
+      "/entry.js": /* js */ `
+        import {missing} from "./a.css"
+        console.log(missing)
+      `,
+      "/a.css": `.a { color: red }`,
+    },
+    bundleErrors: {
+      "/entry.js": ['No matching export in "a.css" for import "missing"'],
+    },
+  });
+  itBundled("css/CSSFromJSMissingStarImport", {
+    outdir: "/out",
+    files: {
+      "/entry.js": /* js */ `
+        import * as ns from "./a.css"
+        console.log(ns.missing)
+      `,
+      "/a.css": `.a { color: red }`,
+    },
+    bundleWarnings: {
+      "/entry.js": ['Import "missing" will always be undefined because there is no matching export in "a.css"'],
+    },
+    onAfterBundle(api) {
+      api.expectFile("/out/entry.css").toEqualIgnoringWhitespace(/* css */ `/* a.css */
+        .a{
+          color: red;
+        }`);
+    },
+  });
+  itBundled("css/ImportCSSFromJS", {
+    outdir: "/out",
+    files: {
+      "/entry.js": /* js */ `
+        import "./a.js"
+        import "./b.js"
+      `,
+      "/a.js": /* js */ `
+        import "./a.css";
+        console.log('a')
+      `,
+      "/a.css": `.a { color: red }`,
+      "/b.js": /* js */ `
+        import "./b.css";
+        console.log('b')
+      `,
+      "/b.css": `.b { color: blue }`,
+    },
+  });
+  // itBundled("css/ImportCSSFromJSWriteToStdout", {
+  //   files: {
+  //     "/entry.js": `import "./entry.css"`,
+  //     "/entry.css": `.entry { color: red }`,
+  //   },
+  //   bundleErrors: {
+  //     "/entry.js": ['Cannot import "entry.css" into a JavaScript file without an output path configured'],
+  //   },
+  // });
+  itBundled("css/ImportJSFromCSS", {
+    outdir: "/out",
+    files: {
+      "/entry.ts": `export default 123`,
+      "/entry.css": `@import "./entry.ts";`,
+    },
+    entryPoints: ["/entry.css"],
+    bundleErrors: {
+      "/entry.css": ['Cannot import a ".ts" file into a CSS file'],
+    },
+  });
+  itBundled("css/ImportJSONFromCSS", {
+    // GENERATED
+    files: {
+      "/entry.json": `{}`,
+      "/entry.css": `@import "./entry.json";`,
+    },
+    entryPoints: ["/entry.css"],
+    bundleErrors: {
+      "/entry.css": ['Cannot import a ".json" file into a CSS file'],
+    },
+  });
+  itBundled("css/MissingImportURLInCSS", {
+    // GENERATED
+    files: {
+      "/src/entry.css": /* css */ `
+        a { background: url(./one.png); }
+        b { background: url("./two.png"); }
+      `,
+    },
+    bundleErrors: {
+      "/src/entry.css": ['Could not resolve: "./one.png"', 'Could not resolve: "./two.png"'],
+    },
+  });
+
+  // Skipping for now
+  itBundled("css/ExternalImportURLInCSS", {
+    files: {
+      "/src/entry.css": /* css */ `
+        div:after {
+          content: 'If this is recognized, the path should become "../src/external.png"';
+          background: url(./external.png);
+        }
+
+        /* These URLs should be external automatically */
+        a { background: url(http://example.com/images/image.png) }
+        b { background: url(https://example.com/images/image.png) }
+        c { background: url(//example.com/images/image.png) }
+        d { background: url(data:image/png;base64,iVBORw0KGgo=) }
+        path { fill: url(#filter) }
+      `,
+    },
+    external: ["./src/external.png"],
+  });
+
+  itBundled("css/InvalidImportURLInCSS", {
+    // GENERATED
+    files: {
+      "/entry.css": /* css */ `
+        a {
+          background: url(./js.js);
+          background: url("./jsx.jsx");
+          background: url(./ts.ts);
+          background: url('./tsx.tsx');
+          background: url(./json.json);
+          background: url(./css.css);
+        }
+      `,
+      "/js.js": `export default 123`,
+      "/jsx.jsx": `export default 123`,
+      "/ts.ts": `export default 123`,
+      "/tsx.tsx": `export default 123`,
+      "/json.json": `{ "test": true }`,
+      "/css.css": `a { color: red }`,
+    },
+    bundleErrors: {
+      "/entry.css": [
+        'Cannot import a ".jsx" file into a CSS file',
+        'Cannot import a ".jsx" file into a CSS file',
+        'Cannot import a ".ts" file into a CSS file',
+        'Cannot import a ".tsx" file into a CSS file',
+        'Cannot import a ".json" file into a CSS file',
+      ],
+    },
+    /* TODO FIX expectedScanLog: `entry.css: ERROR: Cannot use "js.js" as a URL
+  NOTE: You can't use a "url()" token to reference the file "js.js" because it was loaded with the "js" loader, which doesn't provide a URL to embed in the resulting CSS.
+  entry.css: ERROR: Cannot use "jsx.jsx" as a URL
+  NOTE: You can't use a "url()" token to reference the file "jsx.jsx" because it was loaded with the "jsx" loader, which doesn't provide a URL to embed in the resulting CSS.
+  entry.css: ERROR: Cannot use "ts.ts" as a URL
+  NOTE: You can't use a "url()" token to reference the file "ts.ts" because it was loaded with the "ts" loader, which doesn't provide a URL to embed in the resulting CSS.
+  entry.css: ERROR: Cannot use "tsx.tsx" as a URL
+  NOTE: You can't use a "url()" token to reference the file "tsx.tsx" because it was loaded with the "tsx" loader, which doesn't provide a URL to embed in the resulting CSS.
+  entry.css: ERROR: Cannot use "json.json" as a URL
+  NOTE: You can't use a "url()" token to reference the file "json.json" because it was loaded with the "json" loader, which doesn't provide a URL to embed in the resulting CSS.
+  entry.css: ERROR: Cannot use "css.css" as a URL
+  NOTE: You can't use a "url()" token to reference a CSS file, and "css.css" is a CSS file (it was loaded with the "css" loader).
+  `, */
+  });
+  itBundled("css/TextImportURLInCSSText", {
+    outfile: "/out.css",
+    files: {
+      "/entry.css": /* css */ `
+        a {
+          background: url(./example.txt);
+        }
+      `,
+      "/example.txt": `This is some text.`,
+    },
+    onAfterBundle(api) {
+      api.expectFile("/out.css").toEqualIgnoringWhitespace(/* css */ `
+/* entry.css */
+a {
+  background: url("data:text/plain;base64,VGhpcyBpcyBzb21lIHRleHQu");
+}
+`);
+    },
+  });
+  itBundled("css/Png", {
+    outfile: "/out.css",
+    // GENERATED
+    files: {
+      "/entry.css": /* css */ `
+        a {
+          background: url(./example.png);
+        }
+      `,
+      "/example.png": Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    },
+    onAfterBundle(api) {
+      api.expectFile("/out.css").toEqualIgnoringWhitespace(/* css */ `
+/* entry.css */
+a {
+  background: url("data:image/png;base64,iVBORw0KGgo=");
+}
+`);
+    },
+  });
+
+  // We don't support dataurl rn
+  //   itBundled("css/DataURLImportURLInCSS", {
+  //     outfile: "/out.css",
+  //     // GENERATED
+  //     files: {
+  //       "/entry.css": /* css */ `
+  //         a {
+  //           background: url(./example.png);
+  //         }
+  //       `,
+  //       "/example.png": new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  //     },
+  //     loader: {
+  //       ".png": "dataurl",
+  //     },
+  //     onAfterBundle(api) {
+  //       api.expectFile("/out.css").toEqualIgnoringWhitespace(/* css */ `
+  // /* entry.css */
+  // a {
+  //   background: url("data:image/png;base64,iVBORw0KGgo=");
+  // }
+  // `);
+  //     },
+  //   });
+
+  // We don't support binary loader rn
+  //   itBundled("css/BinaryImportURLInCSS", {
+
+  //     // GENERATED
+  //     files: {
+  //       "/entry.css": /* css */ `
+  //         a {
+  //           background: url(./example.png);
+  //         }
+  //       `,
+  //       "/example.png": new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  //     },
+  //     onAfterBundle(api) {
+  //       api.expectFile("/out.css").toEqualIgnoringWhitespace(/* css */ `
+  // /* entry.css */
+  // a {
+  //   background: url("data:image/png;base64,iVBORw0KGgo=");
+  // }
+  // `);
+  //     },
+  //   });
+
+  // We don't support base64 loader rn
+  // itBundled("css/Base64ImportURLInCSS", {
+
+  //   // GENERATED
+  //   files: {
+  //     "/entry.css": /* css */ `
+  //       a {
+  //         background: url(./example.png);
+  //       }
+  //     `,
+  //     "/example.png": `\x89\x50\x4E\x47\x0D\x0A\x1A\x0A`,
+  //   },
+  // });
+
+  itBundled("css/FileImportURLInCSS", {
+    files: {
+      "/entry.css": /* css */ `
+        @import "./one.css";
+        @import "./two.css";
+      `,
+      "/one.css": `a { background: url(./example.data) }`,
+      "/two.css": `b { background: url(./example.data) }`,
+      "/example.data": new Array(128 * 1024 + 1).fill("Z".charCodeAt(0)).join(""),
+    },
+    loader: {
+      ".data": "file",
+    },
+    outdir: "/out",
+    async onAfterBundle(api) {
+      api.expectFile("/out/example-ra0pdz4b.data").toEqual(new Array(128 * 1024 + 1).fill("Z".charCodeAt(0)).join(""));
+
+      api.expectFile("/out/entry.css").toEqualIgnoringWhitespace(/* css */ `
+/* one.css */
+a {
+  background: url("./example-ra0pdz4b.data");
+}
+
+/* two.css */
+b {
+  background: url("./example-ra0pdz4b.data");
+}
+
+/* entry.css */
+
+`);
+    },
+  });
+
+  // A url()'s `?query` / `#fragment` suffix must survive path rewriting so that
+  // SVG fragment references like `url(sprites.svg#icon)` keep addressing the
+  // element inside the asset. esbuild also preserves these.
+  itBundled("css/URLQueryFragmentPreservedFileLoader", {
+    files: {
+      "/entry.css": /* css */ `
+        .a { mask: url(./sprites.svg#icon) }
+        .b { clip-path: url("./sprites.svg?v=3#c") }
+        .c { background: url(./sprites.svg) }
+        .d { --bg: url("./sprites.svg#custom") }
+      `,
+      "/sprites.svg": Buffer.alloc(128 * 1024 + 1, "Z").toString(),
+    },
+    loader: {
+      ".svg": "file",
+    },
+    outdir: "/out",
+    onAfterBundle(api) {
+      api.expectFile("/out/entry.css").toEqualIgnoringWhitespace(/* css */ `
+/* entry.css */
+.a {
+  mask: url("./sprites-mrrzcz3w.svg#icon");
+}
+.b {
+  clip-path: url("./sprites-mrrzcz3w.svg?v=3#c");
+}
+.c {
+  background: url("./sprites-mrrzcz3w.svg");
+}
+.d {
+  --bg: url("./sprites-mrrzcz3w.svg#custom");
+}
+`);
+    },
+  });
+  itBundled("css/URLQueryFragmentPreservedDataURL", {
+    files: {
+      "/entry.css": /* css */ `
+        .a { mask: url(./small.svg#m1) }
+        .b { background: url("./small.svg?v=2") }
+        .c { mask: url(./small.svg?v=2#m1) }
+        .d { background: url(./small.svg) }
+      `,
+      "/small.svg": `<svg xmlns="http://www.w3.org/2000/svg"><mask id="m1"/></svg>`,
+    },
+    outdir: "/out",
+    onAfterBundle(api) {
+      // A `?query` appended to a base64 data: URL lands in the body and fails
+      // decoding, so only the `#fragment` is kept on the inline path.
+      api.expectFile("/out/entry.css").toEqualIgnoringWhitespace(/* css */ `
+/* entry.css */
+.a {
+  mask: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxtYXNrIGlkPSJtMSIvPjwvc3ZnPg==#m1");
+}
+.b {
+  background: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxtYXNrIGlkPSJtMSIvPjwvc3ZnPg==");
+}
+.c {
+  mask: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxtYXNrIGlkPSJtMSIvPjwvc3ZnPg==#m1");
+}
+.d {
+  background: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxtYXNrIGlkPSJtMSIvPjwvc3ZnPg==");
+}
+`);
+    },
+  });
+  itBundled("css/URLQueryFragmentPreservedMinified", {
+    files: {
+      "/entry.css": /* css */ `
+        .a { mask: url(./sprites.svg#icon) }
+      `,
+      "/sprites.svg": Buffer.alloc(128 * 1024 + 1, "Z").toString(),
+    },
+    loader: {
+      ".svg": "file",
+    },
+    minifyWhitespace: true,
+    outdir: "/out",
+    onAfterBundle(api) {
+      api
+        .expectFile("/out/entry.css")
+        .toEqualIgnoringWhitespace(/* css */ `.a{mask:url("./sprites-mrrzcz3w.svg#icon")}`);
+    },
+  });
+
+  itBundled("css/IgnoreURLsInAtRulePrelude", {
+    // GENERATED
+    files: {
+      "/entry.css": /* css */ `
+        /* This should not generate a path resolution error */
+        @supports (background: url(ignored.png)) {
+          a { color: red }
+        }
+      `,
+    },
+  });
+
+  itBundled("css/URLInEnvFallbackOfAtImportMediaQuery", {
+    files: {
+      "/entry.css": /* css */ `
+        @import "./b.css" (min-width: env(foo, url(sub/g.css)));
+        .c0 { color: blue }
+      `,
+      "/b.css": `.b1 { color: green }`,
+      "/sub/g.css": `.c0 { color: red }`,
+    },
+    backend: "cli",
+    outdir: "/out",
+    onAfterBundle(api) {
+      api.expectFile("/out/entry.css").toBe(`/* b.css */
+@media (min-width: env(foo, url(sub/g.css))) {
+  .b1 {
+    color: green;
+  }
+}
+
+/* entry.css */
+.c0 {
+  color: #00f;
+}
+`);
+    },
+  });
+
+  itBundled("css/PackageURLsInCSS", {
+    files: {
+      "/entry.css": /* css */ `
+        @import "./test.css";
+
+        a { background: url(a/1.png); }
+        b { background: url(b/2.png); }
+        c { background: url(c/3.png); }
+      `,
+      "/test.css": `.css { color: red }`,
+      "/a/1.png": `a-1`,
+      "/node_modules/b/2.png": `b-2-node_modules`,
+      "/c/3.png": `c-3`,
+      "/node_modules/c/3.png": `c-3-node_modules`,
+    },
+    outfile: "/out.css",
+    onAfterBundle(api) {
+      api.expectFile("/out.css").toEqualIgnoringWhitespace(/* css */ `
+/* test.css */
+.css {
+  color: red;
+}
+
+/* entry.css */
+a {
+  background: url("data:image/png;base64,YS0x");
+}
+b {
+  background: url("data:image/png;base64,Yi0yLW5vZGVfbW9kdWxlcw==");
+}
+c {
+  background: url("data:image/png;base64,Yy0z");
+}
+`);
+    },
+  });
+
+  itBundled("css/CSSAtImportExtensionOrderCollision", {
+    files: {
+      // This should avoid picking ".js" because it's explicitly configured as non-CSS
+      "/entry.css": `@import "./test";`,
+      "/test.js": `console.log('js')`,
+      "/test.css": `.css { color: red }`,
+    },
+    outfile: "/out.css",
+    // extensionOrder: [".js", ".css"],
+    onAfterBundle(api) {
+      api.expectFile("/out.css").toEqualIgnoringWhitespace(/* css */ `
+/* test.css */
+.css {
+  color: red;
+}
+
+/* entry.css */
+
+`);
+    },
+  });
+
+  /* We don't support `extensionOrder`/`--resolve-extensions` rn
+  itBundled("css/CSSAtImportExtensionOrderCollisionUnsupported", {
+
+    // GENERATED
+    files: {
+      "/entry.css": `@import "./test";`,
+      "/test.js": `console.log('js')`,
+      "/test.sass": `// some code`,
+    },
+    outfile: "/out.css",
+    extensionOrder: [".js", ".sass"],
+    bundleErrors: {
+      "/entry.css": ['ERROR: No loader is configured for ".sass" files: test.sass'],
+    },
+  });
+  */
+
+  // itBundled("css/CSSAtImportConditionsNoBundle", {
+  //   files: {
+  //     "/entry.css": `@import "./print.css" print;`,
+  //   },
+  // });
+
+  itBundled("css/CSSAtImportConditionsBundleExternal", {
+    files: {
+      "/entry.css": /* css */ `@import "https://example.com/print.css" print;`,
+    },
+    outfile: "/out.css",
+    onAfterBundle(api) {
+      api.expectFile("/out.css").toEqualIgnoringWhitespace(/* css */ `
+@import "https://example.com/print.css" print;
+
+/* entry.css */
+
+`);
+    },
+  });
+
+  itBundled("css/CSSAtImportConditionsBundleExternalConditionWithURL", {
+    files: {
+      "/entry.css": /* css */ `@import "https://example.com/foo.css" supports(background: url("foo.png"));`,
+    },
+  });
+
+  itBundled("css/CSSAtImportConditionsBundleLOL", {
+    outfile: "/out.css",
+    files: {
+      "/entry.css": /* css */ `
+@import url(http://example.com/foo.css);
+@import url(http://example.com/foo.css) layer;
+@import url(http://example.com/foo.css) layer(layer-name);
+@import url(http://example.com/foo.css) layer(layer-name) supports(display: flex);
+@import url(http://example.com/foo.css) layer(layer-name) supports(display: flex) (min-width: 768px) and
+  (max-width: 1024px);
+@import url(http://example.com/foo.css) layer(layer-name) (min-width: 768px) and (max-width: 1024px);
+@import url(http://example.com/foo.css) supports(display: flex);
+@import url(http://example.com/foo.css) supports(display: flex) (min-width: 768px) and (max-width: 1024px);
+@import url(http://example.com/foo.css) (min-width: 768px) and (max-width: 1024px);
+
+@import url(./foo.css);
+@import url(./foo.css) layer;
+@import url(./foo.css) layer(layer-name);
+@import url(./foo.css) layer(layer-name) supports(display: flex);
+@import url(./foo.css) layer(layer-name) supports(display: flex) (min-width: 768px) and (max-width: 1024px);
+@import url(./foo.css) layer(layer-name) (min-width: 768px) and (max-width: 1024px);
+@import url(./foo.css) supports(display: flex);
+@import url(./foo.css) supports(display: flex) (min-width: 768px) and (max-width: 1024px);
+@import url(./foo.css) (min-width: 768px) and (max-width: 1024px);
+
+@import url(./empty-1.css) layer(empty-1);
+@import url(./empty-2.css) supports(empty: 2);
+@import url(./empty-3.css) (empty: 3);
+
+@import "./nested-layer.css" layer(outer);
+@import "./nested-layer.css" supports(outer: true);
+@import "./nested-layer.css" (outer: true);
+@import "./nested-supports.css" layer(outer);
+@import "./nested-supports.css" supports(outer: true);
+@import "./nested-supports.css" (outer: true);
+@import "./nested-media.css" layer(outer);
+@import "./nested-media.css" supports(outer: true);
+@import "./nested-media.css" (outer: true);
+			`,
+
+      "/foo.css": /* css */ `body { color: red }`,
+
+      "/empty-1.css": ``,
+      "/empty-2.css": ``,
+      "/empty-3.css": ``,
+
+      "/nested-layer.css": /* css */ `@import "./foo.css" layer(inner);`,
+      "/nested-supports.css": /* css */ `@import "./foo.css" supports(inner: true);`,
+      "/nested-media.css": /* css */ `@import "./foo.css" (inner: true);`,
+    },
+    onAfterBundle(api) {
+      // api.expectFile("/out.css").toMatchSnapshot();
+      api.expectFile("/out.css").toEqualIgnoringWhitespace(/* css */ `@import "http://example.com/foo.css";
+        @import "http://example.com/foo.css" layer;
+        @import "http://example.com/foo.css" layer(layer-name);
+        @import "http://example.com/foo.css" layer(layer-name) supports(display: flex);
+        @import "http://example.com/foo.css" layer(layer-name) supports(display: flex) (min-width: 768px) and (max-width: 1024px);
+        @import "http://example.com/foo.css" layer(layer-name) (min-width: 768px) and (max-width: 1024px);
+        @import "http://example.com/foo.css" supports(display: flex);
+        @import "http://example.com/foo.css" (min-width: 768px) and (max-width: 1024px);
+
+        /* foo.css */
+        body {
+          color: red;
+        }
+
+        /* foo.css */
+        @layer {
+          body {
+            color: red;
+          }
+        }
+
+        /* foo.css */
+        @layer layer-name {
+          body {
+            color: red;
+          }
+        }
+
+        /* foo.css */
+        @supports (display: flex) {
+          @layer layer-name {
+            body {
+              color: red;
+            }
+          }
+        }
+
+        /* foo.css */
+        @media (min-width: 768px) and (max-width: 1024px) {
+          @layer layer-name {
+            body {
+          color: red;
+            }
+          }
+        }
+
+        /* foo.css */
+        @supports (display: flex) {
+          body {
+            color: red;
+          }
+        }
+
+        /* foo.css */
+        @media (min-width: 768px) and (max-width: 1024px) {
+          body {
+            color: red;
+          }
+        }
+
+        /* empty-1.css */
+        @layer empty-1;
+
+        /* empty-2.css */
+
+        /* empty-3.css */
+
+        /* foo.css */
+        @layer outer {
+          @layer inner {
+            body {
+              color: red;
+            }
+          }
+        }
+
+        /* nested-layer.css */
+        @layer outer;
+
+        /* foo.css */
+        @supports (outer: true) {
+          @layer inner {
+            body {
+              color: red;
+            }
+          }
+        }
+
+        /* nested-layer.css */
+
+        /* foo.css */
+        @media (outer: true) {
+          @layer inner {
+            body {
+              color: red;
+            }
+          }
+        }
+
+        /* nested-layer.css */
+
+        /* foo.css */
+        @layer outer {
+          @supports (inner: true) {
+            body {
+              color: red;
+            }
+          }
+        }
+
+        /* nested-supports.css */
+        @layer outer;
+
+        /* foo.css */
+        @supports (outer: true) {
+          @supports (inner: true) {
+            body {
+              color: red;
+            }
+          }
+        }
+
+        /* nested-supports.css */
+
+        /* foo.css */
+        @media (outer: true) {
+          @supports (inner: true) {
+            body {
+              color: red;
+            }
+          }
+        }
+
+        /* nested-supports.css */
+
+        /* foo.css */
+        @layer outer {
+          @media (inner: true) {
+            body {
+              color: red;
+            }
+          }
+        }
+
+        /* nested-media.css */
+        @layer outer;
+
+        /* foo.css */
+        @supports (outer: true) {
+          @media (inner: true) {
+            body {
+              color: red;
+            }
+          }
+        }
+
+        /* nested-media.css */
+
+        /* foo.css */
+        @media (outer: true) {
+          @media (inner: true) {
+            body {
+              color: red;
+            }
+          }
+        }
+
+        /* nested-media.css */
+
+        /* entry.css */
+      `);
+    },
+  });
+
+  // This tests that bun correctly clones the import records for all import
+  // condition tokens. If they aren't cloned correctly, then something will
+  // likely crash with an out-of-bounds error.
+  itBundled("css/CSSAtImportConditionsWithImportRecordsBundle", {
+    files: {
+      "/entry.css": /* css */ `
+        @import url(./foo.css) supports(background: url(./a.png));
+        @import url(./foo.css) supports(background: url(./b.png)) list-of-media-queries;
+        @import url(./foo.css) layer(layer-name) supports(background: url(./a.png));
+        @import url(./foo.css) layer(layer-name) supports(background: url(./b.png)) list-of-media-queries;
+      `,
+      "/foo.css": /* css */ `body { color: red }`,
+      "/a.png": `A`,
+      "/b.png": `B`,
+    },
+    outfile: "/out.css",
+    onAfterBundle(api) {
+      api.expectFile("/out.css").toEqualIgnoringWhitespace(/* css */ `
+/* foo.css */
+@supports (background: url(./a.png)) {
+  body {
+    color: red;
+  }
+}
+
+/* foo.css */
+@media list-of-media-queries {
+  @supports (background: url(./b.png)) {
+    body {
+      color: red;
+    }
+  }
+}
+
+/* foo.css */
+@supports (background: url(./a.png)) {
+  @layer layer-name {
+    body {
+      color: red;
+    }
+  }
+}
+
+/* foo.css */
+@media list-of-media-queries {
+  @supports (background: url(./b.png)) {
+    @layer layer-name {
+      body {
+        color: red;
+      }
+    }
+  }
+}
+
+/* entry.css */
+
+`);
+    },
+  });
+
+  const files = [
+    "/001/default/style.css",
+    "/001/relative-url/style.css",
+    "/at-charset/001/style.css",
+    "/at-keyframes/001/style.css",
+    "/at-layer/001/style.css",
+    "/at-layer/002/style.css",
+    "/at-layer/003/style.css",
+    "/at-layer/004/style.css",
+    "/at-layer/005/style.css",
+    "/at-layer/006/style.css",
+    "/at-layer/007/style.css",
+    "/at-layer/008/style.css",
+    "/at-media/001/default/style.css",
+    "/at-media/002/style.css",
+    "/at-media/003/style.css",
+    "/at-media/004/style.css",
+    "/at-media/005/style.css",
+    "/at-media/006/style.css",
+    "/at-media/007/style.css",
+    "/at-media/008/style.css",
+    "/at-supports/001/style.css",
+    "/at-supports/002/style.css",
+    "/at-supports/003/style.css",
+    "/at-supports/004/style.css",
+    "/at-supports/005/style.css",
+    "/cycles/001/style.css",
+    "/cycles/002/style.css",
+    "/cycles/003/style.css",
+    "/cycles/004/style.css",
+    "/cycles/005/style.css",
+    "/cycles/006/style.css",
+    "/cycles/007/style.css",
+    "/cycles/008/style.css",
+    "/data-urls/002/style.css",
+    "/data-urls/003/style.css",
+    "/duplicates/001/style.css",
+    "/duplicates/002/style.css",
+    "/empty/001/style.css",
+    "/relative-paths/001/style.css",
+    "/relative-paths/002/style.css",
+    "/subresource/001/style.css",
+    "/subresource/002/style.css",
+    "/subresource/004/style.css",
+    "/subresource/005/style.css",
+    "/subresource/007/style.css",
+    "/url-format/001/default/style.css",
+    "/url-format/001/relative-url/style.css",
+    "/url-format/002/default/style.css",
+    "/url-format/002/relative-url/style.css",
+    "/url-format/003/default/style.css",
+    "/url-format/003/relative-url/style.css",
+    "/url-fragments/001/style.css",
+    "/url-fragments/002/style.css",
+  ];
+
+  // From: https://github.com/romainmenke/css-import-tests. These test cases just
+  // serve to document any changes in bun's behavior. Any changes in behavior
+  // should be tested to ensure they don't cause any regressions. The easiest way
+  // to test the changes is to bundle https://github.com/evanw/css-import-tests
+  // and visually inspect a browser's rendering of the resulting CSS file.
+  itBundled("css/CSSAtImportConditionsFromExternalRepo", {
+    files: {
+      "/001/default/a.css": `.box { background-color: green; }`,
+      "/001/default/style.css": `@import url("a.css");`,
+
+      "/001/relative-url/a.css": `.box { background-color: green; }`,
+      "/001/relative-url/style.css": `@import url("./a.css");`,
+
+      "/at-charset/001/a.css": `@charset "utf-8"; .box { background-color: red; }`,
+      "/at-charset/001/b.css": `@charset "utf-8"; .box { background-color: green; }`,
+      "/at-charset/001/style.css": `@charset "utf-8"; @import url("a.css"); @import url("b.css");`,
+
+      "/at-keyframes/001/a.css": `
+        .box { animation: BOX; animation-duration: 0s; animation-fill-mode: both; }
+        @keyframes BOX { 0%, 100% { background-color: green; } }
+      `,
+      "/at-keyframes/001/b.css": `
+        .box { animation: BOX; animation-duration: 0s; animation-fill-mode: both; }
+        @keyframes BOX { 0%, 100% { background-color: red; } }
+      `,
+      "/at-keyframes/001/style.css": `@import url("a.css") screen; @import url("b.css") print;`,
+
+      "/at-layer/001/a.css": `.box { background-color: red; }`,
+      "/at-layer/001/b.css": `.box { background-color: green; }`,
+      "/at-layer/001/style.css": `
+        @import url("a.css") layer(a);
+        @import url("b.css") layer(b);
+        @import url("a.css") layer(a);
+      `,
+
+      "/at-layer/002/a.css": `.box { background-color: green; }`,
+      "/at-layer/002/b.css": `.box { background-color: red; }`,
+      "/at-layer/002/style.css": `
+        @import url("a.css") layer(a) print;
+        @import url("b.css") layer(b);
+        @import url("a.css") layer(a);
+      `,
+
+      "/at-layer/003/a.css": `@layer a { .box { background-color: red; } }`,
+      "/at-layer/003/b.css": `@layer b { .box { background-color: green; } }`,
+      "/at-layer/003/style.css": `@import url("a.css"); @import url("b.css"); @import url("a.css");`,
+
+      "/at-layer/004/a.css": `@layer { .box { background-color: green; } }`,
+      "/at-layer/004/b.css": `@layer { .box { background-color: red; } }`,
+      "/at-layer/004/style.css": `@import url("a.css"); @import url("b.css"); @import url("a.css");`,
+
+      "/at-layer/005/a.css": `@import url("b.css") layer(b) (width: 1px);`,
+      "/at-layer/005/b.css": `.box { background-color: red; }`,
+      "/at-layer/005/style.css": `
+        @import url("a.css") layer(a) (min-width: 1px);
+        @layer a.c { .box { background-color: red; } }
+        @layer a.b { .box { background-color: green; } }
+      `,
+
+      "/at-layer/006/a.css": `@import url("b.css") layer(b) (min-width: 1px);`,
+      "/at-layer/006/b.css": `.box { background-color: red; }`,
+      "/at-layer/006/style.css": `
+        @import url("a.css") layer(a) (min-width: 1px);
+        @layer a.c { .box { background-color: green; } }
+        @layer a.b { .box { background-color: red; } }
+      `,
+
+      "/at-layer/007/style.css": `
+        @layer foo {}
+        @layer bar {}
+        @layer bar { .box { background-color: green; } }
+        @layer foo { .box { background-color: red; } }
+      `,
+
+      "/at-layer/008/a.css": `@import "b.css" layer; .box { background-color: green; }`,
+      "/at-layer/008/b.css": `.box { background-color: red; }`,
+      "/at-layer/008/style.css": `@import url("a.css") layer;`,
+
+      "/at-media/001/default/a.css": `.box { background-color: green; }`,
+      "/at-media/001/default/style.css": `@import url("a.css") screen;`,
+
+      "/at-media/002/a.css": `.box { background-color: green; }`,
+      "/at-media/002/b.css": `.box { background-color: red; }`,
+      "/at-media/002/style.css": `@import url("a.css") screen; @import url("b.css") print;`,
+
+      "/at-media/003/a.css": `@import url("b.css") (min-width: 1px);`,
+      "/at-media/003/b.css": `.box { background-color: green; }`,
+      "/at-media/003/style.css": `@import url("a.css") screen;`,
+
+      "/at-media/004/a.css": `@import url("b.css") print;`,
+      "/at-media/004/b.css": `.box { background-color: red; }`,
+      "/at-media/004/c.css": `.box { background-color: green; }`,
+      "/at-media/004/style.css": `@import url("c.css"); @import url("a.css") print;`,
+
+      "/at-media/005/a.css": `@import url("b.css") (max-width: 1px);`,
+      "/at-media/005/b.css": `.box { background-color: red; }`,
+      "/at-media/005/c.css": `.box { background-color: green; }`,
+      "/at-media/005/style.css": `@import url("c.css"); @import url("a.css") (max-width: 1px);`,
+
+      "/at-media/006/a.css": `@import url("b.css") (min-width: 1px);`,
+      "/at-media/006/b.css": `.box { background-color: green; }`,
+      "/at-media/006/style.css": `@import url("a.css") (min-height: 1px);`,
+
+      "/at-media/007/a.css": `@import url("b.css") screen;`,
+      "/at-media/007/b.css": `.box { background-color: green; }`,
+      "/at-media/007/style.css": `@import url("a.css") all;`,
+
+      "/at-media/008/a.css": `@import url("green.css") layer(alpha) print;`,
+      "/at-media/008/b.css": `@import url("red.css") layer(beta) print;`,
+      "/at-media/008/green.css": `.box { background-color: green; }`,
+      "/at-media/008/red.css": `.box { background-color: red; }`,
+      "/at-media/008/style.css": `
+        @import url("a.css") layer(alpha) all;
+        @import url("b.css") layer(beta) all;
+        @layer beta { .box { background-color: green; } }
+        @layer alpha { .box { background-color: red; } }
+      `,
+
+      "/at-supports/001/a.css": `.box { background-color: green; }`,
+      "/at-supports/001/style.css": `@import url("a.css") supports(display: block);`,
+
+      "/at-supports/002/a.css": `@import url("b.css") supports(width: 10px);`,
+      "/at-supports/002/b.css": `.box { background-color: green; }`,
+      "/at-supports/002/style.css": `@import url("a.css") supports(display: block);`,
+
+      "/at-supports/003/a.css": `@import url("b.css") supports(width: 10px);`,
+      "/at-supports/003/b.css": `.box { background-color: green; }`,
+      "/at-supports/003/style.css": `@import url("a.css") supports((display: block) or (display: inline));`,
+
+      "/at-supports/004/a.css": `@import url("b.css") layer(b) supports(width: 10px);`,
+      "/at-supports/004/b.css": `.box { background-color: green; }`,
+      "/at-supports/004/style.css": `@import url("a.css") layer(a) supports(display: block);`,
+
+      "/at-supports/005/a.css": `@import url("green.css") layer(alpha) supports(foo: bar);`,
+      "/at-supports/005/b.css": `@import url("red.css") layer(beta) supports(foo: bar);`,
+      "/at-supports/005/green.css": `.box { background-color: green; }`,
+      "/at-supports/005/red.css": `.box { background-color: red; }`,
+      "/at-supports/005/style.css": `
+        @import url("a.css") layer(alpha) supports(display: block);
+        @import url("b.css") layer(beta) supports(display: block);
+        @layer beta { .box { background-color: green; } }
+        @layer alpha { .box { background-color: red; } }
+      `,
+
+      "/cycles/001/style.css": `@import url("style.css"); .box { background-color: green; }`,
+
+      "/cycles/002/a.css": `@import url("red.css"); @import url("b.css");`,
+      "/cycles/002/b.css": `@import url("green.css"); @import url("a.css");`,
+      "/cycles/002/green.css": `.box { background-color: green; }`,
+      "/cycles/002/red.css": `.box { background-color: red; }`,
+      "/cycles/002/style.css": `@import url("a.css");`,
+
+      "/cycles/003/a.css": `@import url("b.css"); .box { background-color: green; }`,
+      "/cycles/003/b.css": `@import url("a.css"); .box { background-color: red; }`,
+      "/cycles/003/style.css": `@import url("a.css");`,
+
+      "/cycles/004/a.css": `@import url("b.css"); .box { background-color: red; }`,
+      "/cycles/004/b.css": `@import url("a.css"); .box { background-color: green; }`,
+      "/cycles/004/style.css": `@import url("a.css"); @import url("b.css");`,
+
+      "/cycles/005/a.css": `@import url("b.css"); .box { background-color: green; }`,
+      "/cycles/005/b.css": `@import url("a.css"); .box { background-color: red; }`,
+      "/cycles/005/style.css": `@import url("a.css"); @import url("b.css"); @import url("a.css");`,
+
+      "/cycles/006/a.css": `@import url("red.css"); @import url("b.css");`,
+      "/cycles/006/b.css": `@import url("green.css"); @import url("a.css");`,
+      "/cycles/006/c.css": `@import url("a.css");`,
+      "/cycles/006/green.css": `.box { background-color: green; }`,
+      "/cycles/006/red.css": `.box { background-color: red; }`,
+      "/cycles/006/style.css": `@import url("b.css"); @import url("c.css");`,
+
+      "/cycles/007/a.css": `@import url("red.css"); @import url("b.css") screen;`,
+      "/cycles/007/b.css": `@import url("green.css"); @import url("a.css") all;`,
+      "/cycles/007/c.css": `@import url("a.css") not print;`,
+      "/cycles/007/green.css": `.box { background-color: green; }`,
+      "/cycles/007/red.css": `.box { background-color: red; }`,
+      "/cycles/007/style.css": `@import url("b.css"); @import url("c.css");`,
+
+      "/cycles/008/a.css": `@import url("red.css") layer; @import url("b.css");`,
+      "/cycles/008/b.css": `@import url("green.css") layer; @import url("a.css");`,
+      "/cycles/008/c.css": `@import url("a.css") layer;`,
+      "/cycles/008/green.css": `.box { background-color: green; }`,
+      "/cycles/008/red.css": `.box { background-color: red; }`,
+      "/cycles/008/style.css": `@import url("b.css"); @import url("c.css");`,
+
+      "/data-urls/002/style.css": `@import url('data:text/css;plain,.box%20%7B%0A%09background-color%3A%20green%3B%0A%7D%0A');`,
+
+      "/data-urls/003/style.css": `@import url('data:text/css,.box%20%7B%0A%09background-color%3A%20green%3B%0A%7D%0A');`,
+
+      "/duplicates/001/a.css": `.box { background-color: green; }`,
+      "/duplicates/001/b.css": `.box { background-color: red; }`,
+      "/duplicates/001/style.css": `@import url("a.css"); @import url("b.css"); @import url("a.css");`,
+
+      "/duplicates/002/a.css": `.box { background-color: green; }`,
+      "/duplicates/002/b.css": `.box { background-color: red; }`,
+      "/duplicates/002/style.css": `@import url("a.css"); @import url("b.css"); @import url("a.css"); @import url("b.css"); @import url("a.css");`,
+
+      "/empty/001/empty.css": ``,
+      "/empty/001/style.css": `@import url("./empty.css"); .box { background-color: green; }`,
+
+      "/relative-paths/001/a/a.css": `@import url("../b/b.css")`,
+      "/relative-paths/001/b/b.css": `.box { background-color: green; }`,
+      "/relative-paths/001/style.css": `@import url("./a/a.css");`,
+
+      "/relative-paths/002/a/a.css": `@import url("./../b/b.css")`,
+      "/relative-paths/002/b/b.css": `.box { background-color: green; }`,
+      "/relative-paths/002/style.css": `@import url("./a/a.css");`,
+
+      "/subresource/001/something/images/green.png": `...`,
+      "/subresource/001/something/styles/green.css": `.box { background-image: url("../images/green.png"); }`,
+      "/subresource/001/style.css": `@import url("./something/styles/green.css");`,
+
+      "/subresource/002/green.png": `...`,
+      "/subresource/002/style.css": `@import url("./styles/green.css");`,
+      "/subresource/002/styles/green.css": `.box { background-image: url("../green.png"); }`,
+
+      "/subresource/004/style.css": `@import url("./styles/green.css");`,
+      "/subresource/004/styles/green.css": `.box { background-image: url("green.png"); }`,
+      "/subresource/004/styles/green.png": `...`,
+
+      "/subresource/005/style.css": `@import url("./styles/green.css");`,
+      "/subresource/005/styles/green.css": `.box { background-image: url("./green.png"); }`,
+      "/subresource/005/styles/green.png": `...`,
+
+      "/subresource/007/green.png": `...`,
+      "/subresource/007/style.css": `.box { background-image: url("./green.png"); }`,
+
+      "/url-format/001/default/a.css": `.box { background-color: green; }`,
+      "/url-format/001/default/style.css": `@import url(a.css);`,
+
+      "/url-format/001/relative-url/a.css": `.box { background-color: green; }`,
+      "/url-format/001/relative-url/style.css": `@import url(./a.css);`,
+
+      "/url-format/002/default/a.css": `.box { background-color: green; }`,
+      "/url-format/002/default/style.css": `@import "a.css";`,
+
+      "/url-format/002/relative-url/a.css": `.box { background-color: green; }`,
+      "/url-format/002/relative-url/style.css": `@import "./a.css";`,
+
+      "/url-format/003/default/a.css": `.box { background-color: green; }`,
+      "/url-format/003/default/style.css": `@import url("a.css"`,
+
+      "/url-format/003/relative-url/a.css": `.box { background-color: green; }`,
+      "/url-format/003/relative-url/style.css": `@import url("./a.css"`,
+
+      "/url-fragments/001/a.css": `.box { background-color: green; }`,
+      "/url-fragments/001/style.css": `@import url("./a.css#foo");`,
+
+      "/url-fragments/002/a.css": `.box { background-color: green; }`,
+      "/url-fragments/002/b.css": `.box { background-color: red; }`,
+      "/url-fragments/002/style.css": `@import url("./a.css#1"); @import url("./b.css#2"); @import url("./a.css#3");`,
+    },
+    entryPoints: files,
+    outputPaths: files,
+    outdir: "/out",
+    onAfterBundle(api) {
+      for (const file of files) {
+        console.log("Checking snapshot:", file);
+        api.expectFile(join(file)).toMatchSnapshot(file);
+      }
+    },
+  });
+
+  itBundled("css/CSSAtImportConditionsAtLayerBundle", {
+    files: {
+      "/case1.css": /* css */ `
+        @import url(case1-foo.css) layer(first.one);
+        @import url(case1-foo.css) layer(last.one);
+        @import url(case1-foo.css) layer(first.one);
+      `,
+      "/case1-foo.css": `body { color: red }`,
+
+      "/case2.css": /* css */ `
+        @import url(case2-foo.css);
+        @import url(case2-bar.css);
+        @import url(case2-foo.css);
+      `,
+      "/case2-foo.css": `@layer first.one { body { color: red } }`,
+      "/case2-bar.css": `@layer last.one { body { color: green } }`,
+
+      "/case3.css": /* css */ `
+        @import url(case3-foo.css);
+        @import url(case3-bar.css);
+        @import url(case3-foo.css);
+      `,
+      "/case3-foo.css": `@layer { body { color: red } }`,
+      "/case3-bar.css": `@layer only.one { body { color: green } }`,
+
+      "/case4.css": /* css */ `
+        @import url(case4-foo.css) layer(first);
+        @import url(case4-foo.css) layer(last);
+        @import url(case4-foo.css) layer(first);
+      `,
+      "/case4-foo.css": `@layer one { @layer two, three.four; body { color: red } }`,
+
+      "/case5.css": /* css */ `
+        @import url(case5-foo.css) layer;
+        @import url(case5-foo.css) layer(middle);
+        @import url(case5-foo.css) layer;
+      `,
+      "/case5-foo.css": `@layer one { @layer two, three.four; body { color: red } }`,
+
+      // Note: There was a bug that only showed up in this case. We need at least this many cases.
+      "/case6.css": /* css */ `
+        @import url(case6-foo.css) layer(first);
+        @import url(case6-foo.css) layer(last);
+        @import url(case6-foo.css) layer(first);
+      `,
+      "/case6-foo.css": `@layer { @layer two, three.four; body { color: red } }`,
+    },
+    entryPoints: ["/case1.css", "/case2.css", "/case3.css", "/case4.css", "/case5.css", "/case6.css"],
+    outdir: "/out",
+    onAfterBundle(api) {
+      const snapshotFiles = ["case1.css", "case2.css", "case3.css", "case4.css", "case5.css", "case6.css"];
+      for (const file of snapshotFiles) {
+        console.log("Checking snapshot:", file);
+        api.expectFile(join("/out", file)).toMatchSnapshot(file);
+      }
+    },
+  });
+
+  itBundled("css/CSSAtImportConditionsAtLayerBundleAlternatingLayerInFile", {
+    files: {
+      "/a.css": `@layer first { body { color: red } }`,
+      "/b.css": `@layer last { body { color: green } }`,
+
+      "/case1.css": /* css */ `
+        @import url(a.css);
+        @import url(a.css);
+      `,
+
+      "/case2.css": /* css */ `
+        @import url(a.css);
+        @import url(b.css);
+        @import url(a.css);
+      `,
+
+      "/case3.css": /* css */ `
+        @import url(a.css);
+        @import url(b.css);
+        @import url(a.css);
+        @import url(b.css);
+      `,
+
+      "/case4.css": /* css */ `
+        @import url(a.css);
+        @import url(b.css);
+        @import url(a.css);
+        @import url(b.css);
+        @import url(a.css);
+      `,
+
+      "/case5.css": /* css */ `
+        @import url(a.css);
+        @import url(b.css);
+        @import url(a.css);
+        @import url(b.css);
+        @import url(a.css);
+        @import url(b.css);
+      `,
+
+      "/case6.css": /* css */ `
+        @import url(a.css);
+        @import url(b.css);
+        @import url(a.css);
+        @import url(b.css);
+        @import url(a.css);
+        @import url(b.css);
+        @import url(a.css);
+      `,
+    },
+    entryPoints: ["/case1.css", "/case2.css", "/case3.css", "/case4.css", "/case5.css", "/case6.css"],
+    outdir: "/out",
+    onAfterBundle(api) {
+      const snapshotFiles = ["case1.css", "case2.css", "case3.css", "case4.css", "case5.css", "case6.css"];
+      for (const file of snapshotFiles) {
+        console.log("Checking snapshot:", file);
+        api.expectFile(join("/out", file)).toMatchSnapshot(file);
+      }
+    },
+  });
+
+  itBundled("css/CSSAtImportConditionsChainExternal", {
+    files: {
+      "/entry.css": /* css */ `
+        @import "a.css" layer(a) not print;
+      `,
+      "/a.css": /* css */ `
+        @import "http://example.com/external1.css";
+        @import "b.css" layer(b) not tv;
+        @import "http://example.com/external2.css" layer(a2);
+      `,
+      "/b.css": /* css */ `
+        @import "http://example.com/external3.css";
+        @import "http://example.com/external4.css" layer(b2);
+      `,
+    },
+    outfile: "/out.css",
+  });
+
+  // This test mainly just makes sure that this scenario doesn't crash
+  itBundled("css/CSSAndJavaScriptCodeSplittingESBuildIssue1064", {
+    files: {
+      "/a.js": /* js */ `
+        import shared from './shared.js'
+        console.log(shared() + 1)
+      `,
+      "/b.js": /* js */ `
+        import shared from './shared.js'
+        console.log(shared() + 2)
+      `,
+      "/c.css": /* css */ `
+        @import "./shared.css";
+        body { color: red }
+      `,
+      "/d.css": /* css */ `
+        @import "./shared.css";
+        body { color: blue }
+      `,
+      "/shared.js": `export default function() { return 3 }`,
+      "/shared.css": `body { background: black }`,
+    },
+    entryPoints: ["/a.js", "/b.js", "/c.css", "/d.css"],
+    format: "esm",
+    splitting: true,
+    onAfterBundle(api) {
+      const files = ["/a.js", "/b.js", "/c.css", "/d.css"];
+      for (const file of files) {
+        api.expectFile(file).toMatchSnapshot(file);
+      }
+    },
+  });
+
+  itBundled("css/CSSExternalQueryAndHashNoMatchESBuildIssue1822", {
+    files: {
+      "/entry.css": /* css */ `
+        a { background: url(foo/bar.png?baz) }
+        b { background: url(foo/bar.png#baz) }
+      `,
+    },
+    outfile: "/out.css",
+    bundleErrors: {
+      "/entry.css": [
+        `Could not resolve: "foo/bar.png?baz". Maybe you need to "bun install"?`,
+        `Could not resolve: "foo/bar.png#baz". Maybe you need to "bun install"?`,
+      ],
+    },
+  });
+  itBundled("css/CSSNestingOldBrowser", {
+    // GENERATED
+    files: {
+      "/nested-@layer.css": `a { @layer base { color: red; } }`,
+      "/nested-@media.css": `a { @media screen { color: red; } }`,
+      "/nested-ampersand-twice.css": `a { &, & { color: red; } }`,
+      "/nested-ampersand-first.css": `a { &, b { color: red; } }`,
+      "/nested-attribute.css": `a { [href] { color: red; } }`,
+      "/nested-colon.css": `a { :hover { color: red; } }`,
+      "/nested-dot.css": `a { .cls { color: red; } }`,
+      "/nested-greaterthan.css": `a { > b { color: red; } }`,
+      "/nested-hash.css": `a { #id { color: red; } }`,
+      "/nested-plus.css": `a { + b { color: red; } }`,
+      "/nested-tilde.css": `a { ~ b { color: red; } }`,
+      "/toplevel-ampersand-twice.css": `&, & { color: red; }`,
+      "/toplevel-ampersand-first.css": `&, a { color: red; }`,
+      "/toplevel-ampersand-second.css": `a, & { color: red; }`,
+      "/toplevel-attribute.css": `[href] { color: red; }`,
+      "/toplevel-colon.css": `:hover { color: red; }`,
+      "/toplevel-dot.css": `.cls { color: red; }`,
+      "/toplevel-greaterthan.css": `> b { color: red; }`,
+      "/toplevel-hash.css": `#id { color: red; }`,
+      "/toplevel-plus.css": `+ b { color: red; }`,
+      "/toplevel-tilde.css": `~ b { color: red; }`,
+    },
+    entryPoints: [
+      "/nested-@layer.css",
+      "/nested-@media.css",
+      "/nested-ampersand-twice.css",
+      "/nested-ampersand-first.css",
+      "/nested-attribute.css",
+      "/nested-colon.css",
+      "/nested-dot.css",
+      "/nested-greaterthan.css",
+      "/nested-hash.css",
+      "/nested-plus.css",
+      "/nested-tilde.css",
+      "/toplevel-ampersand-twice.css",
+      "/toplevel-ampersand-first.css",
+      "/toplevel-ampersand-second.css",
+      "/toplevel-attribute.css",
+      "/toplevel-colon.css",
+      "/toplevel-dot.css",
+      "/toplevel-greaterthan.css",
+      "/toplevel-hash.css",
+      "/toplevel-plus.css",
+      "/toplevel-tilde.css",
+    ],
+    unsupportedCSSFeatures: ["Nesting"],
+    /* TODO FIX expectedScanLog: `nested-@layer.css: WARNING: CSS nesting syntax is not supported in the configured target environment (chrome10)
+  nested-@media.css: WARNING: CSS nesting syntax is not supported in the configured target environment (chrome10)
+  nested-ampersand-first.css: WARNING: CSS nesting syntax is not supported in the configured target environment (chrome10)
+  nested-ampersand-twice.css: WARNING: CSS nesting syntax is not supported in the configured target environment (chrome10)
+  nested-attribute.css: WARNING: CSS nesting syntax is not supported in the configured target environment (chrome10)
+  nested-colon.css: WARNING: CSS nesting syntax is not supported in the configured target environment (chrome10)
+  nested-dot.css: WARNING: CSS nesting syntax is not supported in the configured target environment (chrome10)
+  nested-greaterthan.css: WARNING: CSS nesting syntax is not supported in the configured target environment (chrome10)
+  nested-hash.css: WARNING: CSS nesting syntax is not supported in the configured target environment (chrome10)
+  nested-plus.css: WARNING: CSS nesting syntax is not supported in the configured target environment (chrome10)
+  nested-tilde.css: WARNING: CSS nesting syntax is not supported in the configured target environment (chrome10)
+  toplevel-ampersand-first.css: WARNING: CSS nesting syntax is not supported in the configured target environment (chrome10)
+  toplevel-ampersand-second.css: WARNING: CSS nesting syntax is not supported in the configured target environment (chrome10)
+  toplevel-ampersand-twice.css: WARNING: CSS nesting syntax is not supported in the configured target environment (chrome10)
+  toplevel-ampersand-twice.css: WARNING: CSS nesting syntax is not supported in the configured target environment (chrome10)
+  toplevel-greaterthan.css: WARNING: CSS nesting syntax is not supported in the configured target environment (chrome10)
+  toplevel-plus.css: WARNING: CSS nesting syntax is not supported in the configured target environment (chrome10)
+  toplevel-tilde.css: WARNING: CSS nesting syntax is not supported in the configured target environment (chrome10)
+  `, */
+  });
+  itBundled("css/MetafileCSSBundleTwoToOne", {
+    files: {
+      "/foo/entry.js": /* js */ `
+        import '../common.css'
+        console.log('foo')
+      `,
+      "/bar/entry.js": /* js */ `
+        import '../common.css'
+        console.log('bar')
+      `,
+      "/common.css": `body { color: red }`,
+    },
+    metafile: true,
+    entryPoints: ["/foo/entry.js", "/bar/entry.js"],
+    entryNaming: "[ext]/[hash]",
+    outdir: "/",
+  });
+  itBundled("css/DeduplicateRules", {
+    // GENERATED
+    files: {
+      "/yes0.css": `a { color: red; color: green; color: red }`,
+      "/yes1.css": `a { color: red } a { color: green } a { color: red }`,
+      "/yes2.css": `@media screen { a { color: red } } @media screen { a { color: red } }`,
+      "/no0.css": `@media screen { a { color: red } } @media screen { & a { color: red } }`,
+      "/no1.css": `@media screen { a { color: red } } @media screen { a[x] { color: red } }`,
+      "/no2.css": `@media screen { a { color: red } } @media screen { a.x { color: red } }`,
+      "/no3.css": `@media screen { a { color: red } } @media screen { a#x { color: red } }`,
+      "/no4.css": `@media screen { a { color: red } } @media screen { a:x { color: red } }`,
+      "/no5.css": `@media screen { a:x { color: red } } @media screen { a:x(y) { color: red } }`,
+      "/no6.css": `@media screen { a b { color: red } } @media screen { a + b { color: red } }`,
+      "/across-files.css": `@import 'across-files-0.css'; @import 'across-files-1.css'; @import 'across-files-2.css';`,
+      "/across-files-0.css": `a { color: red; color: red }`,
+      "/across-files-1.css": `a { color: green }`,
+      "/across-files-2.css": `a { color: red }`,
+      "/across-files-url.css": `@import 'across-files-url-0.css'; @import 'across-files-url-1.css'; @import 'across-files-url-2.css';`,
+      "/across-files-url-0.css": `@import 'http://example.com/some.css'; @font-face { src: url(http://example.com/some.font); }`,
+      "/across-files-url-1.css": `@font-face { src: url(http://example.com/some.other.font); }`,
+      "/across-files-url-2.css": `@font-face { src: url(http://example.com/some.font); }`,
+    },
+    entryPoints: [
+      "/yes0.css",
+      "/yes1.css",
+      "/yes2.css",
+      "/no0.css",
+      "/no1.css",
+      "/no2.css",
+      "/no3.css",
+      "/no4.css",
+      "/no5.css",
+      "/no6.css",
+      "/across-files.css",
+      "/across-files-url.css",
+    ],
+  });
+});
+
+describe("bundler", () => {
+  // tachyons, handsontable and jasmine ship the IE star hack.
+  itBundled("css/StarHackIsSkipped", {
+    files: {
+      "/entry.css": /* css */ `
+        @import "./clearfix.css";
+        .inline-block { display: inline-block; *display: inline; *background: url(./missing.png); *zoom: 1 }
+      `,
+      "/clearfix.css": /* css */ `.cf:after { clear: both } .cf { *zoom: 1 }`,
+    },
+    outfile: "/out.css",
+    onAfterBundle(api) {
+      api.expectFile("/out.css").toEqualIgnoringWhitespace(`
+        /* clearfix.css */
+        .cf:after {
+          clear: both;
+        }
+
+        /* entry.css */
+        .inline-block {
+          display: inline-block;
+        }
+      `);
+    },
+  });
+
+  // The bundler puts the path of a copied file in after printing. Unquoted, a space or a parenthesis ends the url().
+  itBundled("css/FileLoaderURLWithSpecialCharsMinified", {
+    files: {
+      "/entry.css": /* css */ `
+        .a { background: url("./my image.png") }
+        .b { background: url("./a(b).png") }
+        .c { --bg: url("./my image.png") }
+        @font-face { font-family: I; src: url("./plain.png") }
+      `,
+      "/my image.png": Buffer.alloc(128 * 1024 + 1, "Z").toString(),
+      "/a(b).png": Buffer.alloc(128 * 1024 + 1, "Y").toString(),
+      "/plain.png": Buffer.alloc(128 * 1024 + 1, "X").toString(),
+    },
+    loader: {
+      ".png": "file",
+    },
+    minifyWhitespace: true,
+    outdir: "/out",
+    onAfterBundle(api) {
+      api
+        .expectFile("/out/entry.css")
+        .toBe(
+          '.a{background:url("./my image-mrrzcz3w.png")}.b{background:url("./a(b)-nkpagkva.png")}.c{--bg:url("./my image-mrrzcz3w.png")}' +
+            '@font-face{font-family:I;src:url("./plain-w49ecq2a.png")}\n',
+        );
+    },
+  });
+  itBundled("css/FileLoaderURLAssetNamingDirAndPublicPath", {
+    files: {
+      "/entry.css": `@font-face { font-family: I; src: url("./Brand Fonts/inter.woff2") }`,
+      "/Brand Fonts/inter.woff2": Buffer.alloc(128 * 1024 + 1, "W").toString(),
+    },
+    loader: {
+      ".woff2": "file",
+    },
+    assetNaming: "[dir]/[name]-[hash].[ext]",
+    publicPath: "https://cdn.example.com/a/",
+    minifyWhitespace: true,
+    outdir: "/out",
+    onAfterBundle(api) {
+      api
+        .expectFile("/out/entry.css")
+        .toBe('@font-face{font-family:I;src:url("https://cdn.example.com/a/Brand Fonts/inter-tny5bcvp.woff2")}\n');
+    },
+  });
+
+  // The same url text in two files names two files.
+  itBundled("css/RulesWithTheSameURLTextInTwoFilesStayApart", {
+    files: {
+      "/entry.css": /* css */ `
+        @import "./one/a.css";
+        @import "./two/b.css";
+      `,
+      "/one/a.css": `.a { background: url(./x.png) }`,
+      "/two/b.css": `.b { background: url(./x.png) }`,
+      "/one/x.png": "1",
+      "/two/x.png": "2",
+    },
+    minifyWhitespace: true,
+    outdir: "/out",
+    onAfterBundle(api) {
+      api
+        .expectFile("/out/entry.css")
+        .toEqualIgnoringWhitespace(
+          /* css */ `.a{background:url(data:image/png;base64,MQ==)}.b{background:url(data:image/png;base64,Mg==)}`,
+        );
+    },
+  });
+});
+
+describe("bundler", () => {
+  // `zoom`, `line-clamp`, `--a` and `--b` have no type. No import makes an earlier one redundant.
+  itBundled("css/CSSAtImportConditionsSupportsUnknownProperty", {
+    files: {
+      "/entry.css": /* css */ `
+        @import "./foo.css" supports(zoom: 1);
+        @import "./foo.css" supports(line-clamp: 1);
+        @import "./foo.css" supports(--a: 1);
+        @import "./foo.css" supports(--b: 1);
+        @import "./foo.css" supports(--b: 1);
+      `,
+      "/foo.css": /* css */ `body { color: red }`,
+    },
+    outfile: "/out.css",
+    onAfterBundle(api) {
+      const block = (condition: string) => `/* foo.css */ @supports (${condition}) { body { color: red; } }`;
+      api
+        .expectFile("/out.css")
+        .toEqualIgnoringWhitespace(
+          ["zoom: 1", "line-clamp: 1", "--a: 1", "--b: 1"].map(block).join("") + "/* entry.css */",
+        );
+    },
+  });
+
+  // The empty blocks put `foo` before `bar` in the layer order, so `bar` wins.
+  itBundled("css/CSSAtLayerEmptyBlockKeepsLayerOrder", {
+    files: {
+      "/entry.css": /* css */ `
+        @layer foo {}
+        @layer bar {}
+        @layer bar { .box { background-color: green; } }
+        @layer foo { .box { background-color: red; } }
+      `,
+    },
+    outfile: "/out.css",
+    onAfterBundle(api) {
+      api.expectFile("/out.css").toEqualIgnoringWhitespace(/* css */ `
+        /* entry.css */
+        @layer foo {}
+        @layer bar {}
+        @layer bar { .box { background-color: green; } }
+        @layer foo { .box { background-color: red; } }
+      `);
+    },
+  });
+
+  // What Tailwind 4 prints: a declaration for old browsers, then its override in `@supports`.
+  itBundled("css/CSSAtSupportsSameConditionKeepsAllRules", {
+    files: {
+      "/entry.css": /* css */ `
+        .a { --x: 1; @supports (color: red) { --x: 2; } --y: 1; @supports (color: red) { --y: 2; } }
+      `,
+    },
+    outfile: "/out.css",
+    minifyWhitespace: true,
+    minifySyntax: true,
+    onAfterBundle(api) {
+      api
+        .expectFile("/out.css")
+        .toBe(".a{--x:1}@supports (color: red){.a{--x:2}}.a{--y:1}@supports (color: red){.a{--y:2}}\n");
+    },
+  });
+});
+
+describe("bundler", () => {
+  itBundled("css/CSSUrlInPropertyInitialValue", {
+    files: {
+      "/a.css": /* css */ `
+          @property --url {
+            syntax: "<url>";
+            inherits: false;
+            initial-value: url(./hi.svg);
+          }
+          @property --image {
+            initial-value: url("./hi.svg");
+            syntax: "<image>";
+            inherits: false;
+          }
+          /* The first initial-value is replaced, so its file is not an import. */
+          @property --last {
+            syntax: "<url>";
+            inherits: false;
+            initial-value: url(./replaced.svg);
+            initial-value: url(./hi.svg);
+          }
+        `,
+      "/hi.svg": /* svg */ `<svg xmlns="http://www.w3.org/2000/svg"><circle r="4" /></svg>`,
+    },
+    outdir: "/out",
+    onAfterBundle(api) {
+      const url = `url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxjaXJjbGUgcj0iNCIgLz48L3N2Zz4=")`;
+      api.expectFile("/out/a.css").toEqualIgnoringWhitespace(`
+  /* a.css */
+  @property --url {
+    syntax: "<url>";
+    inherits: false;
+    initial-value: ${url};
+  }
+  @property --image {
+    syntax: "<image>";
+    inherits: false;
+    initial-value: ${url};
+  }
+  @property --last {
+    syntax: "<url>";
+    inherits: false;
+    initial-value: ${url};
+  }
+  `);
+    },
+  });
+
+  // Each case prints the layers in the order of the source files. `.t` gets the same color from `out` as from them.
+  const layerOrderCases: Record<string, { files: Record<string, string>; out: string }> = {
+    StatementBeforeImport: {
+      files: {
+        "/entry.css": /* css */ `
+          @layer first;
+          @import "./imported.css" layer(second);
+          @layer third { .t { c: d } }
+        `,
+        "/imported.css": `.i { c: d }`,
+      },
+      out: "@layer first;@layer second{.i{c:d}}@layer third{.t{c:d}}",
+    },
+    StatementBeforeImportInImportedFile: {
+      files: {
+        "/entry.css": /* css */ `
+          @import "./ui/index.css";
+          @layer components { .card { c: e } }
+        `,
+        "/ui/index.css": /* css */ `
+          @layer theme, base, components, utilities;
+          @import "./theme.css" layer(theme);
+          @import "./utilities.css" layer(utilities);
+        `,
+        "/ui/theme.css": `:root { --x: 1 }`,
+        "/ui/utilities.css": `.u { c: d }`,
+      },
+      out: "@layer theme,base,components,utilities;@layer theme{:root{--x:1}}@layer utilities{.u{c:d}}@layer components{.card{c:e}}",
+    },
+    StatementUnderImportConditions: {
+      files: {
+        "/entry.css": /* css */ `
+          @layer outer;
+          @import "./mid.css" layer(wrap) supports(display: flex);
+        `,
+        "/mid.css": /* css */ `
+          @layer inner;
+          @import "./leaf.css" layer(leafy);
+          @layer after;
+          .mid { c: d }
+        `,
+        "/leaf.css": `.leaf { c: d }`,
+      },
+      out: "@layer outer;@supports (display:flex){@layer wrap{@layer inner;}}@supports (display:flex){@layer wrap{@layer leafy{.leaf{c:d}}}}@supports (display:flex){@layer wrap{@layer after;.mid{c:d}}}",
+    },
+    // "a" and "wrap.a" are different layers, so the first list does not cover the second.
+    SameStatementInLayeredImport: {
+      files: {
+        "/entry.css": /* css */ `
+          @layer a, b;
+          @import "./lib.css" layer(wrap);
+          .e { c: d }
+        `,
+        "/lib.css": /* css */ `
+          @layer a, b;
+          @import "./leaf.css";
+          @layer b { .lb { c: d } }
+          @layer a { .la { c: d } }
+        `,
+        "/leaf.css": `.leaf { c: d }`,
+      },
+      out: "@layer a,b;@layer wrap{@layer a,b;}@layer wrap{.leaf{c:d}}@layer wrap{@layer b{.lb{c:d}}@layer a{.la{c:d}}}.e{c:d}",
+    },
+    StatementOfAFileImportedTwice: {
+      files: {
+        "/entry.css": /* css */ `
+          @import "./f.css";
+          @import "./g.css";
+          @import "./f.css";
+        `,
+        "/f.css": /* css */ `
+          @layer a;
+          @import "./leaf.css";
+          .f { c: d }
+        `,
+        "/g.css": `@layer b { .g { c: d } }`,
+        "/leaf.css": `.leaf { c: d }`,
+      },
+      out: "@layer a;@layer b{.g{c:d}}.leaf{c:d}.f{c:d}",
+    },
+    // A statement ahead of the imports stays ahead of them in the one anonymous layer.
+    StatementInAnonymousLayerImport: {
+      files: {
+        "/entry.css": /* css */ `
+          @import "./lib.css" layer;
+          .z { c: d }
+        `,
+        "/lib.css": /* css */ `
+          @layer p, q;
+          @import "./leaf.css";
+          @layer q { .x { c: e } }
+          @layer p { .x { c: f } }
+        `,
+        "/leaf.css": `.leaf { c: d }`,
+      },
+      out: "@layer{@layer p,q;.leaf{c:d}@layer q{.x{c:e}}@layer p{.x{c:f}}}.z{c:d}",
+    },
+    // The first copy of "f.css" declares "w" ahead of "v", also inside an anonymous layer.
+    SublayerOfADuplicateImportInAnonymousLayer: {
+      files: {
+        "/entry.css": `@import "./a.css" layer;`,
+        "/a.css": /* css */ `
+          @import "./f.css" layer(w);
+          @import "./g.css";
+          @import "./f.css" layer(w);
+          .a { color: green }
+        `,
+        "/g.css": `@layer v { .t { color: blue } }`,
+        "/f.css": `.t { color: red }`,
+      },
+      out: "@layer{@layer w;@layer v{.t{color:#00f}}@layer w{.t{color:red}}.a{color:green}}",
+    },
+    // The first copy of "f.css" stays in the anonymous layer of its neighbours.
+    DuplicateImportBetweenAnonymousLayers: {
+      files: {
+        "/entry.css": `@import "./c.css" layer;`,
+        "/c.css": `@import "./d.css" layer(w);`,
+        "/d.css": `@import "./e.css" layer;`,
+        "/e.css": /* css */ `
+          @import "./h.css";
+          @import "./f.css";
+          @import "./g.css";
+          @import "./f.css";
+        `,
+        "/h.css": `.t.t { color: green }`,
+        "/f.css": `.t { color: red }`,
+        "/g.css": `.g { color: blue }`,
+      },
+      out: "@layer{@layer w{@layer{.t.t{color:green}.g{color:#00f}.t{color:red}}}@layer w;}",
+    },
+    SublayerOfADuplicateImportInNestedAnonymousLayer: {
+      files: {
+        "/entry.css": `@import "./a.css" layer(x);`,
+        "/a.css": `@import "./b.css" layer;`,
+        "/b.css": /* css */ `
+          @import "./f.css" layer(w);
+          @import "./g.css";
+          @import "./f.css" layer(w);
+        `,
+        "/g.css": `@layer v { .t { color: blue } }`,
+        "/f.css": `.t { color: red }`,
+      },
+      out: "@layer x{@layer{@layer w;@layer v{.t{color:#00f}}@layer w{.t{color:red}}}}@layer x;",
+    },
+    // An import that closes a cycle is not loaded, but it declares its layer.
+    SublayerOfACycleInAnonymousLayer: {
+      files: {
+        "/entry.css": `@import "./a.css" layer;`,
+        "/a.css": /* css */ `
+          @import "./a.css" layer(w);
+          @import "./g.css";
+        `,
+        "/g.css": `@layer v { .t { color: blue } }`,
+      },
+      out: "@layer{@layer w;@layer v{.t{color:#00f}}}",
+    },
+    // "v" comes first because the import that closes the cycle declares it.
+    SublayerOfACycleInImportedFileOfAnonymousLayer: {
+      files: {
+        "/entry.css": `@import "./a.css" layer;`,
+        "/a.css": /* css */ `
+          @import "./b.css";
+          @layer v { .t { color: red } }
+          @layer c { .t { color: green } }
+        `,
+        "/b.css": /* css */ `
+          @import "./entry.css" layer(v);
+          @layer c { .u { color: blue } }
+        `,
+      },
+      out: "@layer{@layer v;@layer c{.u{color:#00f}}@layer v{.t{color:red}}@layer c{.t{color:green}}}",
+    },
+    // The external import prints an anonymous layer of its own, so it does not declare "w" for its neighbours.
+    SublayerOfAnExternalImportInAnonymousLayer: {
+      files: {
+        "/entry.css": `@import "./a.css" layer;`,
+        "/a.css": /* css */ `
+          @import "https://example.com/ext.css" layer(w);
+          @import "./f.css" layer(w);
+          @import "./g.css";
+          @import "./f.css" layer(w);
+        `,
+        "/g.css": `@layer v { .t { color: blue } }`,
+        "/f.css": `.t { color: red }`,
+      },
+      out: `@import "data:text/css,@import \\"https://example.com/ext.css\\" layer(w);" layer;@layer{@layer w;@layer v{.t{color:#00f}}@layer w{.t{color:red}}}`,
+    },
+    // The external import declares "w" ahead of "v", also with no other copy of "f.css".
+    SublayerOfALoneExternalImportInAnonymousLayer: {
+      files: {
+        "/entry.css": `@import "./a.css" layer;`,
+        "/a.css": /* css */ `
+          @import "https://example.com/ext.css" layer(w);
+          @import "./g.css";
+          @import "./f.css" layer(w);
+        `,
+        "/g.css": `@layer v { .t { color: blue } }`,
+        "/f.css": `.t { color: red }`,
+      },
+      out: `@import "data:text/css,@import \\"https://example.com/ext.css\\" layer(w);" layer;@layer{@layer w;@layer v{.t{color:#00f}}@layer w{.t{color:red}}}`,
+    },
+    // An import that does not load a style sheet still declares its layer, each time.
+    LayersOfImportsOfAnAsset: {
+      files: {
+        "/entry.css": /* css */ `
+          @import "./a.svg" layer(x);
+          @import "./a.svg" layer(y);
+          @import "./c.css" layer(y);
+          @import "./b.css" layer(x);
+        `,
+        "/a.svg": `<svg/>`,
+        "/b.css": `.t { color: red }`,
+        "/c.css": `.t { color: blue }`,
+      },
+      out: "@layer x;@layer y{.t{color:#00f}}@layer x{.t{color:red}}",
+    },
+    // An asset under no layer adds nothing, so the statement stays ahead of the external import.
+    ImportOfAnAssetAheadOfAStatement: {
+      files: {
+        "/entry.css": /* css */ `
+          @import "./a.svg" screen;
+          @import "./a.svg" screen;
+          @import "./a.css";
+        `,
+        "/a.svg": `<svg/>`,
+        "/a.css": /* css */ `
+          @layer x;
+          @import "https://example.com/e.css" layer(y);
+        `,
+      },
+      out: `@layer x;@import "https://example.com/e.css" layer(y);`,
+    },
+    // Only "z" is out of its place, and nothing else declares it.
+    ConditionalImportOfAnAssetAheadOfAStatement: {
+      files: {
+        "/entry.css": /* css */ `
+          @import "./a.svg" layer(z) screen;
+          @import "./a.css";
+        `,
+        "/a.svg": `<svg/>`,
+        "/a.css": /* css */ `
+          @layer x;
+          @import "https://example.com/e.css" layer(y);
+          .a { c: d }
+        `,
+      },
+      out: `@layer x;@import "https://example.com/e.css" layer(y);@media screen{@layer z;}.a{c:d}`,
+    },
+    ConditionalImportOfACycleAheadOfAStatement: {
+      files: {
+        "/entry.css": /* css */ `
+          @import "./entry.css" layer(z) screen;
+          @import "./a.css";
+        `,
+        "/a.css": /* css */ `
+          @layer x;
+          @import "https://example.com/e.css" layer(y);
+          .a { c: d }
+        `,
+      },
+      out: `@layer x;@import "https://example.com/e.css" layer(y);@media screen{@layer z;}.a{c:d}`,
+    },
+    // Browsers accept an "@import" behind an unknown at-rule, and it applies once.
+    ImportBehindAnUnknownAtRule: {
+      files: {
+        "/entry.css": /* css */ `
+          @import "./a.css";
+          @import "https://example.com/f.css";
+        `,
+        "/a.css": /* css */ `
+          @layer first;
+          @unknown x;
+          @import "https://example.com/e.css";
+          .a { c: d }
+        `,
+      },
+      out: `@layer first;@import "https://example.com/e.css";@import "https://example.com/f.css";@unknown x;.a{c:d}`,
+    },
+    ImportOfAFileBehindAnUnknownAtRule: {
+      files: {
+        "/entry.css": /* css */ `
+          @unknown x;
+          @import "./b.css";
+          .a { c: d }
+        `,
+        "/b.css": `.b { c: d }`,
+      },
+      out: ".b{c:d}@unknown x;.a{c:d}",
+    },
+    ConditionalImportsBehindAnUnknownAtRule: {
+      files: {
+        "/entry.css": /* css */ `
+          @unknown x;
+          @import "./b.css" layer(x) supports(display: grid) screen;
+          @import "https://example.com/e.css" layer(y) print;
+          .a { c: d }
+        `,
+        "/b.css": `.b { c: d }`,
+      },
+      out: `@import "https://example.com/e.css" layer(y) print;@media screen{@supports (display:grid){@layer x{.b{c:d}}}}@unknown x;.a{c:d}`,
+    },
+    // The "url()" has an import record of its own, ahead of the one of the "@import".
+    ImportBehindAnUnknownAtRuleWithAURL: {
+      files: {
+        "/entry.css": /* css */ `
+          @unknown url(./x.png);
+          @import "./b.css";
+          @import "https://example.com/e.css";
+          .a { c: d }
+        `,
+        "/b.css": `.b { c: d }`,
+        "/x.png": `png`,
+      },
+      out: `@import "https://example.com/e.css";.b{c:d}@unknown url(data:image/png;base64,cG5n);.a{c:d}`,
+    },
+    // A block between the imports would make the ones after it invalid.
+    ThreeCopiesOfAnExternalImportInAnonymousLayer: {
+      files: {
+        "/entry.css": `@import "./a.css" layer;`,
+        "/a.css": /* css */ `
+          @import "https://example.com/ext.css" layer(w);
+          @import "https://example.com/ext.css" layer(w);
+          @import "https://example.com/other.css" layer(v);
+          @import "https://example.com/ext.css" layer(w);
+          .a { c: d }
+        `,
+      },
+      out: `@import "data:text/css,@import \\"https://example.com/ext.css\\" layer(w);" layer;@import "data:text/css,@import \\"https://example.com/other.css\\" layer(v);" layer;@import "data:text/css,@import \\"https://example.com/ext.css\\" layer(w);" layer;@layer{@layer w;@layer v;.a{c:d}}`,
+    },
+    // A copy with no layer does not cover a list under "layer(w)": the list is what declares "w" ahead of "u".
+    ListForADuplicateImportUnderLayer: {
+      files: {
+        "/entry.css": /* css */ `
+          @import "./base.css";
+          @import "./btn.css" layer(w);
+          @import "./other.css";
+          @import "./btn.css" layer(w);
+        `,
+        "/base.css": `.base { color: black }`,
+        "/btn.css": `.t { color: red }`,
+        "/other.css": `@layer u { .t { color: blue } }`,
+      },
+      out: ".base{color:#000}@layer w;@layer u{.t{color:#00f}}@layer w{.t{color:red}}",
+    },
+    ListForADuplicateImportAheadOfAStatement: {
+      files: {
+        "/entry.css": /* css */ `
+          @import "./base.css";
+          @import "./btn.css" layer(w);
+          @import "./card.css";
+        `,
+        "/base.css": `.x { color: green }`,
+        "/btn.css": `.t { color: red }`,
+        "/card.css": /* css */ `
+          @layer u;
+          @import "./btn.css" layer(w);
+          @layer u { .t { color: blue } }
+        `,
+      },
+      out: ".x{color:green}@layer w;@layer u;@layer w{.t{color:red}}@layer u{.t{color:#00f}}",
+    },
+    // The rules of the first copy are in "w.c" and "w.a", not in "c" and "a".
+    LayeredCopyBehindABareCopy: {
+      files: {
+        "/entry.css": /* css */ `
+          @layer a;
+          @import "./f1.css";
+          @layer c { .t { color: red } }
+        `,
+        "/f1.css": /* css */ `
+          @layer c;
+          @import "./f2.css" layer(w);
+          @import "./f2.css";
+        `,
+        "/f2.css": /* css */ `
+          @layer c;
+          @layer a { .t { color: blue } }
+        `,
+      },
+      out: "@layer a;@layer c;@layer w{@layer c;@layer a{.t{color:#00f}}}@layer c;@layer a{.t{color:#00f}}@layer c{.t{color:red}}",
+    },
+    AnonymousCopyBehindABareCopy: {
+      files: {
+        "/entry.css": /* css */ `
+          @layer a;
+          @import "./f1.css";
+          @layer c { .t { color: red } }
+        `,
+        "/f1.css": /* css */ `
+          @layer c;
+          @import "./f2.css" layer;
+          @import "./f2.css";
+        `,
+        "/f2.css": /* css */ `
+          @layer c;
+          @layer a { .t { color: blue } }
+        `,
+      },
+      out: "@layer a;@layer c;@layer{@layer c;@layer a{.t{color:#00f}}}@layer c;@layer a{.t{color:#00f}}@layer c{.t{color:red}}",
+    },
+    FileWithImportsUnderBareLayerAndBare: {
+      files: {
+        "/entry.css": /* css */ `
+          @layer a;
+          @import "./lib.css" layer;
+          @import "./lib.css";
+        `,
+        "/lib.css": /* css */ `
+          @import "./leaf.css";
+          @layer a { @layer c { .t { color: red } } }
+        `,
+        "/leaf.css": `@layer a { .t { color: blue } }`,
+      },
+      out: "@layer a;@layer{@layer a{.t{color:#00f}}@layer a{@layer c{.t{color:red}}}}@layer a{.t{color:#00f}}@layer a{@layer c{.t{color:red}}}",
+    },
+    ImportantUnderBareLayer: {
+      files: {
+        "/entry.css": /* css */ `
+          @import "./f2.css" layer;
+          @import "./f1.css";
+        `,
+        "/f1.css": /* css */ `
+          @layer a;
+          @import "./f2.css" layer;
+          @layer a { .t { color: red !important } }
+        `,
+        "/f2.css": `.t { color: blue !important }`,
+      },
+      out: "@layer{.t{color:#00f!important}}@layer a;@layer{.t{color:#00f!important}}@layer a{.t{color:red!important}}",
+    },
+    // Each visit of a bare "layer" is a layer of its own, so a copy in one does not cover a copy in the other.
+    TwoBareImportsOfFilesWithOneImport: {
+      files: {
+        "/entry.css": /* css */ `
+          @import "./a.css" layer;
+          @import "./b.css" layer;
+        `,
+        "/a.css": /* css */ `
+          @import "./leaf.css";
+          .a { c: d }
+        `,
+        "/b.css": /* css */ `
+          @import "./leaf.css";
+          .b { c: d }
+        `,
+        "/leaf.css": `.leaf { c: d }`,
+      },
+      out: "@layer{.leaf{c:d}.a{c:d}}@layer{.leaf{c:d}.b{c:d}}",
+    },
+    SameFileVisitedTwiceWithABareImport: {
+      files: {
+        "/entry.css": /* css */ `
+          @import "./a.css";
+          @import "./z.css";
+          @import "./a.css";
+        `,
+        "/a.css": /* css */ `
+          @import "./leaf.css" layer;
+          .a { c: d }
+        `,
+        "/leaf.css": `.leaf { c: d }`,
+        "/z.css": `.z { c: d }`,
+      },
+      out: "@layer{.leaf{c:d}}.z{c:d}@layer{.leaf{c:d}}.a{c:d}",
+    },
+    // "p" and "q" of the first x.css order the layers inside the block, where the later copy prints.
+    MaskedCopyInsideABareImport: {
+      files: {
+        "/entry.css": `@import "./lib.css" layer;`,
+        "/lib.css": /* css */ `
+          @import "./x.css";
+          @import "./y.css";
+          @import "./x.css";
+        `,
+        "/x.css": /* css */ `
+          @layer p, q;
+          @layer q { .x { c: d } }
+        `,
+        "/y.css": `@layer q { .y { c: d } } @layer p { .y { c: e } }`,
+      },
+      out: "@layer{@layer p,q,q;@layer q{.y{c:d}}@layer p{.y{c:e}}@layer p,q;@layer q{.x{c:d}}}",
+    },
+    BlocksInsideAndOutsideABareImport: {
+      files: {
+        "/entry.css": `@import "./mid.css" screen;`,
+        "/mid.css": /* css */ `
+          @import "./lib.css" layer(w) supports(display: grid);
+          .mid { c: d }
+        `,
+        "/lib.css": /* css */ `
+          @import "./one.css" layer;
+          .lib { c: d }
+        `,
+        "/one.css": /* css */ `
+          @import "./two.css" print;
+          @import "./three.css" layer;
+          .one { c: d }
+        `,
+        "/two.css": `.two { c: d }`,
+        "/three.css": /* css */ `
+          @import "./four.css";
+          .three { c: d }
+        `,
+        "/four.css": `.four { c: d }`,
+      },
+      out:
+        "@media screen{@supports (display:grid){@layer w{@layer{@media print{.two{c:d}}" +
+        "@layer{.four{c:d}.three{c:d}}.one{c:d}}}}}" +
+        "@media screen{@supports (display:grid){@layer w{.lib{c:d}}}}" +
+        "@media screen{.mid{c:d}}",
+    },
+    // An "@import" that closes a cycle is not loaded, but it still declares its layer.
+    CyclicLayeredImport: {
+      files: {
+        "/entry.css": /* css */ `
+          @import "./entry.css" layer(w);
+          @import "./b.css" layer(b);
+          @import "./c.css" layer(w);
+        `,
+        "/b.css": `.t { color: blue }`,
+        "/c.css": `.t { color: red }`,
+      },
+      out: "@layer w;@layer b{.t{color:#00f}}@layer w{.t{color:red}}",
+    },
+    CyclicLayeredImportAheadOfAStatement: {
+      files: {
+        "/entry.css": `@import "./f2.css";`,
+        "/f2.css": /* css */ `
+          @import "./entry.css" layer(w);
+          @import "./f3.css";
+        `,
+        "/f3.css": /* css */ `
+          @layer b;
+          @import "./f4.css" layer(w);
+          @layer b { .t { color: blue } }
+        `,
+        "/f4.css": `.t { color: red }`,
+      },
+      out: "@layer w;@layer b;@layer w{.t{color:red}}@layer b{.t{color:#00f}}",
+    },
+    // g.css names "a" only under "@media", so it does not stand for the statement of f.css.
+    NameDeclaredUnderMediaInAnEarlierFile: {
+      files: {
+        "/entry.css": /* css */ `
+          @import "./g.css";
+          @import "./f.css";
+        `,
+        "/g.css": `@media print { @layer a { .g { color: green } } }`,
+        "/f.css": /* css */ `
+          @layer a;
+          @import "./y.css" layer(b);
+          @layer a { .t { color: red } }
+        `,
+        "/y.css": `.t { color: blue }`,
+      },
+      out: "@media print{@layer a{.g{color:green}}}@layer a;@layer b{.t{color:#00f}}@layer a{.t{color:red}}",
+    },
+    NameDeclaredBehindAnAnonymousBlock: {
+      files: {
+        "/entry.css": /* css */ `
+          @layer a;
+          @import "./g.css";
+        `,
+        "/g.css": /* css */ `
+          @layer { .t { color: blue } }
+          @layer a { .t { color: red } }
+        `,
+      },
+      out: "@layer a;@layer{.t{color:#00f}}@layer a{.t{color:red}}",
+    },
+  };
+  for (const [name, { files, out }] of Object.entries(layerOrderCases)) {
+    itBundled(`css/CSSAtLayerOrder${name}`, {
+      files,
+      outfile: "/out.css",
+      minifyWhitespace: true,
+      onAfterBundle(api) {
+        api.expectFile("/out.css").toBe(out + "\n");
+      },
+    });
+  }
+
+  itBundled("css/CSSAtLayerBareImportPrintsOneIndentedBlock", {
+    files: {
+      "/entry.css": `@import "./lib.css" layer print;`,
+      "/lib.css": /* css */ `
+        @import "./leaf.css";
+        .lib { color: red }
+      `,
+      "/leaf.css": `@layer a { .leaf { color: red } }`,
+    },
+    outfile: "/out.css",
+    onAfterBundle(api) {
+      api.expectFile("/out.css").toBe(`/* leaf.css */
+@media print {
+  @layer {
+    @layer a {
+      .leaf {
+        color: red;
+      }
+    }
+
+/* lib.css */
+    .lib {
+      color: red;
+    }
+  }
+}
+
+/* entry.css */
+
+`);
+    },
+  });
+
+  // esbuild's TestCSSAtLayerBeforeImportBundle, with its snapshot.
+  itBundled("css/CSSAtLayerBeforeImportBundle", {
+    files: {
+      "/entry.css": /* css */ `
+        @layer layer1, layer2.layer3;
+        @import "a.css";
+        @import "b.css";
+        @layer layer6.layer7, layer8;
+      `,
+      "/a.css": `@layer layer4 { a { color: red } }`,
+      "/b.css": `@layer layer5 { b { color: red } }`,
+    },
+    outdir: "/out",
+    onAfterBundle(api) {
+      api.expectFile("/out/entry.css").toEqualIgnoringWhitespace(/* css */ `
+        @layer layer1, layer2.layer3;
+
+        /* a.css */
+        @layer layer4 {
+          a {
+            color: red;
+          }
+        }
+
+        /* b.css */
+        @layer layer5 {
+          b {
+            color: red;
+          }
+        }
+
+        /* entry.css */
+        @layer layer6.layer7, layer8;
+      `);
+    },
+  });
+
+  // Only "@charset" and "@layer" statements are valid ahead of an "@import", and the parser rejects anything else.
+  const importPrologueCases: Record<string, { files: Record<string, string>; out: string }> = {
+    StatementBeforeExternalImport: {
+      files: {
+        "/entry.css": /* css */ `
+          @layer first;
+          @import "https://example.com/e.css";
+          @import "./local.css" layer(second);
+        `,
+        "/local.css": `.l { c: d }`,
+      },
+      out: '@layer first;@import "https://example.com/e.css";@layer second{.l{c:d}}',
+    },
+    // Under import conditions a list prints as a block, so it stays behind the import.
+    StatementUnderConditionsBeforeExternalImport: {
+      files: {
+        "/entry.css": `@import "./mid.css" layer(wrap) supports(display: flex);`,
+        "/mid.css": /* css */ `
+          @layer inner;
+          @import "https://example.com/e.css";
+        `,
+      },
+      out: '@import "https://example.com/e.css" layer(wrap) supports(display:flex);@supports (display:flex){@layer wrap{@layer inner;}}@supports (display:flex){@layer wrap;}',
+    },
+    // A list here would print as a block. Only the first copy says that "a" comes before "b" in print.
+    DuplicateExternalImportUnderMedia: {
+      files: {
+        "/entry.css": /* css */ `
+          @import "https://example.com/a.css" layer(a) print;
+          @import "https://example.com/b.css" layer(b);
+          @import "https://example.com/a.css" layer(a) print;
+        `,
+      },
+      out: `@import "https://example.com/a.css" layer(a) print;@import "https://example.com/b.css" layer(b);@import "https://example.com/a.css" layer(a) print;`,
+    },
+    // The first copy declares the layer. The second copy adds nothing.
+    ThreeCopiesOfAnExternalImport: {
+      files: {
+        "/entry.css": /* css */ `
+          @import "https://example.com/a.css" layer(a) print;
+          @import "https://example.com/b.css" layer(b);
+          @import "https://example.com/a.css" layer(a) print;
+          @import "https://example.com/a.css" layer(a) print;
+        `,
+      },
+      out: `@import "https://example.com/a.css" layer(a) print;@import "https://example.com/b.css" layer(b);@import "https://example.com/a.css" layer(a) print;`,
+    },
+    // The middle copy loses its media condition, and must not print between the two imports.
+    ThreeCopiesUnderALayerAndMedia: {
+      files: {
+        "/entry.css": /* css */ `
+          @import "./a.css";
+          @import "./b.css";
+          @import "./c.css";
+        `,
+        "/a.css": /* css */ `@import "./theme.css" layer(theme); .a { color: red }`,
+        "/b.css": /* css */ `@import "./theme.css" layer(theme); .b { color: red }`,
+        "/c.css": /* css */ `@import "./theme.css" layer(theme); .c { color: red }`,
+        "/theme.css": /* css */ `@import "https://example.com/x.css" screen;`,
+      },
+      out: `@import "data:text/css,@import \\"https://example.com/x.css\\" screen;" layer(theme);@import "data:text/css,@import \\"https://example.com/x.css\\" screen;" layer(theme);@layer theme;.a{color:red}.b{color:red}@layer theme;.c{color:red}`,
+    },
+    // A statement is not valid between two "@import" rules.
+    DuplicateExternalImportAfterOtherImport: {
+      files: {
+        "/entry.css": /* css */ `
+          @import "https://example.com/first.css" layer(first);
+          @import "https://example.com/a.css" layer(a);
+          @import "https://example.com/b.css" layer(b);
+          @import "https://example.com/a.css" layer(a);
+        `,
+      },
+      out: `@import "https://example.com/first.css" layer(first);@import "https://example.com/a.css" layer(a);@import "https://example.com/b.css" layer(b);@import "https://example.com/a.css" layer(a);`,
+    },
+    DuplicateExternalImportBehindALeadingStatement: {
+      files: {
+        "/entry.css": /* css */ `
+          @import "https://example.com/a.css" layer(a);
+          @import "https://example.com/b.css" layer(b);
+          @import "https://example.com/a.css" layer(a);
+        `,
+      },
+      out: `@layer a;@import "https://example.com/b.css" layer(b);@import "https://example.com/a.css" layer(a);`,
+    },
+    // The rules of the two copies are in different layers, so both stay.
+    ExternalImportUnderLayerAndBare: {
+      files: {
+        "/entry.css": /* css */ `
+          @layer x;
+          @import "https://example.com/a.css" layer(v);
+          @import "./m.css" layer(w);
+          @import "https://example.com/a.css";
+        `,
+        "/m.css": `.m { color: red }`,
+      },
+      out: '@layer x;@import "https://example.com/a.css" layer(v);@import "https://example.com/a.css";@layer w{.m{color:red}}',
+    },
+  };
+  for (const [name, { files, out }] of Object.entries(importPrologueCases)) {
+    itBundled(`css/CSSImportPrologue${name}`, {
+      files,
+      outfile: "/out.css",
+      minifyWhitespace: true,
+      async onAfterBundle(api) {
+        api.expectFile("/out.css").toBe(out + "\n");
+        const again = await Bun.build({ entrypoints: [api.outfile], throw: false });
+        expect(again.logs.map(log => log.message)).toEqual([]);
+        expect(again.success).toBe(true);
+      },
+    });
+  }
+
+  // A media or container condition the parser does not know is kept as written.
+  itBundled("css/GeneralEnclosedCondition", {
+    files: {
+      "/entry.css": /* css */ `
+        @import "https://example.com/b.css" (layer(x));
+        @import "./ie.css" screen and (min-width:0\\0);
+        @media screen and (min-width:0\\0) { .media { color: red } }
+        @container scroll-state(stuck: top) { .container { color: red } }
+      `,
+      "/ie.css": /* css */ `.ie { color: red }`,
+    },
+    outfile: "/out.css",
+    onAfterBundle(api) {
+      api.expectFile("/out.css").toEqualIgnoringWhitespace(`
+        @import "https://example.com/b.css" (layer(x));
+
+        /* ie.css */
+        @media screen and (min-width:0\\0) {
+          .ie {
+            color: red;
+          }
+        }
+
+        /* entry.css */
+        @media screen and (min-width:0\\0) {
+          .media {
+            color: red;
+          }
+        }
+
+        @container scroll-state(stuck: top) {
+          .container {
+            color: red;
+          }
+        }
+      `);
+    },
+  });
+
+  // The text of a kept condition is not an import.
+  itBundled("css/GeneralEnclosedConditionURL", {
+    files: {
+      "/entry.css": /* css */ `
+        @media (foo: url("./missing.png")) { .media { color: red } }
+        @container (style(--bg: url(./missing.png)) junk) { .container { color: red } }
+      `,
+    },
+    outfile: "/out.css",
+    onAfterBundle(api) {
+      api.expectFile("/out.css").toEqualIgnoringWhitespace(`
+        /* entry.css */
+        @media (foo: url("./missing.png")) {
+          .media {
+            color: red;
+          }
+        }
+
+        @container (style(--bg: url(./missing.png)) junk) {
+          .container {
+            color: red;
+          }
+        }
+      `);
+    },
+  });
+});
+
+describe("bundler", () => {
+  // The default browser targets start at Chrome 80 and Safari 14.
+  itBundled("css/DefaultTargetsKeepWhatBrowsersRead", {
+    files: {
+      "/entry.css": /* css */ `
+        .overlay { position: fixed; top: 0; right: 0; bottom: 0; left: 0 }
+        .clamp { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; flex-direction: column; overflow: hidden }
+        .frame { border: 4px solid; border-image: linear-gradient(red, blue); border-image-slice: 1 }
+        .menu { max-width: calc(100vw - 32px); max-width: var(--menu-max-width, calc(100vw - 32px)) }
+      `,
+    },
+    outfile: "/out.css",
+    onAfterBundle(api) {
+      api.expectFile("/out.css").toEqualIgnoringWhitespace(`
+        /* entry.css */
+        .overlay { position: fixed; top: 0; bottom: 0; left: 0; right: 0; }
+        .clamp { display: -webkit-box; -webkit-line-clamp: 3; overflow: hidden; -webkit-box-orient: vertical; flex-direction: column; }
+        .frame { border: 4px solid; border-image: linear-gradient(red, #00f) 1; }
+        .menu { max-width: calc(100vw - 32px); max-width: var(--menu-max-width, calc(100vw - 32px)); }
+      `);
+    },
+  });
+});

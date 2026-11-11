@@ -1,0 +1,2116 @@
+import { describe, expect, test } from "bun:test";
+import { bunEnv, bunExe, normalizeBunSnapshot, tempDir } from "harness";
+import { itBundled, type BundlerTestInput } from "./expectBundled";
+
+describe("bundler", () => {
+  // A direct eval at the top level of a file the bundler wraps in a CommonJS
+  // closure can reach that file's top-level names, so they are not renamed.
+  itBundled("minify/DirectEvalKeepsTopLevelNamesOfWrappedFile", {
+    files: {
+      "/entry.js": /* js */ `
+        var secret = 'top'
+        function helper() { return 'fn' }
+        console.log(eval('secret'), eval('helper()'))
+      `,
+    },
+    minifyIdentifiers: true,
+    onAfterBundle(api) {
+      api.expectFile("/out.js").toContain("secret");
+    },
+    run: { stdout: "top fn" },
+  });
+
+  // A symbol read through a `with` body keeps its original name. The renamer
+  // must not give that name to another symbol the body can see, such as the
+  // parameter of the enclosing function: `function f(obj) { var t = 1; with
+  // (obj) { return t } }` printed as `function f(t) { var t = 1; with (t)
+  // return t }` reads the local instead of `obj.t`. Each `f_` function pins
+  // one of the 54 single-character names the minifier can produce, so
+  // whichever name the (most used) parameter slot gets, one `with` body breaks
+  // without the fix. `hoisted` and `merged` declare the pinned `var` twice, so
+  // the reference that the `with` pins is a link to the function-level symbol,
+  // which has to keep its name too. `braceless` declares the `var` in the
+  // `with` scope itself, which the hoisting walk starts above.
+  const singleCharNames = [..."abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$"];
+  const withPinnedNamesSource = [
+    ...singleCharNames.map(n => `function f_${n}(obj) { var ${n} = 1; obj.p; obj.p; with (obj) { return ${n}; } }`),
+    "function hoisted(obj) { var t = 1; obj.p; obj.p; with (obj) { var t = 2; } return [t, obj.t]; }",
+    "function merged(obj) { var t = 1; obj.p; obj.p; { var t = 2; with (obj) { return t; } } }",
+    "function braceless(obj) { obj.p; obj.p; with (obj) var t = 2; return [t, obj.t]; }",
+    "const bad = [];",
+    ...singleCharNames.map(n => `if (f_${n}({}) !== 1 || f_${n}({ ${n}: 9 }) !== 9) bad.push("${n}");`),
+    `if (JSON.stringify([hoisted({}), hoisted({ t: 9 })]) !== "[[2,null],[1,2]]") bad.push("hoisted");`,
+    `if (merged({}) !== 2 || merged({ t: 9 }) !== 9) bad.push("merged");`,
+    `if (JSON.stringify([braceless({}), braceless({ t: 9 })]) !== "[[2,null],[null,2]]") bad.push("braceless");`,
+    "console.log(JSON.stringify(bad));",
+  ].join("\n");
+  itBundled("minify/WithStatementPinnedNameNotReusedByEnclosingScope", {
+    files: {
+      "/entry.js": withPinnedNamesSource,
+    },
+    format: "cjs",
+    minifyIdentifiers: true,
+    run: { stdout: "[]" },
+  });
+  // `bun build --no-bundle` names symbols through the same reserved set.
+  itBundled("minify/WithStatementPinnedNameNotReusedByEnclosingScopeNoBundle", {
+    files: {
+      "/entry.js": withPinnedNamesSource,
+    },
+    bundling: false,
+    format: "cjs",
+    minifyIdentifiers: true,
+    run: { stdout: "[]" },
+  });
+  // The same reserved names without --minify. The parameter "require_dep"
+  // meets the wrapper of dep.cjs, which the function calls, so it is numbered.
+  // It cannot take "require_dep2", the `var` that the `with` body reads.
+  itBundled("minify/WithStatementPinnedNameNotReusedWithoutMinify", {
+    files: {
+      "/entry.js": /* js */ `
+        const { read } = require("./sloppy.cjs");
+        console.log(JSON.stringify([read("arg", {}), read("arg", { require_dep2: 9 })]));
+      `,
+      "/sloppy.cjs": /* js */ `
+        module.exports.read = function (require_dep, obj) {
+          var require_dep2 = 1;
+          var seen = require_dep + "," + require("./dep.cjs").value;
+          with (obj) {
+            return [seen, require_dep2];
+          }
+        };
+      `,
+      "/dep.cjs": /* js */ `
+        module.exports.value = "dep";
+      `,
+    },
+    format: "cjs",
+    minifyIdentifiers: false,
+    run: { stdout: `[["arg,dep",1],["arg,dep",9]]` },
+  });
+  // `bun build --no-bundle` keeps the export names. They were pinned after the
+  // reserved names were computed, so a local in a nested function could take
+  // one of them and shadow the export it reads.
+  itBundled("minify/NoBundleExportNameNotReusedByLocal", {
+    files: {
+      "/entry.js": [
+        ...singleCharNames.map(n => `export const ${n} = "${n}";`),
+        "export function check() {",
+        "  let local = 0; local; local;",
+        "  const bad = [];",
+        ...singleCharNames.map(n => `  if (${n} !== "${n}") bad.push("${n}");`),
+        "  return bad;",
+        "}",
+        "console.log(JSON.stringify(check()));",
+      ].join("\n"),
+    },
+    bundling: false,
+    minifyIdentifiers: true,
+    run: { stdout: "[]" },
+  });
+  // Every kind of export takes one-character names here, and each test below
+  // declares 54 other names, one for each one-character name the minifier can
+  // produce. So every export name is wanted by one of them, whatever the
+  // character frequency of the file is.
+  const exportKinds: ((n: string) => [declaration: string, read: string])[] = [
+    n => [`export const ${n} = "${n}";`, n],
+    n => [`export let ${n} = "${n}";`, n],
+    n => [`export var ${n} = "${n}";`, n],
+    n => [`export function ${n}() { return "${n}"; }`, `${n}()`],
+    n => [`export class ${n} { static value = "${n}"; }`, `${n}.value`],
+    n => [`const ${n} = "${n}"; export { ${n} };`, n],
+    n => [`export const { ${n} } = { ${n}: "${n}" };`, n],
+  ];
+  const everyExportKind = singleCharNames.map((n, i) => exportKinds[i % exportKinds.length](n));
+  const exportDeclarations = everyExportKind.map(([declaration]) => declaration);
+  const exportChecks = singleCharNames.map((n, i) => `if (${everyExportKind[i][1]} !== "${n}") bad.push("${n}");`);
+  // A parameter, a local and a catch binding of a function that reads the
+  // exports: `export const t = ...; export function label(item) { return
+  // t(item.name) }` printed as `function label(t) { return t(t.name) }`.
+  itBundled("minify/NoBundleExportNameNotReusedInFunction", {
+    files: {
+      "/entry.js": [
+        ...exportDeclarations,
+        `export function check(${singleCharNames.map((_, i) => `param${i} = ${i}`).join(", ")}) {`,
+        "  const bad = [];",
+        `  let local = [${singleCharNames.map((_, i) => `param${i}`).join(", ")}].join();`,
+        `  if (local !== "${singleCharNames.map((_, i) => i).join()}") bad.push("params " + local);`,
+        "  try { throw local.length; } catch (caught) { if (caught !== local.length) bad.push('caught ' + caught); }",
+        ...exportChecks,
+        "  return bad;",
+        "}",
+        "console.log(JSON.stringify(check()));",
+      ].join("\n"),
+    },
+    bundling: false,
+    minifyIdentifiers: true,
+    run: { stdout: "[]" },
+  });
+  // An import and a private top-level name: `import { a } from "./x.js";
+  // export const t = a` printed as `import { a as t } from "./x.js"; export
+  // const t = t`, which does not parse.
+  itBundled("minify/NoBundleExportNameNotReusedAtTopLevel", {
+    files: {
+      "/entry.js": [
+        `import fromDefault, { fromNamed } from "./imported.js";`,
+        `import * as fromNamespace from "./imported.js";`,
+        `function privateFunction() { return "function"; }`,
+        `class PrivateClass { static value = "class"; }`,
+        ...singleCharNames.map((_, i) => `const private${i} = ${i};`),
+        ...exportDeclarations,
+        "const bad = [];",
+        `const imports = [fromDefault, fromNamed, fromNamespace.fromNamed, privateFunction(), PrivateClass.value].join();`,
+        `if (imports !== "default,named,named,function,class") bad.push("imports " + imports);`,
+        `const privates = [${singleCharNames.map((_, i) => `private${i}`).join(", ")}].join();`,
+        `if (privates !== "${singleCharNames.map((_, i) => i).join()}") bad.push("privates " + privates);`,
+        ...exportChecks,
+        "console.log(JSON.stringify(bad));",
+      ].join("\n"),
+      "/imported.js": `export const fromNamed = "named"; export default "default";`,
+    },
+    bundling: false,
+    minifyIdentifiers: true,
+    run: { stdout: "[]" },
+  });
+  // The second `var t` replaces the symbol of the export, which then links to
+  // it. The pin has to follow that link: `export var t = 1; var t = 2` printed
+  // as `export var r = 1; var r = 2` exports no `t`.
+  itBundled("minify/NoBundleExportNameKeptWhenDeclaredAgain", {
+    files: {
+      "/entry.js": `export var t = 1;\nvar t = 2;\nexport function read() { return t; }`,
+    },
+    runtimeFiles: {
+      "/importer.js": `import { t, read } from "./out.js";\nconsole.log(t, read());`,
+    },
+    bundling: false,
+    minifyIdentifiers: true,
+    run: { file: "/importer.js", stdout: "2 2" },
+  });
+  itBundled("minify/DefaultExportOfNamedExpressionAcrossChunks", {
+    files: {
+      "/a.js": /* js */ `
+        import inc from './inc.js'
+        import User from './user.js'
+        import Decorated from './decorated.js'
+        console.log("a", inc(1), new User(1).value, new Decorated().kind)
+      `,
+      "/b.js": /* js */ `
+        import inc from './inc.js'
+        import User from './user.js'
+        import Decorated from './decorated.js'
+        console.log("b", inc(2), new User(2).value, new Decorated().kind)
+      `,
+      "/inc.js": /* js */ `
+        export default (function inc(n) { return n + 1 })
+      `,
+      "/user.js": /* js */ `
+        export default (class User { constructor(value) { this.value = value } })
+      `,
+      "/decorated.js": /* js */ `
+        function dec(value) { return value }
+        export default @dec class Decorated { kind = "decorated" }
+      `,
+    },
+    entryPoints: ["/a.js", "/b.js"],
+    splitting: true,
+    minifyIdentifiers: true,
+    outdir: "/out",
+    format: "esm",
+    backend: "cli",
+    run: [
+      { file: "/out/a.js", stdout: "a 2 1 decorated" },
+      { file: "/out/b.js", stdout: "b 3 2 decorated" },
+    ],
+  });
+  itBundled("minify/DefaultExportOfNamedExpressionKeepsItsName", {
+    files: {
+      "/entry.js": /* js */ `
+        import Controller from './controller.js'
+        import Model from './model.js'
+        console.log(Controller.name, Model.name)
+      `,
+      "/controller.js": /* js */ `
+        export default (function Controller(a) { return a })
+      `,
+      "/model.js": /* js */ `
+        export default (class Model { value = 1 })
+      `,
+    },
+    minifySyntax: true,
+    run: { stdout: "Controller Model" },
+  });
+  itBundled("minify/TemplateStringFolding", {
+    files: {
+      "/entry.js": /* js */ `
+        capture(\`\${1}-\${2}-\${3}-\${null}-\${undefined}-\${true}-\${false}\`);
+        capture(\`\\uD83D\\uDE0B \\uD83D\\uDCCB \\uD83D\\uDC4C\`.length)
+        capture(\`\\uD83D\\uDE0B \\uD83D\\uDCCB \\uD83D\\uDC4C\`.length === 8)
+        capture(\`\\uD83D\\uDE0B \\uD83D\\uDCCB \\uD83D\\uDC4C\`.length == 8)
+        capture(\`\\uD83D\\uDE0B \\uD83D\\uDCCB \\uD83D\\uDC4C\`.length === 1)
+        capture(\`\\uD83D\\uDE0B \\uD83D\\uDCCB \\uD83D\\uDC4C\`.length == 1)
+        capture("\\uD83D\\uDE0B \\uD83D\\uDCCB \\uD83D\\uDC4C".length)
+        capture("\\uD83D\\uDE0B \\uD83D\\uDCCB \\uD83D\\uDC4C".length === 8)
+        capture("\\uD83D\\uDE0B \\uD83D\\uDCCB \\uD83D\\uDC4C".length == 8)
+        capture("\\uD83D\\uDE0B \\uD83D\\uDCCB \\uD83D\\uDC4C".length === 1)
+        capture("\\uD83D\\uDE0B \\uD83D\\uDCCB \\uD83D\\uDC4C".length == 1)
+        capture('\\uD83D\\uDE0B \\uD83D\\uDCCB \\uD83D\\uDC4C'.length)
+        capture('\\uD83D\\uDE0B \\uD83D\\uDCCB \\uD83D\\uDC4C'.length === 8)
+        capture('\\uD83D\\uDE0B \\uD83D\\uDCCB \\uD83D\\uDC4C'.length == 8)
+        capture('\\uD83D\\uDE0B \\uD83D\\uDCCB \\uD83D\\uDC4C'.length === 1)
+        capture('\\uD83D\\uDE0B \\uD83D\\uDCCB \\uD83D\\uDC4C'.length == 1)
+        capture(\`😋📋👌\`.length === 6)
+        capture(\`😋📋👌\`.length == 6)
+        capture(\`😋📋👌\`.length === 2)
+        capture(\`😋📋👌\`.length == 2)
+        capture(\`\\n\`.length)
+        capture(\`\n\`.length)
+        capture("\\uD800\\uDF34".length)
+        capture("\\u{10334}".length)
+        capture("𐌴".length)
+      `,
+    },
+    capture: [
+      '"1-2-3-null-undefined-true-false"',
+      "8",
+      "!0",
+      "!0",
+      "!1",
+      "!1",
+      "8",
+      "!0",
+      "!0",
+      "!1",
+      "!1",
+      "8",
+      "!0",
+      "!0",
+      "!1",
+      "!1",
+      "!0",
+      "!0",
+      "!1",
+      "!1",
+      "1",
+      "1",
+      "2",
+      "2",
+      "2",
+    ],
+    minifySyntax: true,
+    target: "bun",
+  });
+  itBundled("minify/StringAdditionFolding", {
+    files: {
+      "/entry.js": /* js */ `
+        capture("Objects are not valid as a React child (found: " + (childString === "[object Object]" ? "object with keys {" + Object.keys(node).join(", ") + "}" : childString) + "). " + "If you meant to render a collection of children, use an array " + "instead.")
+      `,
+    },
+    capture: [
+      '"Objects are not valid as a React child (found: " + (childString === "[object Object]" ? "object with keys {" + Object.keys(node).join(", ") + "}" : childString) + "). If you meant to render a collection of children, use an array instead."',
+    ],
+    minifySyntax: true,
+  });
+  itBundled("minify/FunctionExpressionRemoveName", {
+    files: {
+      "/entry.js": /* js */ `
+        export var AB = function A() { };
+        export var CD = function B() { return 1; };
+        export var EF = function C() { C(); };
+        export var GH = function() { };
+        export var IJ = class D { };
+        export var KL = class E { constructor() {} };
+        export var MN = class F { method() { return F; } };
+        export var OP = class { };
+      `,
+    },
+    onAfterBundle(api) {
+      const code = api.readFile("/out.js");
+      // With minify-identifiers, variable names are minified but we check function/class name removal
+      // Function names with 0 usage should be removed
+      expect(code).toMatch(/var \w+ = function\(\) \{/); // AB function without name
+      expect(code).toContain("return 1"); // CD function
+      // Function name with self-reference should be kept (minified)
+      expect(code).toMatch(/function \w+\(\) \{\s*\w+\(\)/); // EF function with self-reference
+      // Class names with 0 usage should be removed
+      expect(code).toMatch(/\w+ = class \{/); // Classes without names
+      // Class name with self-reference should be kept (minified)
+      expect(code).toMatch(/class \w+ \{[\s\S]*return \w+/); // MN class with self-reference
+    },
+    minifySyntax: true,
+    minifyIdentifiers: true,
+    target: "bun",
+  });
+  itBundled("minify/KeepNamesPreservesNames", {
+    files: {
+      "/entry.js": /* js */ `
+        export var AB = function A() { };
+        export var CD = function B() { return 1; };
+        export var EF = function C() { C(); };
+        export var GH = function() { };
+        export var IJ = class D { };
+        export var KL = class E { constructor() {} };
+        export var MN = class F { method() { return F; } };
+        export var OP = class { };
+      `,
+    },
+    onAfterBundle(api) {
+      const code = api.readFile("/out.js");
+      // With keepNames, all names should be preserved even when minifying
+      expect(code).toContain("function A()");
+      expect(code).toContain("function B()");
+      expect(code).toContain("function C()");
+      expect(code).toContain("class D");
+      expect(code).toContain("class E");
+      expect(code).toContain("class F");
+      // Anonymous functions/classes stay anonymous
+      expect(code).toMatch(/\w+ = function\(\) \{\}/); // GH stays anonymous
+      expect(code).toMatch(/\w+ = class \{\s*\}/); // OP stays anonymous
+    },
+    minifySyntax: true,
+    minifyIdentifiers: false, // Don't minify identifiers to make testing easier
+    keepNames: true,
+    target: "bun",
+  });
+  itBundled("minify/KeepNamesWithMinifyIdentifiers", {
+    files: {
+      "/entry.js": /* js */ `
+        export var AB = function A() { };
+        export var CD = function B() { return 1; };
+        export var EF = class C { };
+      `,
+    },
+    onAfterBundle(api) {
+      const code = api.readFile("/out.js");
+      // With keepNames + minifyIdentifiers, names are preserved but minified
+      // The original names A, B, C should still exist (though minified)
+      expect(code).toMatch(/function \w+\(\)/); // Functions should have names
+      expect(code).toMatch(/class \w+/); // Classes should have names
+      // Should not have anonymous functions/classes
+      expect(code).not.toContain("function()");
+      expect(code).not.toContain("class {");
+    },
+    minifySyntax: true,
+    minifyIdentifiers: true,
+    keepNames: true,
+    target: "bun",
+  });
+  itBundled("minify/PrivateIdentifiersNameCollision", {
+    files: {
+      "/entry.js": /* js */ `
+        class C {
+          ${new Array(500)
+            .fill(null)
+            .map((_, i) => `#identifier${i} = 123;`)
+            .join("\n")}
+          a = 456;
+
+          getAllValues() {
+            return [
+              ${new Array(500)
+                .fill(null)
+                .map((_, i) => `this.#identifier${i}`)
+                .join(",")}
+            ]
+          }
+        }
+        
+        const values = new C().getAllValues();
+        for (const value of values) {
+          if(value !== 123) { throw new Error("Expected 123!"); }
+        }
+
+        console.log("a = " + new C().a);
+      `,
+    },
+    minifyIdentifiers: true,
+    run: { stdout: "a = 456" },
+  });
+  itBundled("minify/MergeAdjacentVars", {
+    files: {
+      "/entry.js": /* js */ `
+        var a = 1;
+        var b = 2;
+        var c = 3;
+        
+        // some code to prevent inlining
+        a = 4;
+        console.log(a, b, c)
+        b = 5;
+        console.log(a, b, c)
+        c = 6;
+        console.log(a, b, c)
+      `,
+    },
+    minifySyntax: true,
+    run: { stdout: "4 2 3\n4 5 3\n4 5 6" },
+    onAfterBundle(api) {
+      const code = api.readFile("/out.js");
+      expect([...code.matchAll(/var /g)]).toHaveLength(1);
+    },
+  });
+  itBundled("minify/UnusedCommaAndStrictEqChains", {
+    // Exercises the reusable binary-comma simplification stack, including
+    // recursive re-entry while an outer frame's stack slice is still live.
+    files: {
+      "/entry.js": /* js */ `
+        function eff(n) { console.log(n); return n; }
+        // Deep left-nested comma chain.
+        (${new Array(60)
+          .fill(null)
+          .map((_, i) => `eff(${i + 1})`)
+          .join(", ")});
+        // Comma chain whose right operands are themselves comma chains.
+        (eff(61), (eff(62), (eff(63), eff(64)), eff(65)), eff(66));
+        // Unused strict-eq/ne: pure comparison dropped, operand side effects kept.
+        (eff(67) === (eff(68), eff(69)), eff(70));
+        ((eff(71), eff(72)) !== eff(73), (eff(74), eff(75)) === eff(76));
+        console.log("done");
+      `,
+    },
+    minifySyntax: true,
+    run: {
+      stdout:
+        new Array(76)
+          .fill(null)
+          .map((_, i) => String(i + 1))
+          .join("\n") + "\ndone",
+    },
+    onAfterBundle(api) {
+      const code = api.readFile("/out.js");
+      expect(code).not.toContain("===");
+      expect(code).not.toContain("!==");
+    },
+  });
+  itBundled("minify/Infinity", {
+    files: {
+      "/entry.js": /* js */ `
+        capture(Infinity);
+        capture(-Infinity);
+        capture(Infinity + 1);
+        capture(-Infinity - 1);
+        capture(Infinity / 0);
+        capture(-Infinity / 0);
+        capture(Infinity * 0);
+        capture(-Infinity * 0);
+        capture(Infinity % 1);
+        capture(-Infinity % 1);
+        capture(Infinity ** 1);
+        capture(-(Infinity ** 1));
+        capture(~Infinity);
+        capture(~-Infinity);
+      `,
+    },
+    capture: [
+      "1 / 0",
+      "-1 / 0",
+      "1 / 0",
+      "-1 / 0",
+      "1 / 0",
+      "-1 / 0",
+      "NaN",
+      "NaN",
+      "NaN",
+      "NaN",
+      "1 / 0",
+      "-1 / 0",
+      "-1",
+      "-1",
+    ],
+    minifySyntax: true,
+  });
+  itBundled("minify+whitespace/Infinity", {
+    files: {
+      "/entry.js": /* js */ `
+        capture(Infinity);
+        capture(-Infinity);
+        capture(Infinity + 1);
+        capture(-Infinity - 1);
+        capture(Infinity / 0);
+        capture(-Infinity / 0);
+        capture(Infinity * 0);
+        capture(-Infinity * 0);
+        capture(Infinity % 1);
+        capture(-Infinity % 1);
+        capture(Infinity ** 1);
+        capture((-Infinity) ** 2);
+        capture(~Infinity);
+        capture(~-Infinity);
+      `,
+    },
+    capture: ["1/0", "-1/0", "1/0", "-1/0", "1/0", "-1/0", "NaN", "NaN", "NaN", "NaN", "1/0", "1/0", "-1", "-1"],
+    minifySyntax: true,
+    minifyWhitespace: true,
+  });
+  // Numeric property names that would be printed as "1/0" (Infinity) or "-1" (inlined const
+  // enums) are not valid syntax in property-name position and must become computed properties.
+  // The negative const enum key case is https://github.com/oven-sh/bun/issues/14687
+  itBundled("minify/NumericPropertyKeysPrintedAsComputed", {
+    files: {
+      "/entry.ts": /* ts */ `
+        import { E } from "./enum";
+        const obj = { 1e999: "inf", [E.Negative]: "neg" };
+        const { 1e999: destructured } = obj;
+        class C {
+          1e999() { return "method"; }
+          static 1e999 = "static";
+        }
+        console.log(JSON.stringify([obj[Infinity], obj[-1], destructured, new C()[Infinity](), C[Infinity]]));
+      `,
+      "enum.ts": /* ts */ `
+        export const enum E { Negative = -1 }
+      `,
+    },
+    minifySyntax: true,
+    minifyWhitespace: true,
+    run: {
+      stdout: '["inf","neg","inf","method","static"]',
+    },
+  });
+  // https://github.com/oven-sh/bun/issues/40688: the same-target destructuring
+  // transform must apply to every eligible run of declarations, not only the
+  // run at the head of the list.
+  itBundled("minify/SameTargetDestructuringAfterOtherDecl", {
+    files: {
+      "/entry.js": /* js */ `
+        var Math_random = Math.random;
+        var Math_random2 = Math.random;
+        var x = Math_random2() + Math_random();
+        var Math_cos = Math.cos;
+        var Math_sin = Math.sin;
+        console.log(typeof Math_cos(x), typeof Math_sin(x));
+      `,
+    },
+    minifySyntax: true,
+    onAfterBundle(api) {
+      api.expectFile("/out.js").toContain("{ random: Math_random, random: Math_random2 } = Math");
+      api.expectFile("/out.js").toContain("{ cos: Math_cos, sin: Math_sin } = Math");
+    },
+    run: { stdout: "number number" },
+  });
+  itBundled("minify/SameTargetDestructuringMultipleRuns", {
+    files: {
+      "/entry.js": /* js */ `
+        var o = { a: 1, b: 2 };
+        var p = { a: 3, b: 4 };
+        var w = o.a;
+        var x = o.b;
+        var y = p.a;
+        var z = p.b;
+        var mid = w + x;
+        var q = p.a;
+        var r = p.b;
+        console.log(w, x, y, z, mid, q, r);
+      `,
+    },
+    minifySyntax: true,
+    onAfterBundle(api) {
+      api.expectFile("/out.js").toContain("{ a: w, b: x } = o");
+      api.expectFile("/out.js").toContain("{ a: y, b: z } = p");
+      api.expectFile("/out.js").toContain("{ a: q, b: r } = p");
+    },
+    run: { stdout: "1 2 3 4 3 3 4" },
+  });
+  // A destructuring group evaluates its target once, before any assignment.
+  // A declarator that rebinds the target itself must end the group, or a
+  // later member reads the old target instead of the rebound one.
+  itBundled("minify/SameTargetDestructuringStopsWhenTargetRebound", {
+    files: {
+      "/entry.js": /* js */ `
+        var o = { a: 1, o: { b: 99 } };
+        var a = o.a;
+        var o = o.o;
+        var b = o.b;
+        console.log(a, b);
+        var p = { x: { y: 5 }, y: 7 };
+        var p = p.x;
+        var c = p.y;
+        console.log(c);
+      `,
+    },
+    minifySyntax: true,
+    run: { stdout: "1 99\n5" },
+  });
+  // A `var` that re-declares a parameter or an earlier `var` gets its own
+  // symbol, linked to the existing one. The rebound-target check must compare
+  // the linked symbols, or `var n = n.next, n = n.next` folds into
+  // `{ next: n, next: n } = n` and both members read the original `n`.
+  const sameTargetRedeclaredFiles = {
+    "/entry.js": /* js */ `
+      const L = { v: 0, next: { v: 1, next: { v: 2, next: null } } };
+      function param(n) { var n = n.next, n = n.next; return n.v; }
+      function redecl() { var n = L; var n = n.next, n = n.next; return n.v; }
+      function later(n) { var n = n.next, v = n.v; var n; return v; }
+      function mixed(n) { var a = n.next, n = n.next, b = n.v; return [a.v, n.v, b].join(""); }
+      console.log(param(L), redecl(), later(L), mixed(L));
+    `,
+  };
+  itBundled("minify/SameTargetDestructuringSkipsRedeclaredTarget", {
+    files: sameTargetRedeclaredFiles,
+    minifySyntax: true,
+    onAfterBundle(api) {
+      api.expectFile("/out.js").toContain("var n = n.next, n = n.next");
+      api.expectFile("/out.js").toContain("var n = L, n = n.next, n = n.next");
+      api.expectFile("/out.js").toContain("var n = n.next, v = n.v, n;");
+      api.expectFile("/out.js").toContain("var { next: a, next: n } = n, b = n.v");
+    },
+    run: { stdout: "2 2 1 111" },
+  });
+  itBundled("minify/SameTargetDestructuringSkipsRedeclaredTargetWithoutMinify", {
+    files: sameTargetRedeclaredFiles,
+    onAfterBundle(api) {
+      api.expectFile("/out.js").toContain("var n = n.next, n = n.next");
+      api.expectFile("/out.js").toContain("var n = n.next, v = n.v;");
+      api.expectFile("/out.js").toContain("var { next: a, next: n } = n, b = n.v");
+    },
+    run: { stdout: "2 2 1 111" },
+  });
+  // The pattern reads its target once where the declarators read it once
+  // each. An unbound global may be an accessor on globalThis, and a getter on
+  // the first property may reassign a variable the file assigns somewhere.
+  // Only a declared symbol that nothing assigns, or a known pure global such
+  // as `Math`, reads as the same value both times.
+  itBundled("minify/SameTargetDestructuringSkipsUnstableTarget", {
+    files: {
+      "/entry.js": /* js */ `
+        let reads = 0;
+        Object.defineProperty(globalThis, "CFG", {
+          get() {
+            reads++;
+            return { host: "h", port: 1 };
+          },
+          configurable: true,
+        });
+        function globalHead() {
+          reads = 0;
+          var h = CFG.host, p = CFG.port;
+          return [h, p, reads];
+        }
+        function globalMid() {
+          reads = 0;
+          var z = 0, h = CFG.host, p = CFG.port;
+          return [z, h, p, reads];
+        }
+        function getterReassigns() {
+          var cur = { get a() { cur = nxt; return "a1"; }, b: "b1" }, nxt = { a: "a2", b: "b2" };
+          var x = cur.a, y = cur.b;
+          return x + y;
+        }
+        function blockHoisted() {
+          var swap;
+          { var o; swap = () => { o = { a: "a2", b: "b2" }; }; }
+          var o = { get a() { swap(); return "a1"; }, b: "b1" };
+          var a = o.a, b = o.b;
+          return a + b;
+        }
+        function stable(param) {
+          var local = { a: "a1", b: "b1" };
+          var a = local.a, b = local.b;
+          var c = param.a, d = param.b;
+          var cos = Math.cos, sin = Math.sin;
+          return [a + b, c + d, typeof cos(0), typeof sin(0)];
+        }
+        var top = { get a() { swapTop(); return "a1"; }, b: "b1" };
+        var swapTop = () => eval("top = { a: 'a2', b: 'b2' }");
+        var ta = top.a, tb = top.b;
+        console.log(JSON.stringify([globalHead(), globalMid(), getterReassigns(), blockHoisted(), stable({ a: "a2", b: "b2" }), ta + tb]));
+      `,
+    },
+    minifySyntax: true,
+    onAfterBundle(api) {
+      api.expectFile("/out.js").toContain("var h = CFG.host, p = CFG.port");
+      api.expectFile("/out.js").toContain("var z = 0, h = CFG.host, p = CFG.port");
+      // `--minify-syntax` merges the adjacent `var` statements, so these runs
+      // start mid-list.
+      api.expectFile("/out.js").toContain(", x = cur.a, y = cur.b;");
+      api.expectFile("/out.js").toContain(", a = o.a, b = o.b;");
+      api.expectFile("/out.js").toContain("{ a, b } = local");
+      api.expectFile("/out.js").toContain("{ a: c, b: d } = param");
+      api.expectFile("/out.js").toContain("{ cos, sin } = Math");
+      // The direct eval can assign any top-level variable.
+      api.expectFile("/out.js").toContain(", ta = top.a, tb = top.b;");
+    },
+    run: { stdout: '[["h",1,2],[0,"h",1,2],"a1b2","a1b2",["a1b1","a2b2","number","number"],"a1b2"]' },
+  });
+  // A `using` declaration admits only identifier bindings, so the transform
+  // must not rewrite its declarators into an object pattern.
+  itBundled("minify/SameTargetDestructuringSkipsUsingDecls", {
+    files: {
+      "/entry.js": /* js */ `
+        const obj = { x: null, y: null };
+        function mk() {
+          return { r: null, w: null, v: 1, [Symbol.dispose]() {} };
+        }
+        function f() {
+          using a = obj.x, b = obj.y;
+          return [a, b];
+        }
+        function g() {
+          using db = mk(), a = db.r, b = db.w;
+          return [db.v, a, b];
+        }
+        console.log(JSON.stringify(f()), JSON.stringify(g()));
+      `,
+    },
+    minifySyntax: true,
+    target: "bun",
+    onAfterBundle(api) {
+      api.expectFile("/out.js").toContain("using a = obj.x, b = obj.y");
+      api.expectFile("/out.js").toContain("using db = mk(), a = db.r, b = db.w");
+    },
+    run: { stdout: "[null,null] [1,null,null]" },
+  });
+  itBundled("minify/InlineArraySpread", {
+    files: {
+      "/entry.js": /* js */ `
+        capture([1, 2, ...[3, 4], 5, 6, ...[7, ...[...[...[...[8, 9]]]]], 10, ...[...[...[...[...[...[...[11]]]]]]]]);
+        capture([1, 2, ...[3, 4], 5, 6, ...[7, [...[...[...[8, 9]]]]], 10, ...[...[...[...[...[...[...11]]]]]]]);
+      `,
+    },
+    capture: ["[1,2,3,4,5,6,7,8,9,10,11]", "[1,2,3,4,5,6,7,[8,9],10,...11]"],
+    minifySyntax: true,
+    minifyWhitespace: true,
+  });
+  itBundled("minify/ForAndWhileLoopsWithMissingBlock", {
+    files: {
+      "/entry.js": /* js */ `
+        {
+          var n = 0;
+          for (let i = 0; i < 10; i++) i;
+        }
+        {
+          var j = 0;
+          for (let i in [1, 2, 3]) i;
+        }
+        {
+          var k = 0;
+          for (let i of [1, 2, 3]) i;
+        }
+        console.log("PASS");
+      `,
+    },
+    minifyWhitespace: true,
+    run: {
+      stdout: "PASS",
+    },
+  });
+  itBundled("minify/MissingExpressionBlocks", {
+    files: {
+      "/entry.js": /* js */ `
+        var r = 1;
+        var g;
+        g = () => {
+          if (r) {
+            undefined;
+          }
+        };
+        
+        g = () => {
+          if (r) {
+          } else if (r) {
+            undefined;
+          }
+        };
+        
+        g = () => {
+          if (r) {
+            undefined;
+          } else if (r) {
+            undefined;
+          }
+        };
+        
+        g = () => {
+          if (r) {
+          } else if (r) {
+          } else {
+            undefined;
+          }
+        };
+        
+        g = () => {
+          if (r) {
+          } else if (r) {
+            undefined;
+          } else {
+          }
+        };
+        
+        g = () => {
+          if (r) {
+            undefined;
+          } else if (r) {
+          } else {
+          }
+        };
+        
+        g = () => {
+          if (r) {
+            undefined;
+          } else if (r) {
+            undefined;
+          } else {
+          }
+        };
+        
+        g = () => {
+          if (r) {
+            undefined;
+          } else if (r) {
+            undefined;
+          } else {
+            undefined;
+          }
+        };
+        
+        g = () => {
+          if (r) {
+            undefined;
+          } else if (r) {
+          } else {
+            undefined;
+          }
+        };
+        
+        g = () => {
+          while (r) {
+            undefined;
+          }
+        };
+        
+        g = () => {
+          do undefined;
+          while (r);
+        };
+        
+        g = () => {
+          for (;;) undefined;
+        };
+        
+        g = () => {
+          for (let i = 0; i < 10; i++) undefined;
+        };
+        g = () => {
+          for (let i in [1, 2, 3]) undefined;
+        };
+        g = () => {
+          for (let i of [1, 2, 3]) undefined;
+        };
+        
+        g = () => {
+          switch (r) {
+            case 1:
+              undefined;
+            case 23: {
+              undefined;
+            }
+          }
+        };
+        
+        g = () => {
+          let gg;
+          gg = () => undefined;
+        };
+        
+        console.log("PASS");
+      `,
+    },
+    minifyWhitespace: true,
+    minifySyntax: true,
+    run: {
+      stdout: "PASS",
+    },
+  });
+  // https://github.com/oven-sh/bun/issues/5501
+  itBundled("minify/BunRequireStatement", {
+    files: {
+      "/entry.js": /* js */ `
+        export function test(ident) {
+          return require(ident);
+        }
+
+        test("fs");
+        console.log("PASS");
+      `,
+    },
+    minifyWhitespace: true,
+    minifySyntax: true,
+    minifyIdentifiers: true,
+    target: "bun",
+    backend: "cli",
+    run: {
+      stdout: "PASS",
+    },
+  });
+  // https://github.com/oven-sh/bun/issues/6750
+  itBundled("minify/SwitchUndefined", {
+    files: {
+      "/entry.js": /* js */ `
+        switch (1) {
+          case undefined: {
+          }
+        }
+        console.log("PASS");
+      `,
+    },
+    minifyWhitespace: true,
+    minifySyntax: false,
+    minifyIdentifiers: false,
+    target: "bun",
+    backend: "cli",
+    run: {
+      stdout: "PASS",
+    },
+  });
+  itBundled("minify/RequireInDeadBranch", {
+    files: {
+      "/entry.ts": /* js */ `
+        if (0 !== 0) {
+          require;
+        }
+      `,
+    },
+    outfile: "/out.js",
+    minifySyntax: true,
+    onAfterBundle(api) {
+      // This should not be marked as a CommonJS module
+      api.expectFile("/out.js").not.toContain("require");
+      api.expectFile("/out.js").not.toContain("module");
+    },
+  });
+  itBundled("minify/TypeOfRequire", {
+    files: {
+      "/entry.ts": /* js */ `
+        capture(typeof require); 
+      `,
+    },
+    outfile: "/out.js",
+    capture: ['"function"'],
+    minifySyntax: true,
+    onAfterBundle(api) {
+      // This should not be marked as a CommonJS module
+      api.expectFile("/out.js").not.toContain("require");
+      api.expectFile("/out.js").not.toContain("module");
+    },
+  });
+  itBundled("minify/RequireMainToImportMetaMain", {
+    files: {
+      "/entry.ts": /* js */ `
+        capture(require.main === module); 
+        capture(require.main !== module); 
+        capture(require.main == module); 
+        capture(require.main != module); 
+        capture(!(require.main === module)); 
+        capture(!(require.main !== module)); 
+        capture(!(require.main == module)); 
+        capture(!(require.main != module)); 
+        capture(!!(require.main === module)); 
+        capture(!!(require.main !== module)); 
+        capture(!!(require.main == module)); 
+        capture(!!(require.main != module)); 
+      `,
+    },
+    outfile: "/out.js",
+    capture: [
+      "import.meta.main",
+      "!import.meta.main",
+      "import.meta.main",
+      "!import.meta.main",
+      "!import.meta.main",
+      "import.meta.main",
+      "!import.meta.main",
+      "import.meta.main",
+      "import.meta.main",
+      "!import.meta.main",
+      "import.meta.main",
+      "!import.meta.main",
+    ],
+    minifySyntax: true,
+    onAfterBundle(api) {
+      // This should not be marked as a CommonJS module
+      api.expectFile("/out.js").not.toContain("require");
+      api.expectFile("/out.js").not.toContain("module");
+    },
+  });
+  itBundled("minify/ConstantFoldingUnaryPlusString", {
+    files: {
+      "/entry.ts": `
+        // supported
+        capture(+'1.0');
+        capture(+'-123.567');
+        capture(+'8.325');
+        capture(+'100000000');
+        capture(+'\\u0030\\u002e\\u0031');
+        capture(+'\\x30\\x2e\\x31');
+        capture(+'NotANumber');
+        // not supported
+        capture(+'æ');
+      `,
+    },
+    minifySyntax: true,
+    capture: [
+      "1",
+      "-123.567",
+      "8.325",
+      "1e8",
+      "0.1",
+      "0.1",
+      "NaN",
+      // untouched
+      '+"æ"',
+    ],
+  });
+  itBundled("minify/ImportMetaHotTreeShaking", {
+    files: {
+      "/entry.ts": `
+        import { value } from "./other.ts";
+        capture(import.meta.hot);
+        if (import.meta.hot) {
+          throw new Error("FAIL");
+        }
+        import.meta.hot.accept(() => {"FAIL";value});
+        import.meta.hot.dispose(() => {"FAIL";value});
+        import.meta.hot.on(() => {"FAIL";value});
+        import.meta.hot.off(() => {"FAIL";value});
+        import.meta.hot.send(() => {"FAIL";value});
+        import.meta.hot.invalidate(() => {"FAIL";value});
+        import.meta.hot.prune(() => {"FAIL";value});
+        capture(import.meta.hot.accept());
+        capture("This should remain");
+        import.meta.hot.accept(async() => {
+          await import("crash");
+          require("crash");
+        });
+        capture(import.meta.hot.data);
+        capture(import.meta.hot.data.value ??= "hello");
+      `,
+      "other.ts": `
+        capture("hello");
+        export const value = "hello";
+      `,
+    },
+    outfile: "/out.js",
+    capture: ['"hello"', "void 0", "void 0", '"This should remain"', "{}", '"hello"'],
+    minifySyntax: true,
+    onAfterBundle(api) {
+      api.expectFile("/out.js").not.toContain("FAIL");
+      api.expectFile("/out.js").not.toContain("import.meta.hot");
+    },
+  });
+  itBundled("minify/ProductionMode", {
+    files: {
+      "/entry.jsx": `
+        import {foo} from 'dev-trap';
+        capture(process.env.NODE_ENV);
+        capture(1232 + 521)
+        console.log(<div>Hello</div>);
+      `,
+      "/node_modules/react/jsx-dev-runtime.js": `
+        throw new Error("Should not use dev runtime");
+      `,
+      "/node_modules/react/jsx-runtime.js": `
+        export function jsx(type, props) {
+          return {type, props};
+        }
+        export const Fragment = (globalThis.doNotDCE = Symbol.for("jsx-runtime"));
+      `,
+      "/node_modules/dev-trap/package.json": `{
+        "name": "dev-trap",
+        "exports": {
+          "development": "./dev.js",
+          "default": "./prod.js"
+        }
+      }`,
+      "/node_modules/dev-trap/dev.js": `
+        throw new Error("FAIL");
+      `,
+      "/node_modules/dev-trap/prod.js": `
+        export const foo = "production";
+      `,
+    },
+    capture: ['"production"', "1753"],
+    production: true,
+    onAfterBundle(api) {
+      const output = api.readFile("out.js");
+
+      expect(output).not.toContain("FAIL");
+
+      // Check minification
+      expect(output).not.toContain("\t");
+      expect(output).not.toContain("  ");
+
+      // Check NODE_ENV is inlined
+      expect(output).toContain('"production"');
+      expect(output).not.toContain("process.env.NODE_ENV");
+
+      // Check JSX uses production runtime
+      expect(output).toContain("jsx-runtime");
+    },
+  });
+  itBundled("minify/UnusedInCommaExpression", {
+    files: {
+      "/entry.ts": `
+        let flag = computeSomethingUnknown();
+        // the expression 'flag === 1' has no side effects
+        capture((flag === 1234 ? "a" : "b", "c"));
+        // 'flag == 1234' may invoke a side effect
+        capture((flag == 1234 ? "a" : "b", "c"));
+        // 'unbound' may invoke a side effect
+        capture((unbound ? "a" : "b", "c"));
+        // two side effects
+        capture((flag == 1234 ? "a" : unbound, "c"));
+        // two side effects 2
+        capture(([flag == 1234] ? unbound : other, "c"));
+        // new expression
+        capture((new Date(), 123));
+        // call expression
+        const funcWithNoSideEffects = () => 1;
+        capture((/* @__PURE__ */ funcWithNoSideEffects(), 456));
+      `,
+    },
+    minifySyntax: true,
+    capture: [
+      // 'flag' cannot throw on access or comparison via '==='
+      '"c"',
+      // 0 is inserted instead of 1234 because it is shorter and invokes the same coercion side effects
+      '(flag == 0, "c")',
+      // 'unbound' may throw on access
+      '(unbound, "c")',
+      // 0 is not inserted here because the result of 'flag == 1234' is used by the ternary
+      '(flag == 1234 || unbound, "c")',
+      // || is not inserted since the condition is always true, can simplify '1234' to '0'
+      '(flag == 0, unbound, "c")',
+      "123",
+      "456",
+    ],
+  });
+
+  itBundled("minify/TrimCodeInDeadControlFlow", {
+    files: {
+      "/entry.js": /* js */ `
+        // Basic dead code elimination after return
+        function test1() {
+          return 'foo'; 
+          try { 
+            return 'bar';
+          } catch {}
+        }
+
+        // Keep var declarations in dead try block
+        function test2() {
+          return foo = true; 
+          try { 
+            var foo;
+          } catch {}
+        }
+
+        // Keep var declarations in dead catch block
+        function test3() {
+          return foo = true; 
+          try {} catch { 
+            var foo;
+          }
+        }
+
+        // Complex async function with dead code after early return
+        async function test4() {
+          if (true) return { status: "disabled_for_development" };
+          try {
+            const response = await httpClients.releasesApi.get();
+            if (!response.ok) return { status: "no_release_found" };
+            if (response.statusCode === 204) return { status: "up_to_date" };
+          } catch (error) {
+            return { status: "no_release_found" };
+          }
+          return { status: "downloading" };
+        }
+
+        console.log(test1());
+        console.log(test2());
+        console.log(test3());
+        test4().then(result => console.log(result.status));
+      `,
+    },
+    minifySyntax: true,
+    minifyWhitespace: true,
+    minifyIdentifiers: false,
+    onAfterBundle(api) {
+      const file = api.readFile("out.js");
+      expect(file).toContain('function test1(){return"foo"}');
+      expect(file).toContain("return foo=!0;try{var foo}catch{}");
+      expect(file).toContain("return foo=!0;try{}catch{var foo}");
+      expect(file).toContain('async function test4(){return{status:"disabled_for_development"}}');
+      expect(file).not.toContain("no_release_found");
+      expect(file).not.toContain("downloading");
+      expect(file).not.toContain("up_to_date");
+    },
+    run: {
+      stdout: "foo\ntrue\ntrue\ndisabled_for_development",
+    },
+  });
+
+  itBundled("minify/ErrorConstructorOptimization", {
+    files: {
+      "/entry.js": /* js */ `
+        // Test all Error constructors
+        capture(new Error());
+        capture(new Error("message"));
+        capture(new Error("message", { cause: "cause" }));
+        
+        capture(new TypeError());
+        capture(new TypeError("type error"));
+        
+        capture(new SyntaxError());
+        capture(new SyntaxError("syntax error"));
+        
+        capture(new RangeError());
+        capture(new RangeError("range error"));
+        
+        capture(new ReferenceError());
+        capture(new ReferenceError("ref error"));
+        
+        capture(new EvalError());
+        capture(new EvalError("eval error"));
+        
+        capture(new URIError());
+        capture(new URIError("uri error"));
+        
+        capture(new AggregateError([], "aggregate error"));
+        capture(new AggregateError([new Error("e1")], "multiple"));
+        
+        // Test with complex arguments
+        const msg = "dynamic";
+        capture(new Error(msg));
+        capture(new TypeError(getErrorMessage()));
+        
+        // Test that other constructors are not affected
+        capture(new Date());
+        capture(new Map());
+        capture(new Set());
+        
+        function getErrorMessage() { return "computed"; }
+      `,
+    },
+    capture: [
+      "Error()",
+      'Error("message")',
+      'Error("message", { cause: "cause" })',
+      "TypeError()",
+      'TypeError("type error")',
+      "SyntaxError()",
+      'SyntaxError("syntax error")',
+      "RangeError()",
+      'RangeError("range error")',
+      "ReferenceError()",
+      'ReferenceError("ref error")',
+      "EvalError()",
+      'EvalError("eval error")',
+      "URIError()",
+      'URIError("uri error")',
+      'AggregateError([], "aggregate error")',
+      'AggregateError([Error("e1")], "multiple")',
+      "Error(msg)",
+      "TypeError(getErrorMessage())",
+      "/* @__PURE__ */ new Date",
+      "/* @__PURE__ */ new Map",
+      "/* @__PURE__ */ new Set",
+    ],
+    minifySyntax: true,
+    target: "bun",
+  });
+
+  itBundled("minify/ErrorConstructorWithVariables", {
+    files: {
+      "/entry.js": /* js */ `
+        function capture(val) { console.log(val); return val; }
+        // Test that Error constructors work with variables and expressions
+        const e1 = new Error("test1");
+        const e2 = new TypeError("test2");
+        const e3 = new SyntaxError("test3");
+        
+        capture(e1.message);
+        capture(e2.message);
+        capture(e3.message);
+        
+        // Test that they're still Error instances
+        capture(e1 instanceof Error);
+        capture(e2 instanceof TypeError);
+        capture(e3 instanceof SyntaxError);
+        
+        // Test with try-catch
+        try {
+          throw new RangeError("out of range");
+        } catch (e) {
+          capture(e.message);
+        }
+      `,
+    },
+    capture: [
+      "val",
+      "e1.message",
+      "e2.message",
+      "e3.message",
+      "e1 instanceof Error",
+      "e2 instanceof TypeError",
+      "e3 instanceof SyntaxError",
+      "e.message",
+    ],
+    minifySyntax: true,
+    target: "bun",
+    run: {
+      stdout: "test1\ntest2\ntest3\ntrue\ntrue\ntrue\nout of range",
+    },
+  });
+
+  itBundled("minify/ErrorConstructorPreservesSemantics", {
+    files: {
+      "/entry.js": /* js */ `
+        function capture(val) { console.log(val); return val; }
+        // Verify that Error() and new Error() have identical behavior
+        const e1 = new Error("with new");
+        const e2 = Error("without new");
+        
+        // Both should be Error instances
+        capture(e1 instanceof Error);
+        capture(e2 instanceof Error);
+        
+        // Both should have the same message
+        capture(e1.message === "with new");
+        capture(e2.message === "without new");
+        
+        // Both should have stack traces
+        capture(typeof e1.stack === "string");
+        capture(typeof e2.stack === "string");
+        
+        // Test all error types
+        const errors = [
+          [new TypeError("t1"), TypeError("t2")],
+          [new SyntaxError("s1"), SyntaxError("s2")],
+          [new RangeError("r1"), RangeError("r2")],
+        ];
+        
+        for (const [withNew, withoutNew] of errors) {
+          capture(withNew.constructor === withoutNew.constructor);
+        }
+      `,
+    },
+    capture: [
+      "val",
+      "e1 instanceof Error",
+      "e2 instanceof Error",
+      'e1.message === "with new"',
+      'e2.message === "without new"',
+      'typeof e1.stack === "string"',
+      'typeof e2.stack === "string"',
+      "withNew.constructor === withoutNew.constructor",
+    ],
+    minifySyntax: true,
+    target: "bun",
+    run: {
+      stdout: "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue",
+    },
+  });
+
+  itBundled("minify/AdditionalGlobalConstructorOptimization", {
+    files: {
+      "/entry.js": /* js */ `
+        // Test Array constructor
+        capture(new Array());
+        capture(new Array(3));
+        capture(new Array(1, 2, 3));
+        capture(new Array(...unknownValue));
+        capture(new Array(5, ...unknownValue));
+        
+        // Test Array with non-numeric single arguments (should convert to literal)
+        capture(new Array("string"));
+        capture(new Array(true));
+        capture(new Array(null));
+        capture(new Array(undefined));
+        capture(new Array({}));
+        
+        // Test Object constructor
+        capture(new Object());
+        capture(new Object(null));
+        capture(new Object({ a: 1 }));
+        
+        // Test Function constructor
+        capture(new Function("return 42"));
+        capture(new Function("a", "b", "return a + b"));
+        
+        // Test RegExp constructor
+        capture(new RegExp("test"));
+        capture(new RegExp("test", "gi"));
+        capture(new RegExp(/abc/));
+        
+        // Test with variables
+        const pattern = "\\d+";
+        capture(new RegExp(pattern));
+        
+        // Test that other constructors are preserved
+        capture(new Date());
+        capture(new Map());
+        capture(new Set());
+      `,
+    },
+    capture: [
+      "[]", // new Array() -> []
+      "Array(3)", // new Array(3) stays as Array(3) because it creates sparse array
+      `[
+  1,
+  2,
+  3
+]`, // new Array(1, 2, 3) -> [1, 2, 3]
+      "Array(...unknownValue)", // a spread may leave a single number behind, which is a length
+      "Array(5, ...unknownValue)",
+      `[
+  "string"
+]`, // new Array("string") -> ["string"]
+      `[
+  !0
+]`, // new Array(true) -> [true] (minified to !0)
+      `[
+  null
+]`, // new Array(null) -> [null]
+      `[
+  void 0
+]`, // new Array(undefined) -> [void 0]
+      `[
+  {}
+]`, // new Array({}) -> [{}]
+      "{}", // new Object() -> {}
+      "{}", // new Object(null) -> {}
+      "{ a: 1 }", // new Object({ a: 1 }) -> { a: 1 }
+      'Function("return 42")',
+      'Function("a", "b", "return a + b")',
+      'new RegExp("test")',
+      'new RegExp("test", "gi")',
+      "new RegExp(/abc/)",
+      "new RegExp(pattern)",
+      "/* @__PURE__ */ new Date",
+      "/* @__PURE__ */ new Map",
+      "/* @__PURE__ */ new Set",
+    ],
+    minifySyntax: true,
+    target: "bun",
+  });
+
+  itBundled("minify/ArrayConstructorWithNumberAndMinifyWhitespace", {
+    files: {
+      "/entry.js": /* js */ `
+        capture(new Array(0));
+        capture(new Array(1));
+        capture(new Array(2));
+        capture(new Array(3));
+        capture(new Array(4));
+        capture(new Array(5));
+        capture(new Array(6));
+        capture(new Array(7));
+        capture(new Array(8));
+        capture(new Array(9));
+        capture(new Array(10));
+        capture(new Array(11));
+        capture(new Array(4.5));
+      `,
+    },
+    capture: [
+      "[]", // new Array() -> []
+      "[,]", // new Array(1) -> [undefined]
+      "[,,]", // new Array(2) -> [undefined, undefined]
+      "[,,,]", // new Array(3) -> [undefined, undefined, undefined]
+      "[,,,,]", // new Array(4) -> [undefined, undefined, undefined, undefined]
+      "[,,,,,]", // new Array(5) -> [undefined x 5]
+      "[,,,,,,]", // new Array(6) -> [undefined x 6]
+      "[,,,,,,,]", // new Array(7) -> [undefined x 7]
+      "[,,,,,,,,]", // new Array(8) -> [undefined x 8]
+      "[,,,,,,,,,]", // new Array(9) -> [undefined x 9]
+      "[,,,,,,,,,,]", // new Array(10) -> [undefined x 10]
+      "Array(11)", // new Array(11) -> Array(11)
+      "Array(4.5)", // new Array(4.5) is Array(4.5) because it's not an integer
+    ],
+    minifySyntax: true,
+    minifyWhitespace: true,
+    target: "bun",
+  });
+
+  itBundled("minify/GlobalConstructorSemanticsPreserved", {
+    files: {
+      "/entry.js": /* js */ `
+        function capture(val) { console.log(val); return val; }
+        
+        // Test Array semantics
+        const a1 = new Array(1, 2, 3);
+        const a2 = Array(1, 2, 3);
+        capture(JSON.stringify(a1) === JSON.stringify(a2));
+        capture(a1.constructor === a2.constructor);
+        
+        // Test sparse array semantics - new Array(5) creates sparse array
+        const sparse = new Array(5);
+        capture(sparse.length === 5);
+        capture(0 in sparse === false); // No element at index 0
+        capture(JSON.stringify(sparse) === "[null,null,null,null,null]");
+
+        // Single-arg variable case: must preserve sparse semantics
+        const n = 3;
+        const a3 = new Array(n);
+        const a4 = Array(n);
+        capture(a3.length === a4.length && a3.length === 3 && a3[0] === undefined);
+
+        // A spread can leave a single number behind at runtime, and then it is a length
+        const none = [];
+        const a5 = new Array(5, ...none);
+        capture(a5.length === 5);
+        capture(0 in a5 === false);
+        
+        // Test Object semantics
+        const o1 = new Object();
+        const o2 = Object();
+        capture(typeof o1 === typeof o2);
+        capture(o1.constructor === o2.constructor);
+        
+        // Test Function semantics
+        const f1 = new Function("return 1");
+        const f2 = Function("return 1");
+        capture(typeof f1 === typeof f2);
+        capture(f1() === f2());
+        
+        // Test RegExp semantics
+        const r1 = new RegExp("test", "g");
+        const r2 = RegExp("test", "g");
+        capture(r1.source === r2.source);
+        capture(r1.flags === r2.flags);
+      `,
+    },
+    capture: [
+      "val",
+      "JSON.stringify(a1) === JSON.stringify(a2)",
+      "a1.constructor === a2.constructor",
+      "sparse.length === 5",
+      "0 in sparse === !1",
+      'JSON.stringify(sparse) === "[null,null,null,null,null]"',
+      "a3.length === a4.length && a3.length === 3 && a3[0] === void 0",
+      "a5.length === 5",
+      "0 in a5 === !1",
+      "typeof o1 === typeof o2",
+      "o1.constructor === o2.constructor",
+      "typeof f1 === typeof f2",
+      "f1() === f2()",
+      "r1.source === r2.source",
+      "r1.flags === r2.flags",
+    ],
+    minifySyntax: true,
+    target: "bun",
+    run: {
+      stdout: "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue",
+    },
+  });
+
+  itBundled("minify/TypeofUndefinedOptimization", {
+    files: {
+      "/entry.js": /* js */ `
+        // Test all equality operators with typeof undefined
+        console.log(typeof x !== 'undefined');
+        console.log(typeof x != 'undefined');
+        console.log('undefined' !== typeof x);
+        console.log('undefined' != typeof x);
+
+        console.log(typeof x === 'undefined');
+        console.log(typeof x == 'undefined');
+        console.log('undefined' === typeof x);
+        console.log('undefined' == typeof x);
+
+        // These should not be optimized
+        console.log(typeof x === 'string');
+        console.log(x === 'undefined');
+        console.log('undefined' === y);
+        console.log(typeof x === 'undefinedx');
+      `,
+    },
+    minifySyntax: true,
+    minifyWhitespace: true,
+    minifyIdentifiers: false,
+    onAfterBundle(api) {
+      const file = api.readFile("out.js");
+      expect(normalizeBunSnapshot(file)).toMatchInlineSnapshot(
+        `"console.log(typeof x<"u");console.log(typeof x<"u");console.log(typeof x<"u");console.log(typeof x<"u");console.log(typeof x>"u");console.log(typeof x>"u");console.log(typeof x>"u");console.log(typeof x>"u");console.log(typeof x==="string");console.log(x==="undefined");console.log(y==="undefined");console.log(typeof x==="undefinedx");"`,
+      );
+    },
+  });
+
+  // https://github.com/oven-sh/bun/issues/26371
+  // Minified bundler output missing semicolon between statements when
+  // using both default and named imports from "bun" module
+  itBundled("minify/BunImportSemicolonInsertion", {
+    files: {
+      "/entry.js": /* js */ `
+        import bun, { embeddedFiles } from "bun"
+        console.log(typeof embeddedFiles)
+        console.log(typeof bun.argv)
+      `,
+    },
+    minifySyntax: true,
+    minifyWhitespace: true,
+    minifyIdentifiers: true,
+    target: "bun",
+    run: {
+      stdout: "object\nobject",
+    },
+  });
+
+  itBundled("minify/BunImportNamespaceAndNamed", {
+    files: {
+      "/entry.js": /* js */ `
+        import * as bun from "bun"
+        import { embeddedFiles } from "bun"
+        console.log(typeof embeddedFiles)
+        console.log(typeof bun.argv)
+      `,
+    },
+    minifySyntax: true,
+    minifyWhitespace: true,
+    minifyIdentifiers: true,
+    target: "bun",
+    run: {
+      stdout: "object\nobject",
+    },
+  });
+
+  itBundled("minify/BunImportDefaultNamespaceAndNamed", {
+    files: {
+      "/entry.js": /* js */ `
+        import bun, * as bunNs from "bun"
+        import { embeddedFiles } from "bun"
+        console.log(typeof embeddedFiles)
+        console.log(typeof bun.argv)
+        console.log(typeof bunNs.argv)
+      `,
+    },
+    minifySyntax: true,
+    minifyWhitespace: true,
+    minifyIdentifiers: true,
+    target: "bun",
+    run: {
+      stdout: "object\nobject\nobject",
+    },
+  });
+
+  // https://github.com/oven-sh/bun/issues/31722
+  // An arrow whose body is a single `return <value>` collapses to a shorthand
+  // expression body when minifying: `(a) => { return a; }` becomes `(a) => a`.
+  itBundled("minify/ArrowReturnToExpressionBody", {
+    files: {
+      "/entry.js": /* js */ `
+        export const withArgs = (a, b, c) => { return a + b * c; };
+        export const noArgs = () => { return 42; };
+        export const asyncArrow = async x => { return x + 1; };
+        export const nested = () => () => { return 1; };
+      `,
+    },
+    minifySyntax: true,
+    minifyIdentifiers: false,
+    onAfterBundle(api) {
+      const code = api.readFile("/out.js");
+      expect(code).toContain("(a, b, c) => a + b * c");
+      expect(code).toContain("() => 42");
+      expect(code).toContain("async (x) => x + 1");
+      expect(code).toContain("() => () => 1");
+      // The collapsed arrows must not keep the `{ return ... }` block body.
+      expect(code).not.toMatch(/=>\s*\{\s*return/);
+    },
+  });
+
+  // A bare `return;` (no value) cannot be expressed as a shorthand arrow body,
+  // so the block body must be preserved even when minifying.
+  itBundled("minify/ArrowBareReturnKeepsBlock", {
+    files: {
+      "/entry.js": /* js */ `
+        export const bare = (x) => { return; };
+        export const undef = (x) => { return undefined; };
+        export function fn(a) { return a + 1; }
+      `,
+    },
+    minifySyntax: true,
+    minifyIdentifiers: false,
+    onAfterBundle(api) {
+      const code = api.readFile("/out.js");
+      // Bare `return;` and `return undefined;` (normalized to `return;`) stay as blocks.
+      expect(code).toMatch(/bare = \(x\) => \{\s*return;?\s*\}/);
+      expect(code).toMatch(/undef = \(x\) => \{\s*return;?\s*\}/);
+      // Function declarations are never rewritten into arrows.
+      expect(code).toContain("function fn(a)");
+    },
+  });
+
+  // https://github.com/oven-sh/bun/issues/14586
+  // Enough top-level bindings to exhaust every single-char name. With `$`
+  // unreferenced it sorts last in the head alphabet, so it is the 54th name
+  // the minifier would otherwise hand out.
+  const manyDecls = Array.from({ length: 60 }, (_, i) => `class C${i} { m${i}() {} }`).join("\n");
+  const manyRefs = Array.from({ length: 60 }, (_, i) => `C${i}`).join(",");
+  itBundled("minify/IdentifiersNeverBareDollar", {
+    files: {
+      "/entry.js": /* js */ `
+        ${manyDecls}
+        console.log(${manyRefs});
+      `,
+    },
+    minifyIdentifiers: true,
+    minifyWhitespace: true,
+    target: "browser",
+    onAfterBundle(api) {
+      const code = api.readFile("/out.js");
+      // No bare `$` identifier (allow `$` inside longer names like `a$`/`$a`).
+      const bareDollar = /(?<![A-Za-z0-9_$])\$(?![A-Za-z0-9_$])/;
+      expect(bareDollar.test(code)).toBe(false);
+    },
+  });
+  itBundled("minify/IdentifiersDollarStillUsableWhenReferenced", {
+    files: {
+      "/entry.js": /* js */ `
+        $(document).ready(() => {});
+        ${manyDecls}
+        console.log(${manyRefs});
+      `,
+    },
+    minifyIdentifiers: true,
+    minifyWhitespace: true,
+    target: "browser",
+    onAfterBundle(api) {
+      const code = api.readFile("/out.js");
+      // The unbound reference to `$` must be preserved verbatim; reserving
+      // the name must not break referencing an existing global `$`.
+      expect(code).toContain("$(document)");
+      // Count bare `$` occurrences: exactly the one reference above.
+      const bareDollar = /(?<![A-Za-z0-9_$])\$(?![A-Za-z0-9_$])/g;
+      expect([...code.matchAll(bareDollar)].length).toBe(1);
+    },
+  });
+  // The reservation is scoped to the minify renamer; the non-minifying
+  // `NumberRenamer` must keep user-written `$` bindings verbatim (React
+  // Compiler emits `let $ = _c(n)` inside every optimized component).
+  itBundled("minify/IdentifiersDollarPreservedWithoutMinify", {
+    files: {
+      "/entry.js": /* js */ `
+        function Component() {
+          let $ = _c(3);
+          return $[0];
+        }
+        console.log(Component);
+      `,
+    },
+    minifyIdentifiers: false,
+    target: "browser",
+    onAfterBundle(api) {
+      const code = api.readFile("/out.js");
+      expect(code).toContain("let $ = _c(3)");
+      expect(code).toContain("return $[0]");
+      expect(code).not.toContain("$2");
+    },
+  });
+
+  // Without minifySyntax the block body must be preserved verbatim.
+  itBundled("minify/ArrowReturnNotCollapsedWithoutMinifySyntax", {
+    files: {
+      "/entry.js": /* js */ `
+        export const foo = (a) => { return a + 1; };
+      `,
+    },
+    minifySyntax: false,
+    minifyIdentifiers: false,
+    onAfterBundle(api) {
+      const code = api.readFile("/out.js");
+      expect(code).toMatch(/=>\s*\{\s*return a \+ 1;?\s*\}/);
+    },
+  });
+
+  // The collapse is gated on bundling, so minify-syntax alone (no bundle) must
+  // keep the block body. The runtime transpiler (`bun run`/`bun test`) forces
+  // minify-syntax on for bun targets but never bundles, so collapsing here
+  // would change `Function.prototype.toString()` output at runtime.
+  itBundled("minify/ArrowReturnNotCollapsedWhenNotBundling", {
+    files: {
+      "/entry.js": /* js */ `
+        export const foo = (a) => { return a + 1; };
+      `,
+    },
+    bundling: false,
+    minifySyntax: true,
+    minifyIdentifiers: false,
+    onAfterBundle(api) {
+      const code = api.readFile("/out.js");
+      expect(code).toMatch(/=>\s*\{\s*return a \+ 1;?\s*\}/);
+    },
+  });
+
+  // A single-use `let` is substituted into whichever child of the next
+  // expression reads it. `a` is used where the substitution must happen;
+  // `keep` where a side effect in between must block it.
+  itBundled("minify/SingleUseSubstitutionIntoEachChild", {
+    files: {
+      "/entry.js": /* js */ `
+        export function newTarget(c) { let a = c; return new a(); }
+        export function newArgs(c, v) { let a = v; return new c(1, a); }
+        export function spread(v) { let a = v; return [...a]; }
+        export async function awaited(v) { let a = v; return await a; }
+        export function* yielded(v) { let a = v; yield a; }
+        export function dynamicImport(v) { let a = v; return import(a); }
+        export function unary(v) { let a = v; return -a; }
+        export function dot(v) { let a = v; return a.b; }
+        export function binaryLeft(v, w) { let a = v; return a + w; }
+        export function binaryRight(v, w) { let a = v; return w + a; }
+        export function ifTest(v, w, u) { let a = v; return a ? w : u; }
+        export function ifYes(v, w, u) { let a = v; return w ? a : u; }
+        export function ifNo(v, w, u) { let a = v; return w ? u : a; }
+        export function indexTarget(v, i) { let a = v; return a[i]; }
+        export function indexIndex(v, i) { let a = i; return v[a]; }
+        export function callTarget(v) { let a = v; return a(); }
+        export function array(v) { let a = v; return [1, a, 2]; }
+        export function objectValue(v) { let a = v; return { k: 1, v: a }; }
+        export function objectComputedKey(v) { let a = v; return { [a]: 1 }; }
+        export function templateTag(t) { let a = t; return a\`x\`; }
+        export function templateParts(v) { let a = v; return \`1-\${v}-\${a}\`; }
+
+        export function newArgsWithSideEffect(c) { let keep = g(); return new c(keep); }
+        export function* yieldWithoutOperand(v) { let keep = v; yield; return keep; }
+        export function mutatingUnary(v) { let keep = v; return keep++; }
+        export function binaryRightAfterSideEffect(w) { let keep = g(); return w.z + keep; }
+        export function updateAssignment() { let keep = g(); total += keep; }
+        export function ifBranchWithSideEffect(w, u) { let keep = g(); return w ? keep : u; }
+        export function optionalCallArg() { let keep = g(); return f?.(keep); }
+        export function callTargetChangingThis(o) { let keep = o.m; return keep(); }
+        export function objectValueAfterComputedKey() { let keep = g(); return { [k()]: 1, v: keep }; }
+        export function templatePartAfterSideEffect() { let keep = g(); return \`\${h()}-\${keep}\`; }
+      `,
+    },
+    minifySyntax: true,
+    minifyIdentifiers: false,
+    onAfterBundle(api) {
+      const code = api.readFile("/out.js");
+      expect(code).not.toContain("let a");
+      for (const substituted of [
+        "new c;",
+        "new c(1, v)",
+        "[...v]",
+        "await v",
+        "yield v",
+        "import(v)",
+        "return -v",
+        "return v.b",
+        "return v + w",
+        "return w + v",
+        "v ? w : u",
+        "w ? v : u",
+        "w ? u : v",
+        "return v()",
+        "[1, v, 2]",
+        "{ k: 1, v }",
+        "{ [v]: 1 }",
+        "t`x`",
+        "`1-${v}-${v}`",
+      ]) {
+        expect(code).toContain(substituted);
+      }
+      // indexTarget and indexIndex both end up here.
+      expect(code.match(/return v\[i\];/g)).toHaveLength(2);
+      expect(code.match(/let keep = /g)).toHaveLength(10);
+    },
+  });
+
+  // Every top-level statement of /esm.js hoists, so it gets no `init_esm()`
+  // wrapper and `require("./esm.js")` prints as `__toCommonJS(exports_esm)`
+  // alone: the first token after whichever keyword comes before it.
+  const requireEsmAfterKeyword: BundlerTestInput = {
+    files: {
+      "/entry.js": /* js */ `
+        function afterReturn() { return require("./esm.js").get(); }
+        function afterTypeof() { return typeof require("./esm.js"); }
+        function afterThrow() { try { throw require("./esm.js").get(); } catch (e) { return e; } }
+        function afterVoid() { return void require("./esm.js"); }
+        function* afterYield() { yield require("./esm.js").get(); }
+        async function afterAwait() { return await require("./esm.js").get(); }
+        function afterCase(x) { switch (x) { case require("./esm.js").get(): return "matched"; } return "no match"; }
+        function afterIn() { return "val" in require("./esm.js"); }
+        function afterInstanceof(x) { return x instanceof require("./esm.js").Base; }
+        function afterElse(c) { if (c) return "then"; else require("./esm.js").record("else"); return globalThis.seen.join(); }
+        function afterDo() { do require("./esm.js").record("do"); while (false); return globalThis.seen.join(); }
+        function afterOf() { const out = []; for (const x of require("./esm.js").chars) out.push(x); return out.join(); }
+        function afterForIn() { const out = []; for (const k in require("./esm.js")) out.push(k); return out.sort().join(); }
+        function afterExtends() { return class extends require("./esm.js").Base {}; }
+        console.log("return", afterReturn());
+        console.log("typeof", afterTypeof());
+        console.log("throw", afterThrow());
+        console.log("void", afterVoid());
+        console.log("yield", afterYield().next().value);
+        console.log("await", await afterAwait());
+        console.log("case", afterCase("v4"));
+        console.log("in", afterIn());
+        console.log("instanceof", afterInstanceof(afterExtends().prototype));
+        console.log("else", afterElse(false));
+        console.log("do", afterDo());
+        console.log("of", afterOf());
+        console.log("for-in", afterForIn());
+        console.log("extends", afterExtends().tag);
+      `,
+      "/esm.js": /* js */ `
+        export const val = "v4";
+        export const chars = "ab";
+        export function get() { return val; }
+        export function record(x) { (globalThis.seen ??= []).push(x); }
+        export class Base { static tag = "base"; }
+      `,
+    },
+    target: "bun",
+    run: {
+      stdout: `
+        return v4
+        typeof object
+        throw v4
+        void undefined
+        yield v4
+        await v4
+        case matched
+        in true
+        instanceof true
+        else else
+        do else,do
+        of a,b
+        for-in Base,chars,get,record,val
+        extends base
+      `,
+    },
+  };
+  itBundled("minify/RequireEsmWithoutInitAfterKeyword", {
+    ...requireEsmAfterKeyword,
+    minifyWhitespace: true,
+    onAfterBundle(api) {
+      const code = api.readFile("/out.js");
+      expect(code).not.toContain("init_esm");
+      // What comes before each inlined require(), in source order.
+      const before = [...code.matchAll(/(\w+ ?)__toCommonJS\(exports_esm\)/g)].map(match => match[1]);
+      expect(before).toEqual([
+        "return ",
+        "typeof ",
+        "throw ",
+        "void ",
+        "yield ",
+        "await ",
+        "case ",
+        "in ",
+        "instanceof ",
+        "else ",
+        "do ",
+        "of ",
+        "in ",
+        "extends ",
+      ]);
+    },
+  });
+  // `bun build --minify`: `__toCommonJS` gets a one-letter name, so the glued form is `returns(...)`.
+  itBundled("minify/RequireEsmWithoutInitAfterKeywordAllMinify", {
+    ...requireEsmAfterKeyword,
+    minifyWhitespace: true,
+    minifySyntax: true,
+    minifyIdentifiers: true,
+    backend: "cli",
+  });
+
+  // https://github.com/oven-sh/bun/issues/30669
+  itBundled("minify/RequireBunAfterKeyword", {
+    files: {
+      "/entry.js": /* js */ `
+        function afterReturn() { return require("bun"); }
+        function afterTypeof() { return typeof require("bun"); }
+        function afterIn() { return "version" in require("bun"); }
+        function importAfterReturn() { return import("bun"); }
+        async function importAfterAwait() { return await import("bun"); }
+        console.log("return", afterReturn() === Bun);
+        console.log("typeof", afterTypeof());
+        console.log("in", afterIn());
+        console.log("return import()", (await importAfterReturn()).version === Bun.version);
+        console.log("await import()", (await importAfterAwait()).version === Bun.version);
+      `,
+    },
+    target: "bun",
+    minifyWhitespace: true,
+    onAfterBundle(api) {
+      const before = [...api.readFile("/out.js").matchAll(/(\w+ ?)globalThis\.Bun/g)].map(match => match[1]);
+      expect(before).toEqual(["return ", "typeof ", "in "]);
+    },
+    run: {
+      stdout: `
+        return true
+        typeof object
+        in true
+        return import() true
+        await import() true
+      `,
+    },
+  });
+});
+
+// The runtime transpiler (`bun run`/`bun test`) implicitly enables
+// minify-syntax for bun targets but never bundles. A block-bodied arrow must
+// keep its block body there so `Function.prototype.toString()` is unchanged —
+// libraries like Elysia parse handler source via `.toString()`.
+// https://github.com/oven-sh/bun/issues/31722
+test("runtime transpiler does not collapse single-return arrow bodies", async () => {
+  using dir = tempDir("arrow-runtime-tostring", {
+    "index.js": /* js */ `
+      const withArgs = (a, b, c) => { return a + b * c; };
+      const noArgs = () => { return 42; };
+      console.log(JSON.stringify([withArgs.toString(), noArgs.toString()]));
+    `,
+  });
+
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "index.js"],
+    env: bunEnv,
+    cwd: String(dir),
+    stderr: "pipe",
+  });
+
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+  const [withArgs, noArgs] = JSON.parse(stdout) as [string, string];
+  // The block body (and its `return`) must survive the runtime transpile.
+  expect(withArgs).toContain("return a + b * c");
+  expect(withArgs).toContain("{");
+  expect(noArgs).toContain("return 42");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+// `Bun.Transpiler` prints through the same path as `bun build --no-bundle`.
+// The exports keep their names and take every one-character name the minifier
+// can produce, so the import and the parameter each need a longer name.
+// `label(item)` printed as `function label(t) { return t(t.name) }`.
+test.each(["transformSync", "transform"] as const)(
+  "minify.identifiers: %s gives no import or parameter the name of an export",
+  async method => {
+    const exportNames = [..."abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$"];
+    const output = await new Bun.Transpiler({ loader: "js", minify: { identifiers: true } } as any)[method](
+      [
+        `import { imported } from "./imported.js";`,
+        ...exportNames.map(name => `export const ${name} = "${name}";`),
+        `export function label(item) { return t(item.name) + " #" + item.id + imported; }`,
+      ].join("\n"),
+    );
+    const [, importAlias] = output.match(/import \{ imported as ([\w$]+) \}/)!;
+    const [, parameter] = output.match(/function label\(([\w$]+)\)/)!;
+    expect({
+      importAlias: exportNames.includes(importAlias) ? `${importAlias} is an export` : "ok",
+      parameter: exportNames.includes(parameter) ? `${parameter} is an export` : "ok",
+      body: output.includes(`return t(${parameter}.name) + " #" + ${parameter}.id + ${importAlias};`),
+    }).toEqual({ importAlias: "ok", parameter: "ok", body: true });
+  },
+);
+
+// The second `var t` replaces the symbol of the export, which then links to
+// it, so the export is pinned only if the pin follows that link.
+test.each(["transformSync", "transform"] as const)(
+  "minify.identifiers: %s keeps the name of an export that is declared again",
+  async method => {
+    const output = await new Bun.Transpiler({ loader: "js", minify: { identifiers: true } } as any)[method](
+      "export var t = 1;\nvar t = 2;\nexport function read() { return t; }\n",
+    );
+    expect(output).toBe("export var t = 1;\nvar t = 2;\nexport function read() {\n  return t;\n}\n");
+  },
+);

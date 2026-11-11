@@ -1,0 +1,37 @@
+import { expect, test } from "bun:test";
+
+// Regression test for ENG-24434
+// jest.mock() with invalid arguments should throw TypeError, not crash
+test("jest.mock() with non-string first argument should throw TypeError", () => {
+  const jestObj = Bun.jest(import.meta.path).jest;
+
+  // Passing the jest object itself as the first argument should throw
+  // a TypeError, not crash with stack-buffer-overflow
+  expect(() => {
+    (jestObj as any).mock(jestObj);
+  }).toThrow(TypeError);
+});
+
+test("jest.mock() with object as first argument should throw TypeError", () => {
+  const jestObj = Bun.jest(import.meta.path).jest;
+
+  expect(() => {
+    (jestObj as any).mock({});
+  }).toThrow(TypeError);
+});
+
+test("jest.mock() with a callback that is not a function should throw TypeError", () => {
+  const jestObj = Bun.jest(import.meta.path).jest;
+
+  expect(() => {
+    (jestObj as any).mock("some-module", 123);
+  }).toThrow(TypeError);
+});
+
+test("mock.module() with missing callback should throw TypeError", () => {
+  const { mock } = Bun.jest(import.meta.path);
+
+  expect(() => {
+    (mock as any).module("some-module");
+  }).toThrow(TypeError);
+});

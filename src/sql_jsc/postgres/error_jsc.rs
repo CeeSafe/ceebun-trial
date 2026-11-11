@@ -1,0 +1,142 @@
+//! `createPostgresError` / `postgresErrorToJS` bridges.
+
+use crate::jsc::{
+    JSGlobalObject, JSValue, JsError, JsResult, SQLErrorClass, bun_string_jsc, create_sql_error,
+};
+use bun_sql::postgres::any_postgres_error::{AnyPostgresError, PostgresErrorOptions};
+
+pub(crate) fn create_postgres_error(
+    global: &JSGlobalObject,
+    message: &[u8],
+    options: &PostgresErrorOptions,
+) -> JsResult<JSValue> {
+    // The fields and their order are those of the `PostgresError` constructor (src/js/internal/sql/errors.ts).
+    let error = create_sql_error(global, SQLErrorClass::Postgres, message)?;
+    error.put(
+        global,
+        b"code",
+        bun_string_jsc::create_utf8_for_js(global, options.code)?,
+    );
+    let optional_fields: [(&'static [u8], Option<&[u8]>); 16] = [
+        (b"errno", options.errno),
+        (b"detail", options.detail),
+        (b"hint", options.hint),
+        (b"severity", options.severity),
+        (b"position", options.position),
+        (b"internalPosition", options.internal_position),
+        (b"internalQuery", options.internal_query),
+        (b"where", options.r#where),
+        (b"schema", options.schema),
+        (b"table", options.table),
+        (b"column", options.column),
+        (b"dataType", options.data_type),
+        (b"constraint", options.constraint),
+        (b"file", options.file),
+        (b"line", options.line),
+        (b"routine", options.routine),
+    ];
+    for (name, value) in optional_fields {
+        error.put_optional_utf8(global, name, value)?;
+    }
+
+    Ok(error)
+}
+
+pub(crate) fn postgres_error_to_js(
+    global: &JSGlobalObject,
+    message: Option<&[u8]>,
+    err: AnyPostgresError,
+) -> JSValue {
+    postgres_error_to_js_with_hint(global, message, None, err)
+}
+
+pub(crate) fn postgres_error_to_js_with_hint(
+    global: &JSGlobalObject,
+    message: Option<&[u8]>,
+    hint: Option<&[u8]>,
+    err: AnyPostgresError,
+) -> JSValue {
+    use AnyPostgresError::*;
+    let code: &'static [u8] = match err {
+        ConnectionClosed => b"ERR_POSTGRES_CONNECTION_CLOSED",
+        ConnectionFailed => b"ERR_POSTGRES_CONNECTION_FAILED",
+        ConnectionRefused => b"ERR_POSTGRES_CONNECTION_REFUSED",
+        CopyNotSupported => b"ERR_POSTGRES_COPY_NOT_SUPPORTED",
+        ExpectedRequest => b"ERR_POSTGRES_EXPECTED_REQUEST",
+        ExpectedStatement => b"ERR_POSTGRES_EXPECTED_STATEMENT",
+        InvalidBackendKeyData => b"ERR_POSTGRES_INVALID_BACKEND_KEY_DATA",
+        InvalidBinaryData => b"ERR_POSTGRES_INVALID_BINARY_DATA",
+        InvalidByteSequence => b"ERR_POSTGRES_INVALID_BYTE_SEQUENCE",
+        InvalidCharacter => b"ERR_POSTGRES_INVALID_CHARACTER",
+        InvalidMessage => b"ERR_POSTGRES_INVALID_MESSAGE",
+        InvalidMessageLength => b"ERR_POSTGRES_INVALID_MESSAGE_LENGTH",
+        InvalidServerKey => b"ERR_POSTGRES_INVALID_SERVER_KEY",
+        InvalidServerSignature => b"ERR_POSTGRES_INVALID_SERVER_SIGNATURE",
+        PBKDFD2 => b"ERR_POSTGRES_AUTHENTICATION_FAILED_PBKDF2",
+        SASL_SIGNATURE_MISMATCH => b"ERR_POSTGRES_SASL_SIGNATURE_MISMATCH",
+        SASL_SIGNATURE_INVALID_BASE64 => b"ERR_POSTGRES_SASL_SIGNATURE_INVALID_BASE64",
+        SASLIterationCountOutOfRange => b"ERR_POSTGRES_SASL_ITERATION_COUNT_OUT_OF_RANGE",
+        TLSNotAvailable => b"ERR_POSTGRES_TLS_NOT_AVAILABLE",
+        TLSUpgradeFailed => b"ERR_POSTGRES_TLS_UPGRADE_FAILED",
+        TooManyParameters => {
+            let too_many_msg: &[u8] = b"query has too many parameters - the PostgreSQL wire protocol supports a maximum of 65535 parameters per query. Try reducing your batch size.";
+            return match create_postgres_error(
+                global,
+                too_many_msg,
+                &PostgresErrorOptions {
+                    code: b"ERR_POSTGRES_TOO_MANY_PARAMETERS",
+                    hint: Some(b"Reduce the number of rows in your batch insert so that total_rows * columns_per_row does not exceed 65535."),
+                    ..Default::default()
+                },
+            ) {
+                Ok(v) => v,
+                Err(e) => global.take_error(e),
+            };
+        }
+        UnexpectedMessage => b"ERR_POSTGRES_UNEXPECTED_MESSAGE",
+        UNKNOWN_AUTHENTICATION_METHOD => b"ERR_POSTGRES_UNKNOWN_AUTHENTICATION_METHOD",
+        UNSUPPORTED_AUTHENTICATION_METHOD => b"ERR_POSTGRES_UNSUPPORTED_AUTHENTICATION_METHOD",
+        UnsupportedByteaFormat => b"ERR_POSTGRES_UNSUPPORTED_BYTEA_FORMAT",
+        UnsupportedArrayFormat => b"ERR_POSTGRES_UNSUPPORTED_ARRAY_FORMAT",
+        UnsupportedIntegerSize => b"ERR_POSTGRES_UNSUPPORTED_INTEGER_SIZE",
+        UnknownFormatCode => b"ERR_POSTGRES_UNKNOWN_FORMAT_CODE",
+        JSError => {
+            return global.take_exception(JsError::Thrown);
+        }
+        OutOfMemory => {
+            return global.create_out_of_memory_error();
+        }
+        ShortRead => {
+            unreachable!("Assertion failed: ShortRead should be handled by the caller in postgres");
+        }
+    };
+
+    let mut buffer_message = [0u8; 256];
+    let msg: &[u8] = if let Some(m) = message {
+        m
+    } else {
+        use std::io::Write;
+        let name: &'static str = <&'static str>::from(err);
+        let mut cursor = &mut buffer_message[..];
+        if write!(cursor, "Failed to bind query: {}", name).is_ok() {
+            let remaining = cursor.len();
+            let written = 256 - remaining;
+            &buffer_message[..written]
+        } else {
+            b"Failed to bind query"
+        }
+    };
+
+    match create_postgres_error(
+        global,
+        msg,
+        &PostgresErrorOptions {
+            code,
+            hint,
+            ..Default::default()
+        },
+    ) {
+        Ok(v) => v,
+        Err(e) => global.take_error(e),
+    }
+}

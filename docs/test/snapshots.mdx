@@ -1,0 +1,456 @@
+---
+title: "Snapshots"
+description: "Learn how to use snapshot testing in Bun to save and compare output between test runs"
+---
+
+Snapshot testing saves the output of a value and compares it against future test runs. Use it for UI components, complex objects, or any output that needs to remain consistent.
+
+## Basic Snapshots
+
+Write snapshot tests with the `.toMatchSnapshot()` matcher:
+
+```ts title="test.ts" icon="/icons/typescript.svg"
+import { test, expect } from "bun:test";
+
+test("snap", () => {
+  expect("foo").toMatchSnapshot();
+});
+```
+
+The first time this test runs, Bun serializes the argument to `expect` and writes it to a snapshot file in a `__snapshots__` directory alongside the test file.
+
+### Snapshot Files
+
+After the first run, Bun creates:
+
+```text title="directory structure" icon="file-directory"
+your-project/
+├── snap.test.ts
+└── __snapshots__/
+    └── snap.test.ts.snap
+```
+
+The snapshot file contains:
+
+```ts title="__snapshots__/snap.test.ts.snap" icon="file-code"
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`snap 1`] = `"foo"`;
+```
+
+On future runs, Bun compares the argument against the snapshot on disk.
+
+## Updating Snapshots
+
+Regenerate snapshots with:
+
+```bash terminal icon="terminal"
+bun test --update-snapshots
+```
+
+Do this when you've intentionally changed the output. In CI environments, Bun does not write new snapshots unless you pass this flag.
+
+## Inline Snapshots
+
+For smaller values, use `.toMatchInlineSnapshot()`. Bun stores inline snapshots directly in your test file:
+
+```ts title="test.ts" icon="/icons/typescript.svg"
+import { test, expect } from "bun:test";
+
+test("inline snapshot", () => {
+  // First run: snapshot will be inserted automatically
+  expect({ hello: "world" }).toMatchInlineSnapshot();
+});
+```
+
+After the first run, Bun automatically updates your test file:
+
+```ts title="test.ts" icon="/icons/typescript.svg"
+import { test, expect } from "bun:test";
+
+test("inline snapshot", () => {
+  expect({ hello: "world" }).toMatchInlineSnapshot(`
+    {
+      "hello": "world",
+    }
+  `);
+});
+```
+
+### Using Inline Snapshots
+
+1. Write your test with `.toMatchInlineSnapshot()`
+2. Run the test once
+3. Bun automatically updates your test file with the snapshot
+4. On subsequent runs, Bun compares the value against the inline snapshot
+
+## Error Snapshots
+
+You can also snapshot error messages with `.toThrowErrorMatchingSnapshot()` and `.toThrowErrorMatchingInlineSnapshot()`:
+
+```ts title="test.ts" icon="/icons/typescript.svg"
+import { test, expect } from "bun:test";
+
+test("error snapshot", () => {
+  expect(() => {
+    throw new Error("Something went wrong");
+  }).toThrowErrorMatchingSnapshot();
+
+  expect(() => {
+    throw new Error("Another error");
+  }).toThrowErrorMatchingInlineSnapshot();
+});
+```
+
+After running, the inline version becomes:
+
+```ts title="test.ts" icon="/icons/typescript.svg"
+test("error snapshot", () => {
+  expect(() => {
+    throw new Error("Something went wrong");
+  }).toThrowErrorMatchingSnapshot();
+
+  expect(() => {
+    throw new Error("Another error");
+  }).toThrowErrorMatchingInlineSnapshot(`"Another error"`);
+});
+```
+
+## File Snapshots
+
+`.toMatchFileSnapshot()` compares a value with a snapshot stored in its own file. The file can have the right extension, so you can open it like any other file. The path is relative to the test file.
+
+```ts title="test.ts" icon="/icons/typescript.svg"
+import { test, expect } from "bun:test";
+
+test("renders the page", async () => {
+  await expect(render(page)).toMatchFileSnapshot("./snapshots/page.html");
+});
+```
+
+- A string is compared with the file's contents as is.
+- Any other value is printed first. Bun always prints it the way Vitest does ([`pretty-format`](#snapshots-from-jest-and-vitest)), even when `test` is imported from `"bun:test"`.
+- If the file doesn't exist, Bun creates it, except in CI.
+- `--update-snapshots` rewrites a file that doesn't match.
+
+## Advanced Snapshot Usage
+
+### Complex Objects
+
+Snapshots work well with complex nested objects:
+
+```ts title="test.ts" icon="/icons/typescript.svg"
+import { test, expect } from "bun:test";
+
+test("complex object snapshot", () => {
+  const user = {
+    id: 1,
+    name: "John Doe",
+    email: "john@example.com",
+    profile: {
+      age: 30,
+      preferences: {
+        theme: "dark",
+        notifications: true,
+      },
+    },
+    tags: ["developer", "javascript", "bun"],
+  };
+
+  expect(user).toMatchSnapshot();
+});
+```
+
+### Array Snapshots
+
+Arrays are also well-suited for snapshot testing:
+
+```ts title="test.ts" icon="/icons/typescript.svg"
+import { test, expect } from "bun:test";
+
+test("array snapshot", () => {
+  const numbers = [1, 2, 3, 4, 5].map(n => n * 2);
+  expect(numbers).toMatchSnapshot();
+});
+```
+
+### Function Output Snapshots
+
+Snapshot the output of functions:
+
+```ts title="test.ts" icon="/icons/typescript.svg"
+import { test, expect } from "bun:test";
+
+function generateReport(data: any[]) {
+  return {
+    total: data.length,
+    summary: data.map(item => ({ id: item.id, name: item.name })),
+    timestamp: "2024-01-01", // Fixed for testing
+  };
+}
+
+test("report generation", () => {
+  const data = [
+    { id: 1, name: "Alice", age: 30 },
+    { id: 2, name: "Bob", age: 25 },
+  ];
+
+  expect(generateReport(data)).toMatchSnapshot();
+});
+```
+
+## React Component Snapshots
+
+Snapshots work well for React components:
+
+```tsx title="test.ts" icon="/icons/typescript.svg"
+import { test, expect } from "bun:test";
+import { render } from "@testing-library/react";
+
+function Button({ children, variant = "primary" }) {
+  return <button className={`btn btn-${variant}`}>{children}</button>;
+}
+
+test("Button component snapshots", () => {
+  const { container: primary } = render(<Button>Click me</Button>);
+  const { container: secondary } = render(<Button variant="secondary">Cancel</Button>);
+
+  expect(primary.innerHTML).toMatchSnapshot();
+  expect(secondary.innerHTML).toMatchSnapshot();
+});
+```
+
+## Property Matchers
+
+For values that change between test runs (like timestamps or IDs), use property matchers:
+
+```ts title="test.ts" icon="/icons/typescript.svg"
+import { test, expect } from "bun:test";
+
+test("snapshot with dynamic values", () => {
+  const user = {
+    id: Math.random(), // This changes every run
+    name: "John",
+    createdAt: new Date().toISOString(), // This also changes
+  };
+
+  expect(user).toMatchSnapshot({
+    id: expect.any(Number),
+    createdAt: expect.any(String),
+  });
+});
+```
+
+The snapshot file stores:
+
+```txt title="snapshot file" icon="file-code"
+exports[`snapshot with dynamic values 1`] = `
+{
+  "createdAt": Any<String>,
+  "id": Any<Number>,
+  "name": "John",
+}
+`;
+```
+
+## Custom Serializers
+
+Use `expect.addSnapshotSerializer()` to change how snapshot matchers print certain values. It applies to those values at any depth in a snapshot:
+
+```ts title="test.ts" icon="/icons/typescript.svg"
+import { test, expect } from "bun:test";
+
+expect.addSnapshotSerializer({
+  test: value => value instanceof Money,
+  serialize: value => `${value.amount} ${value.currency}`,
+});
+
+test("price", () => {
+  expect({ price: new Money(5, "EUR") }).toMatchInlineSnapshot(`
+    {
+      "price": 5 EUR,
+    }
+  `);
+});
+```
+
+A serializer is a [`pretty-format` plugin](https://github.com/jestjs/jest/tree/main/packages/pretty-format#writing-plugins), so serializers written for Jest and Vitest work. To print the values nested inside `value`, call the `printer` argument of `serialize(value, config, indentation, depth, refs, printer)`.
+
+The last serializer added is tried first. A serializer added in a test file applies until that file ends. A serializer added in a [preload script](/test/configuration#preload-scripts), or in a module that test files import, applies to every file after it.
+
+## Snapshots from Jest and Vitest
+
+Bun reads and writes each snapshot file in the format of the runner that created it. The file's first line names that runner. `.snap` files from a Jest or Vitest project keep passing, and both runners can still read them after Bun adds or updates entries.
+
+| First line              | Keys              | Values          | `toThrowErrorMatchingSnapshot()` |
+| ----------------------- | ----------------- | --------------- | -------------------------------- |
+| `// Bun Snapshot v1`    | `outer inner 1`   | Bun's format    | the error message                |
+| `// Jest Snapshot v1`   | `outer inner 1`   | `pretty-format` | the error message                |
+| `// Vitest Snapshot v1` | `outer > inner 1` | `pretty-format` | the error                        |
+
+Bun's format and `pretty-format` print most values the same way. They differ on functions (`[Function: name]` in Bun's format, `[Function]` in Jest's and Vitest's), classes, mock functions, regular expressions, symbol keys, React elements and a few others.
+
+A new snapshot file uses Vitest's format if `test` is imported from `"vitest"`, and Bun's format otherwise.
+
+Inline snapshots don't record which runner wrote them, so Bun accepts a match in any runner's format. It writes and updates them in the format of the runner that `test` is imported from.
+
+With `--update-snapshots`, Bun removes entries that no test uses anymore from a file in Jest's or Vitest's format. It keeps entries for tests that were skipped, filtered out or failed. A file in Bun's format keeps only the entries of tests that ran.
+
+Earlier versions of Bun printed `[native code]` for an accessor instead of its value, included non-enumerable own properties, and printed DOM nodes as plain objects. Snapshots written that way still pass. Bun leaves them alone until `--update-snapshots` rewrites them.
+
+## Best Practices
+
+### Keep Snapshots Small
+
+```ts title="test.ts" icon="/icons/typescript.svg"
+// Good: Focused snapshots
+test("user name formatting", () => {
+  const formatted = formatUserName("john", "doe");
+  expect(formatted).toMatchInlineSnapshot(`"John Doe"`);
+});
+
+// Avoid: Huge snapshots that are hard to review
+test("entire page render", () => {
+  const page = renderEntirePage();
+  expect(page).toMatchSnapshot(); // This could be thousands of lines
+});
+```
+
+### Use Descriptive Test Names
+
+```ts title="test.ts" icon="/icons/typescript.svg"
+// Good: Clear what the snapshot represents
+test("formats currency with USD symbol", () => {
+  expect(formatCurrency(99.99)).toMatchInlineSnapshot(`"$99.99"`);
+});
+
+// Avoid: Unclear what's being tested
+test("format test", () => {
+  expect(format(99.99)).toMatchInlineSnapshot(`"$99.99"`);
+});
+```
+
+### Group Related Snapshots
+
+```ts title="test.ts" icon="/icons/typescript.svg"
+import { describe, test, expect } from "bun:test";
+
+describe("Button component", () => {
+  test("primary variant", () => {
+    expect(render(<Button variant="primary">Click</Button>))
+      .toMatchSnapshot();
+  });
+
+  test("secondary variant", () => {
+    expect(render(<Button variant="secondary">Cancel</Button>))
+      .toMatchSnapshot();
+  });
+
+  test("disabled state", () => {
+    expect(render(<Button disabled>Disabled</Button>))
+      .toMatchSnapshot();
+  });
+});
+```
+
+### Handle Dynamic Data
+
+```ts title="test.ts" icon="/icons/typescript.svg"
+// Good: Normalize dynamic data
+test("API response format", () => {
+  const response = {
+    data: { id: 1, name: "Test" },
+    timestamp: Date.now(),
+    requestId: generateId(),
+  };
+
+  expect({
+    ...response,
+    timestamp: "TIMESTAMP",
+    requestId: "REQUEST_ID",
+  }).toMatchSnapshot();
+});
+
+// Or use property matchers
+test("API response with matchers", () => {
+  const response = getApiResponse();
+
+  expect(response).toMatchSnapshot({
+    timestamp: expect.any(Number),
+    requestId: expect.any(String),
+  });
+});
+```
+
+## Managing Snapshots
+
+### Reviewing Snapshot Changes
+
+When snapshots change, carefully review them:
+
+```bash terminal icon="terminal"
+# See what changed
+git diff __snapshots__/
+
+# Update if changes are intentional
+bun test --update-snapshots
+
+# Commit the updated snapshots
+git add __snapshots__/
+git commit -m "Update snapshots after UI changes"
+```
+
+### Organizing Large Snapshot Files
+
+For large projects, consider organizing tests to keep snapshot files manageable:
+
+```text title="directory structure" icon="file-directory"
+tests/
+├── components/
+│   ├── Button.test.tsx
+│   └── __snapshots__/
+│       └── Button.test.tsx.snap
+├── utils/
+│   ├── formatters.test.ts
+│   └── __snapshots__/
+│       └── formatters.test.ts.snap
+```
+
+## Troubleshooting
+
+### Snapshot Failures
+
+When snapshots fail, Bun shows a diff:
+
+```diff title="diff" icon="file-code"
+  {
+-   "name": "John",
++   "name": "Jane",
+  }
+
+- Expected  - 1
++ Received  + 1
+```
+
+Common causes:
+
+- Intentional changes (update with `--update-snapshots`)
+- Unintentional changes (fix the code)
+- Dynamic data (use property matchers)
+- Environment differences (normalize the data)
+
+### Platform Differences
+
+Be aware of platform-specific differences:
+
+```ts title="test.ts" icon="/icons/typescript.svg"
+// Paths might differ between Windows/Unix
+test("file operations", () => {
+  const result = processFile("./test.txt");
+
+  expect({
+    ...result,
+    path: result.path.replace(/\\/g, "/"), // Normalize paths
+  }).toMatchSnapshot();
+});
+```

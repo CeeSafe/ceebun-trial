@@ -1,0 +1,497 @@
+// Regression guard for the TCPSocket/TLSSocket wrapper retention model.
+//
+// TCPSocket/TLSSocket hold their JS wrapper via jsc.JSRef: strong while the
+// socket is active so callbacks can always recover the wrapper, weak once the
+// socket is closed so GC can reclaim it. This test exercises both directions.
+
+import { heapStats } from "bun:jsc";
+import { expect, test } from "bun:test";
+import { bunEnv, bunExe, isWindows, tls as tlsCert } from "harness";
+import net from "node:net";
+
+test("socket.data setter works inside connectError", async () => {
+  // Before the JSRef migration, handleConnectError reset the cached raw
+  // JSValue to .zero *before* invoking the connectError callback. The
+  // `socket.data = x` setter then called `dataSetCached(.zero, ...)` —
+  // a null JSCell — which segfaulted (release) / tripped UBSan (debug).
+  // With JSRef the wrapper is downgraded (not zeroed) and setData resolves
+  // the wrapper via getThisValue(), so the assignment works and the data
+  // round-trips.
+  //
+  // Run in a subprocess so a crash is observed as a non-zero exit instead
+  // of taking down the test runner.
+  await using proc = Bun.spawn({
+    cmd: [
+      bunExe(),
+      "-e",
+      `
+        const { promise, resolve } = Promise.withResolvers();
+        Bun.connect({
+          hostname: "127.0.0.1",
+          port: 1,
+          socket: {
+            connectError(socket) {
+              socket.data = { marker: "after-connect-error" };
+              console.log(JSON.stringify(socket.data));
+              resolve();
+            },
+            data() {},
+          },
+        }).catch(() => {});
+        await promise;
+      `,
+    ],
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  // Positive assertion first: if the setter crashed, stdout is empty and
+  // this fails with a clear message. On release builds the crash surfaces
+  // as a non-zero exit; on debug-asan it surfaces as a UBSan null-deref.
+  expect(stdout.trim()).toBe('{"marker":"after-connect-error"}');
+  expect(exitCode).toBe(0);
+  void stderr;
+});
+
+// Drive GC until the given object-type count is at or below `max`, or the
+// iteration budget is exhausted. Returns the final count so the assertion
+// message is useful on failure.
+async function gcUntilCountAtMost(type: string, max: number): Promise<number> {
+  for (let i = 0; i < 50; i++) {
+    Bun.gc(true);
+    const count = heapStats().objectTypeCounts[type] || 0;
+    if (count <= max) return count;
+    await Bun.sleep(10);
+  }
+  return heapStats().objectTypeCounts[type] || 0;
+}
+
+test("active TCP socket wrapper survives GC until closed", async () => {
+  // The server writes on a timer and records whether the client received
+  // data after the test dropped its only JS reference to the client socket.
+  // If the wrapper were not held strong while active, GC would finalize it
+  // and the data callback would never fire.
+  let received = false;
+  let serverSide: any;
+
+  await using server = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: {
+      open(s) {
+        serverSide = s;
+      },
+      data() {},
+    },
+  });
+
+  // Scope the client reference so it is eligible for GC after this block.
+  const { promise: closed, resolve: markClosed } = Promise.withResolvers<void>();
+  await (async () => {
+    const client = await Bun.connect({
+      hostname: "127.0.0.1",
+      port: server.port,
+      socket: {
+        data() {
+          received = true;
+        },
+        close() {
+          markClosed();
+        },
+      },
+    });
+    // Drop the only local reference; the native side's strong ref must keep
+    // the wrapper alive for the upcoming data callback.
+    void client;
+  })();
+
+  // Aggressively GC while the socket is still open.
+  for (let i = 0; i < 10; i++) {
+    Bun.gc(true);
+    await Bun.sleep(2);
+  }
+
+  // Server writes — the client's data callback must still fire.
+  serverSide.write("hello");
+  for (let i = 0; i < 50 && !received; i++) await Bun.sleep(5);
+  expect(received).toBe(true);
+
+  // Close and verify the wrapper becomes collectable.
+  serverSide.end();
+  await closed;
+
+  const count = await gcUntilCountAtMost("TCPSocket", 3);
+  expect(count).toBeLessThanOrEqual(3);
+});
+
+// Windows has a pre-existing TLSSocket lingerer in the upgradeTLS path
+// (see the `isWindows ? 3 : 2` slack in socket.test.ts "should not leak
+// memory"); on Windows 11 aarch64 the residual count is higher and varies,
+// making a tight GC bound unreliable there. The Strong-release path this
+// guards is platform-independent, so Linux/macOS coverage suffices.
+test.skipIf(isWindows)("upgradeTLS raw + tls wrappers are both collectable after close", async () => {
+  // upgradeTLS produces two TLSSocket wrappers (the raw passthrough and the
+  // TLS socket) sharing one underlying connection. When the connection closes,
+  // the raw socket is cleaned up via WrappedHandler.onClose which must release
+  // its strong ref so both wrappers can be GC'd. A missed transition here pins
+  // one of them forever.
+  await using tlsServer = Bun.serve({
+    port: 0,
+    tls: tlsCert,
+    fetch() {
+      return new Response("ok");
+    },
+  });
+
+  const baseline = heapStats().objectTypeCounts.TLSSocket || 0;
+
+  for (let i = 0; i < 5; i++) {
+    const { promise: done, resolve } = Promise.withResolvers<void>();
+    await (async () => {
+      let body = "";
+      const socket = await Bun.connect({
+        hostname: "127.0.0.1",
+        port: tlsServer.port!,
+        socket: {
+          data() {},
+          close() {},
+          error() {},
+        },
+      });
+      const [raw, tls] = socket.upgradeTLS({
+        tls: { ...tlsCert, ca: tlsCert.cert },
+        socket: {
+          drain(s) {
+            s.write("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+          },
+          data(s, chunk) {
+            body += chunk.toString();
+            if (body.includes("\r\n\r\n")) s.end();
+          },
+          close() {
+            resolve();
+          },
+          error() {
+            resolve();
+          },
+        },
+      });
+      void raw;
+      void tls;
+    })();
+    await done;
+  }
+
+  // All upgradeTLS-created wrappers should be collectable now. We created
+  // 5 × 2 = 10 TLSSocket wrappers; if the Strong release on close is missed,
+  // they all pin and the count stays ≥ baseline + 10.
+  const count = await gcUntilCountAtMost("TLSSocket", baseline + 2);
+  expect(count).toBeLessThanOrEqual(baseline + 2);
+});
+
+test("tls.connect over a Duplex roots the origin and listener thunks through the wrapper, not as Strong handles", async () => {
+  // UpgradedDuplex keeps the origin stream and its four native listener
+  // thunks reachable via WriteBarrier slots on the JSTLSSocket wrapper.
+  // Holding each as a separate Strong handle makes every TLS-over-duplex
+  // connection add five HandleSet entries that live as long as the native
+  // struct, independent of the wrapper's GC lifetime.
+  //
+  // heapStats().protectedObjectTypeCounts reports HandleSet-rooted values by
+  // class, so with Strong handles N live upgrades contribute +4N Function and
+  // +N origin objects; with visited slots they contribute none (the
+  // wrapper's own self-reference is the only per-upgrade Strong).
+  await using proc = Bun.spawn({
+    cmd: [
+      bunExe(),
+      "-e",
+      `
+        const tls = require("node:tls");
+        const { Duplex } = require("node:stream");
+        const { heapStats } = require("bun:jsc");
+
+        const protectedCounts = () => {
+          const c = heapStats().protectedObjectTypeCounts;
+          return { Function: c.Function ?? 0, Object: c.Object ?? 0 };
+        };
+
+        // Warm up so lazy module state doesn't skew the delta.
+        const warm = tls.connect({
+          socket: new Duplex({ read() {}, write(_c, _e, cb) { cb(); } }),
+          rejectUnauthorized: false,
+        });
+
+        Bun.gc(true);
+        const before = protectedCounts();
+
+        const N = 20;
+        const live = [];
+        for (let i = 0; i < N; i++) {
+          const origin = new Duplex({ read() {}, write(_c, _e, cb) { cb(); } });
+          live.push(tls.connect({ socket: origin, rejectUnauthorized: false }));
+        }
+
+        Bun.gc(true);
+        const after = protectedCounts();
+
+        console.log(JSON.stringify({
+          N,
+          fn: after.Function - before.Function,
+          obj: after.Object - before.Object,
+        }));
+        process.exit(0);
+      `,
+    ],
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  const { N, fn, obj } = JSON.parse(stdout.trim());
+  // Without the visited slots these are fn≈4N and obj≈N. A small constant
+  // slack absorbs any unrelated Strong created during the loop.
+  expect(fn).toBeLessThan(N);
+  expect(obj).toBeLessThan(N);
+  expect(exitCode).toBe(0);
+  void stderr;
+});
+
+test("node:net reconnect after connectError does not accumulate wrappers", async () => {
+  // node:net reuses the same native socket across reconnects. With JSRef,
+  // handleConnectError downgrades the wrapper (instead of clearing the raw
+  // JSValue cache), so subsequent getThisValue() calls return the same
+  // wrapper rather than creating orphaned duplicates that each call
+  // finalize() on GC.
+  await using proc = Bun.spawn({
+    cmd: [
+      bunExe(),
+      "-e",
+      `
+        const net = require("node:net");
+        const { heapStats } = require("bun:jsc");
+        const socket = new net.Socket();
+        let attempt = 0;
+        socket.on("error", () => {
+          if (attempt++ < 10) {
+            socket.connect({ port: 1, host: "127.0.0.1", autoSelectFamily: false });
+          } else {
+            socket.destroy();
+            (async () => {
+              for (let i = 0; i < 30; i++) { Bun.gc(true); await Bun.sleep(10); }
+              const n = heapStats().objectTypeCounts.TCPSocket || 0;
+              console.log(JSON.stringify({ count: n }));
+            })();
+          }
+        });
+        socket.connect({ port: 1, host: "127.0.0.1", autoSelectFamily: false });
+      `,
+    ],
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  const { count } = JSON.parse(stdout.trim().split("\n").pop()!);
+  // Prototype/structure plus at most one live wrapper.
+  expect(count).toBeLessThanOrEqual(3);
+  expect(exitCode).toBe(0);
+  void stderr;
+}, 30_000);
+
+test("node:net handle whose socket never starts connecting is collectable", async () => {
+  // node:net creates the native handle inside connect(), before the name
+  // lookup and before the tick that starts the connect. Only a connect
+  // attempt's teardown downgrades the wrapper, so a handle created strong
+  // stayed pinned (with the net.Socket it points back to) whenever the socket
+  // was torn down first, or connect() threw after creating the handle.
+  await using proc = Bun.spawn({
+    cmd: [
+      bunExe(),
+      "-e",
+      `
+        const net = require("node:net");
+        const tls = require("node:tls");
+        const dns = require("node:dns");
+        const { heapStats } = require("bun:jsc");
+
+        const server = net.createServer(s => s.destroy());
+        await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+        const { port } = server.address();
+
+        const closed = [];
+        const untilClosed = s => closed.push(new Promise(resolve => s.on("close", resolve)));
+        const N = 25;
+
+        // destroy() before the deferred connect to a literal IP runs.
+        for (let i = 0; i < N; i++) {
+          const s = net.connect(port, "127.0.0.1");
+          untilClosed(s);
+          s.destroy();
+        }
+        // Same, over TLS.
+        for (let i = 0; i < N; i++) {
+          const s = tls.connect({ port, host: "127.0.0.1" });
+          s.on("error", () => {});
+          untilClosed(s);
+          s.destroy();
+        }
+        // destroy() while the name lookup is in flight.
+        let lookups = 0;
+        const { promise: lookupsDone, resolve: resolveLookups } = Promise.withResolvers();
+        const lookup = (host, opts, cb) => {
+          lookups++;
+          dns.lookup(host, opts, (...args) => {
+            cb(...args);
+            if (--lookups === 0) resolveLookups();
+          });
+        };
+        for (let i = 0; i < N; i++) {
+          const s = net.connect({ port, host: "localhost", lookup });
+          untilClosed(s);
+          s.destroy();
+        }
+        // An AbortSignal that fires before the connect starts.
+        for (let i = 0; i < N; i++) {
+          const ac = new AbortController();
+          const s = net.connect({ port, host: "127.0.0.1", signal: ac.signal });
+          s.on("error", () => {});
+          untilClosed(s);
+          ac.abort();
+        }
+        // A name lookup that fails: the handle exists and the connect never starts.
+        const failingLookup = (host, opts, cb) =>
+          process.nextTick(cb, Object.assign(new Error("getaddrinfo ENOTFOUND " + host), { code: "ENOTFOUND" }));
+        for (let i = 0; i < N; i++) {
+          const s = net.connect({ port, host: "does-not-exist.invalid", lookup: failingLookup });
+          s.on("error", () => {});
+          untilClosed(s);
+        }
+        // An address the socket's blockList rejects.
+        const blockList = new net.BlockList();
+        blockList.addAddress("127.0.0.1");
+        for (let i = 0; i < N; i++) {
+          const s = net.connect({ port, host: "127.0.0.1", blockList });
+          s.on("error", () => {});
+          untilClosed(s);
+        }
+        // connect() that throws after the handle exists; nothing ever closes it.
+        let thrown = 0;
+        for (let i = 0; i < N; i++) {
+          try {
+            net.connect({ port: 65536, host: "127.0.0.1" });
+          } catch {
+            thrown++;
+          }
+        }
+
+        await Promise.all(closed);
+        await lookupsDone;
+        server.close();
+
+        // Each class's prototype object is counted under the same name.
+        let counts, pinned;
+        for (let i = 0; i < 30; i++) {
+          Bun.gc(true);
+          ({ objectTypeCounts: counts, protectedObjectTypeCounts: pinned } = heapStats());
+          if ((counts.TCPSocket ?? 0) <= 1 && (counts.TLSSocket ?? 0) <= 1) break;
+          await new Promise(resolve => setImmediate(resolve));
+        }
+        console.log(JSON.stringify({
+          closed: closed.length,
+          thrown,
+          TCPSocket: counts.TCPSocket ?? 0,
+          TLSSocket: counts.TLSSocket ?? 0,
+          pinned: { TCPSocket: pinned.TCPSocket ?? 0, TLSSocket: pinned.TLSSocket ?? 0 },
+        }));
+      `,
+    ],
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  expect(stderr).toBe("");
+  const { closed, thrown, TCPSocket, TLSSocket, pinned } = JSON.parse(stdout.trim().split("\n").pop()!);
+  expect({ closed, thrown }).toEqual({ closed: 150, thrown: 25 });
+  // Strong-held cells: a handle created strong shows up here, 150 and 25.
+  expect(pinned).toEqual({ TCPSocket: 0, TLSSocket: 0 });
+  // Pinned handles leave 150 TCPSocket and 25 TLSSocket, one per handle.
+  expect(TCPSocket).toBeLessThanOrEqual(3);
+  expect(TLSSocket).toBeLessThanOrEqual(3);
+  expect(exitCode).toBe(0);
+});
+
+test("node:net socket nothing references still connects when GC runs during the attempt", async () => {
+  // The handle is weak until the attempt starts; the attempt has to hold it, or a collection
+  // here finalizes the socket and it never emits 'connect', 'error' or 'close'.
+  const N = 50;
+  let connected = 0;
+  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  const server = net.createServer(connection => connection.end());
+  await new Promise<void>(listening => server.listen(0, "127.0.0.1", listening));
+  try {
+    const { port } = server.address() as net.AddressInfo;
+    for (let i = 0; i < N; i++) {
+      net
+        .connect(port, "127.0.0.1")
+        .on("connectionAttempt", () => process.nextTick(() => Bun.gc(true)))
+        .on("connect", () => ++connected === N && resolve())
+        .on("error", reject);
+    }
+    await promise;
+    expect(connected).toBe(N);
+  } finally {
+    server.close();
+  }
+});
+
+// Windows routes `unix:` through WindowsNamedPipeContext. A connect that fails
+// before libuv queues it (here: a TLS config that cannot build a context)
+// reports the error through `handle_connect_error` while the socket is still
+// detached, so that path releases nothing. The attempt ref taken in
+// `connect_inner` must be released by the caller, as the POSIX path does.
+test.skipIf(!isWindows)(
+  "a named-pipe connect that fails synchronously does not leak the native socket",
+  async () => {
+    const script = /* js */ `
+    const { heapStats } = require("bun:jsc");
+    const socket = { open() {}, data() {}, close() {}, error() {}, connectError() {} };
+    const opts = {
+      unix: "\\\\\\\\.\\\\pipe\\\\bun-missing-" + process.pid,
+      tls: { cert: "not a cert", key: "not a key" },
+    };
+    async function run(n) {
+      for (let i = 0; i < n; i += 100) {
+        await Promise.all(Array.from({ length: 100 }, () => Bun.connect({ ...opts, socket }).catch(() => {})));
+      }
+      for (let k = 0; k < 3; k++) {
+        Bun.gc(true);
+        await new Promise(r => setImmediate(r));
+      }
+    }
+    // Live mimalloc pages: allocator bookkeeping, independent of OS reclamation.
+    function pageCount() {
+      return heapStats().mimalloc.page_bins.reduce((a, b) => a + b.current, 0);
+    }
+    await run(4000);
+    const before = pageCount();
+    await run(4000);
+    const after = pageCount();
+    console.log(JSON.stringify({ before, after, delta: after - before }));
+  `;
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "-e", script],
+      env: { ...bunEnv, BUN_GARBAGE_COLLECTOR_LEVEL: "0" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stderr).toBe("");
+    const { before, after, delta } = JSON.parse(stdout.trim().split("\n").pop()!);
+    // Without the balancing deref each run of 4000 leaks about 16 pages
+    // (release) and many more under debug. With it the delta is heap noise.
+    expect(delta, `mimalloc page count: ${before} -> ${after}`).toBeLessThan(10);
+    expect(exitCode).toBe(0);
+  },
+  60_000,
+);

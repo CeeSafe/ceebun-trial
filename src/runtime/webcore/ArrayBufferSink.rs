@@ -1,0 +1,149 @@
+use crate::webcore::streams;
+use bun_collections::{ByteVecExt, VecExt};
+use bun_jsc::HostReturn as _;
+use bun_jsc::{ArrayBuffer, JSType, JSValue};
+use bun_sys as syscall;
+
+#[derive(Default)]
+pub(crate) struct ArrayBufferSink {
+    pub(crate) bytes: Vec<u8>,
+    // allocator field dropped — global mimalloc (non-AST crate, see PORTING.md §Allocators)
+    pub(crate) done: bool,
+    pub(crate) streaming: bool,
+    pub(crate) as_uint8array: bool,
+}
+
+impl ArrayBufferSink {
+    pub(crate) fn start(&mut self, stream_start: &streams::Start) -> bun_sys::Result<()> {
+        self.bytes.clear_retaining_capacity();
+
+        if let streams::Start::ArrayBufferSink {
+            chunk_size,
+            as_uint8array,
+            stream,
+        } = *stream_start
+        {
+            if chunk_size > 0 {
+                if self.bytes.try_reserve_exact(chunk_size as usize).is_err() {
+                    return Err(syscall::Error::oom());
+                }
+            }
+
+            self.as_uint8array = as_uint8array;
+            self.streaming = stream;
+        }
+
+        self.done = false;
+        Ok(())
+    }
+
+    pub(crate) fn flush_from_js(
+        &mut self,
+        cx: &bun_jsc::JsThread<'_>,
+        _wait: bool,
+    ) -> bun_sys::Result<JSValue> {
+        if self.streaming {
+            let value = if self.as_uint8array {
+                ArrayBuffer::create::<{ JSType::Uint8Array }>(cx.global(), self.bytes.slice())
+            } else {
+                ArrayBuffer::create::<{ JSType::ArrayBuffer }>(cx.global(), self.bytes.slice())
+            };
+            self.bytes.clear();
+            // Host return: empty ⇒ the exception `create` left pending.
+            return Ok(value.or_pending_exception());
+        }
+
+        Ok(JSValue::js_number(0.0))
+    }
+
+    pub(crate) fn write(&mut self, data: &streams::Result) -> streams::result::Writable {
+        let len = match self.bytes.write(data.slice()) {
+            Ok(len) => len,
+            Err(_) => return streams::result::Writable::Err(syscall::Error::oom()),
+        };
+        streams::result::Writable::Owned(len as u64)
+    }
+
+    pub(crate) fn write_latin1(&mut self, data: &streams::Result) -> streams::result::Writable {
+        let len = match self.bytes.write_latin1(data.slice()) {
+            Ok(len) => len,
+            Err(_) => return streams::result::Writable::Err(syscall::Error::oom()),
+        };
+        streams::result::Writable::Owned(len as u64)
+    }
+
+    pub(crate) fn write_utf16(&mut self, text: &[u16]) -> streams::result::Writable {
+        let len = match self.bytes.write_utf16(text) {
+            Ok(len) => len,
+            Err(_) => return streams::result::Writable::Err(syscall::Error::oom()),
+        };
+        streams::result::Writable::Owned(len as u64)
+    }
+
+    pub(crate) fn end(&mut self, _: Option<syscall::Error>) -> bun_sys::Result<()> {
+        Ok(())
+    }
+
+    /// # Safety
+    /// `this` is the allocation `JSSink::constructor` made for the JS wrapper, whose
+    /// `finalize` (the sole caller) frees it exactly once, here.
+    pub(crate) unsafe fn destroy(this: *mut Self) {
+        // SAFETY: reclaiming ownership drops `bytes` (Vec<u8> impls Drop) and
+        // frees the box.
+        drop(unsafe { bun_core::heap::take(this) });
+    }
+
+    pub(crate) fn end_from_js(
+        &mut self,
+        _cx: &bun_jsc::JsThread<'_>,
+    ) -> bun_sys::Result<ArrayBuffer> {
+        if self.done {
+            return Ok(ArrayBuffer::from_bytes(&mut [], JSType::ArrayBuffer));
+        }
+
+        self.done = true;
+        // `defer this.bytes = bun.Vec<u8>.empty` → take ownership, leave empty.
+        let mut bytes = core::mem::take(&mut self.bytes);
+        // Ownership transfers to JSC: the trait impl below converts the returned
+        // `ArrayBuffer` with `to_js_unchecked`, which installs
+        // `MarkedArrayBuffer_deallocator` (frees via `mi_free` on GC).
+        let owned = bytes.to_owned_slice();
+        Ok(ArrayBuffer::from_owned_bytes(
+            owned,
+            if self.as_uint8array {
+                JSType::Uint8Array
+            } else {
+                JSType::ArrayBuffer
+            },
+        ))
+    }
+
+    pub(crate) fn memory_cost(&self) -> usize {
+        // Since this is a JSSink, the NewJSSink function does @sizeOf(JSSink)
+        // which includes @sizeOf(ArrayBufferSink).
+        self.bytes.capacity() as usize
+    }
+}
+
+impl crate::webcore::sink::JsSinkType for ArrayBufferSink {
+    const NAME: &'static str = "ArrayBufferSink";
+
+    crate::impl_js_sink_forwarders!();
+
+    unsafe fn finalize(this: *mut Self) {
+        // SAFETY: trait contract — `this` is the wrapper's live sink, which
+        // `JSSink::constructor` allocated for it alone; nothing uses it afterwards.
+        unsafe { Self::destroy(this) };
+    }
+    fn end_from_js(&mut self, cx: &bun_jsc::JsThread<'_>) -> bun_sys::Result<JSValue> {
+        match Self::end_from_js(self, cx) {
+            // Not `to_js`: its `mi_is_in_heap_region` probe would skip the
+            // deallocator when the global allocator isn't mimalloc.
+            bun_sys::Result::Ok(ab) => bun_sys::Result::Ok(match ab.to_js_unchecked(cx.global()) {
+                Ok(v) => v,
+                Err(_) => JSValue::ZERO,
+            }),
+            bun_sys::Result::Err(e) => bun_sys::Result::Err(e),
+        }
+    }
+}

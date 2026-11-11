@@ -1,0 +1,181 @@
+use crate as css;
+use crate::PrintErr;
+use crate::css_parser::Parser;
+use crate::printer::Printer;
+
+use crate::css_values::ident::{CustomIdent, CustomIdentList};
+
+use bun_alloc::Arena; // bumpalo::Bump re-export (CSS is an AST/arena crate)
+use bun_wyhash::Wyhash;
+
+/// A value for the [composes](https://github.com/css-modules/css-modules/#dependencies) property from CSS modules.
+pub struct Composes {
+    /// A list of class names to compose.
+    pub names: CustomIdentList,
+    /// Where the class names are composed from.
+    pub from: Option<Specifier>,
+    /// The source location of the `composes` property.
+    pub loc: bun_ast::Loc,
+}
+
+impl Composes {
+    pub fn parse(input: &mut Parser) -> css::Result<Composes> {
+        let loc = input.position();
+        let mut names = CustomIdentList::default();
+        while let Ok(name) = input.try_parse(Self::parse_one_ident) {
+            names.append(name);
+        }
+
+        if names.len() == 0 {
+            return Err(input.new_custom_error(css::ParserError::invalid_declaration));
+        }
+
+        let from = if input
+            .try_parse(|i| i.expect_ident_matching(b"from"))
+            .is_ok()
+        {
+            Some(Specifier::parse(input)?)
+        } else {
+            None
+        };
+
+        Ok(Composes {
+            names,
+            from,
+            loc: bun_ast::Loc {
+                start: i32::try_from(loc).expect("int cast"),
+            },
+        })
+    }
+
+    pub fn to_css(&self, dest: &mut Printer) -> Result<(), PrintErr> {
+        use crate::css_values::ident::CustomIdentFns;
+        dest.write_separated(
+            self.names.slice(),
+            |d| d.write_char(b' '),
+            |d, name| CustomIdentFns::to_css(name, d),
+        )?;
+
+        if let Some(from) = &self.from {
+            dest.write_str(b" from ")?;
+            from.to_css(dest)?;
+        }
+        Ok(())
+    }
+
+    fn parse_one_ident(input: &mut Parser) -> css::Result<CustomIdent> {
+        let name: CustomIdent = CustomIdent::parse(input)?;
+
+        if bun_core::eql_case_insensitive_ascii_check_length(name.v(), b"from") {
+            return Err(input.new_error_for_next_token());
+        }
+
+        Ok(name)
+    }
+
+    pub(crate) fn deep_clone(&self, bump: &Arena) -> Self {
+        // `CustomIdent` is `Copy` (arena-ptr payload), so an element-wise copy
+        // into a fresh `SmallList` is the deep clone.
+        let mut names = CustomIdentList::default();
+        for name in self.names.slice() {
+            names.append(*name);
+        }
+        Composes {
+            names,
+            from: self.from.as_ref().map(|f| f.deep_clone(bump)),
+            loc: self.loc,
+        }
+    }
+
+    pub fn eql(lhs: &Self, rhs: &Self) -> bool {
+        if lhs.names.len() != rhs.names.len() {
+            return false;
+        }
+        for (a, b) in lhs.names.slice().iter().zip(rhs.names.slice().iter()) {
+            if a.v() != b.v() {
+                return false;
+            }
+        }
+        match (&lhs.from, &rhs.from) {
+            (None, None) => {}
+            (Some(a), Some(b)) if Specifier::eql(*a, *b) => {}
+            _ => return false,
+        }
+        lhs.loc == rhs.loc
+    }
+}
+
+/// Defines where the class names referenced in the `composes` property are located.
+///
+/// See [Composes](Composes).
+#[derive(Debug, Clone, Copy)]
+pub enum Specifier {
+    /// The referenced name is global.
+    Global,
+    /// The referenced name comes from the specified file.
+    ///
+    /// Is an import record index
+    ImportRecordIndex(u32),
+}
+
+// `generics::CssEql` so the `Option<Specifier>` blanket (used by
+// `DashedIdentReference::eql` in values/ident.rs) resolves. Forwards to the
+// inherent `eql` below.
+impl crate::generics::CssEql for Specifier {
+    #[inline]
+    fn eql(&self, other: &Self) -> bool {
+        Specifier::eql(*self, *other)
+    }
+}
+
+impl Specifier {
+    pub fn eql(lhs: Self, rhs: Self) -> bool {
+        match (lhs, rhs) {
+            (Specifier::Global, Specifier::Global) => true,
+            (Specifier::ImportRecordIndex(a), Specifier::ImportRecordIndex(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    pub fn parse(input: &mut Parser) -> css::Result<Specifier> {
+        input.skip_whitespace();
+        let start_position = input.position();
+        if let Ok(file) = input.try_parse(|i| i.expect_url_or_string()) {
+            let end_position = input.position();
+            let import_record_index = input.add_import_record(
+                file,
+                start_position,
+                end_position,
+                bun_ast::ImportKind::Composes,
+            )?;
+            return Ok(Specifier::ImportRecordIndex(import_record_index));
+        }
+        input.expect_ident_matching(b"global")?;
+        Ok(Specifier::Global)
+    }
+
+    pub fn to_css(self, dest: &mut Printer) -> Result<(), PrintErr> {
+        match self {
+            Specifier::Global => dest.write_str(b"global"),
+            Specifier::ImportRecordIndex(import_record_index) => {
+                let (url, _) = dest.get_import_record_url(import_record_index)?;
+                dest.serialize_string(url)
+            } // .source_index => {},
+        }
+    }
+
+    pub(crate) fn deep_clone(self, _bump: &Arena) -> Self {
+        // Variants are `Copy`; the deep clone is the value itself.
+        self
+    }
+
+    pub(crate) fn hash(self, hasher: &mut Wyhash) {
+        match self {
+            Specifier::Global => hasher.update(&0u32.to_ne_bytes()),
+            Specifier::ImportRecordIndex(i) => {
+                hasher.update(&1u32.to_ne_bytes());
+                hasher.update(&i.to_ne_bytes());
+            }
+        }
+    }
+}

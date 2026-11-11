@@ -1,0 +1,273 @@
+import { describe, expect, test } from "bun:test";
+import { bunEnv, bunExe, isWindows, tls as tlsCert } from "harness";
+import { once } from "node:events";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import tls from "node:tls";
+
+// Unix domain sockets are not supported on Windows via ws+unix://
+// (uSockets uses AF_UNIX which has limited support there).
+describe.skipIf(isWindows)("WebSocket over unix domain socket", () => {
+  function sockPath(name: string) {
+    // Keep it short to stay under sun_path limits on macOS/Linux.
+    return join(tmpdir(), `bun.ws.${name}.${process.pid}.${Date.now().toString(36)}.sock`);
+  }
+
+  test("ws+unix:// echoes through Bun.serve({ unix })", async () => {
+    const unix = sockPath("echo");
+    await using server = Bun.serve({
+      unix,
+      fetch(req, server) {
+        if (server.upgrade(req)) return;
+        return new Response("not a websocket", { status: 400 });
+      },
+      websocket: {
+        open(ws) {
+          ws.send("hello from server");
+        },
+        message(ws, message) {
+          ws.send(message);
+        },
+      },
+    });
+
+    const ws = new WebSocket(`ws+unix://${unix}`);
+    const received: string[] = [];
+    const { promise, resolve, reject } = Promise.withResolvers<void>();
+
+    ws.onerror = e => reject(e);
+    ws.onopen = () => {
+      ws.send("ping over unix");
+    };
+    ws.onmessage = e => {
+      received.push(String(e.data));
+      if (received.length === 2) {
+        ws.close();
+      }
+    };
+    ws.onclose = e => {
+      resolve();
+    };
+
+    await promise;
+
+    expect(received).toEqual(["hello from server", "ping over unix"]);
+    expect(ws.url).toBe(`ws+unix://${unix}`);
+  });
+
+  test("ws+unix:// with ':path' after socket path", async () => {
+    const unix = sockPath("path");
+    let seenUrl = "";
+    let seenHost = "";
+    await using server = Bun.serve({
+      unix,
+      fetch(req, server) {
+        seenUrl = new URL(req.url).pathname + new URL(req.url).search;
+        seenHost = req.headers.get("host") ?? "";
+        if (server.upgrade(req)) return;
+        return new Response("not a websocket", { status: 400 });
+      },
+      websocket: {
+        message(ws, message) {
+          ws.send(`echo:${message}`);
+        },
+      },
+    });
+
+    const ws = new WebSocket(`ws+unix://${unix}:/api/v1/stream?x=1`);
+    const { promise, resolve, reject } = Promise.withResolvers<string>();
+    ws.onerror = e => reject(e);
+    ws.onopen = () => ws.send("hi");
+    ws.onmessage = e => {
+      resolve(String(e.data));
+      ws.close();
+    };
+
+    const got = await promise;
+    expect(got).toBe("echo:hi");
+    expect(seenUrl).toBe("/api/v1/stream?x=1");
+    // Host header defaults to "localhost" over a unix socket, matching Node.
+    expect(seenHost).toBe("localhost");
+  });
+
+  test("ws+unix:// sends binary data", async () => {
+    const unix = sockPath("bin");
+    await using server = Bun.serve({
+      unix,
+      fetch(req, server) {
+        if (server.upgrade(req)) return;
+        return new Response("no", { status: 400 });
+      },
+      websocket: {
+        message(ws, message) {
+          ws.sendBinary(message as Uint8Array);
+        },
+      },
+    });
+
+    const ws = new WebSocket(`ws+unix://${unix}`);
+    ws.binaryType = "arraybuffer";
+    const payload = new Uint8Array([1, 2, 3, 4, 5, 255]);
+    const { promise, resolve, reject } = Promise.withResolvers<ArrayBuffer>();
+    ws.onerror = e => reject(e);
+    ws.onopen = () => ws.send(payload);
+    ws.onmessage = e => {
+      resolve(e.data);
+      ws.close();
+    };
+    const got = new Uint8Array(await promise);
+    expect([...got]).toEqual([...payload]);
+  });
+
+  test("ws+unix:// connection failure emits close when socket file does not exist", async () => {
+    const unix = sockPath("missing");
+    const ws = new WebSocket(`ws+unix://${unix}`);
+    const { promise, resolve } = Promise.withResolvers<{ code: number; gotError: boolean }>();
+    let gotError = false;
+    ws.onerror = () => {
+      gotError = true;
+    };
+    ws.onclose = e => resolve({ code: e.code, gotError });
+    const { code, gotError: sawError } = await promise;
+    expect(sawError).toBe(true);
+    expect(code).toBe(1006);
+  });
+
+  test("ws+unix:// without a socket path throws SyntaxError", () => {
+    expect(() => new WebSocket("ws+unix://")).toThrow(SyntaxError);
+  });
+
+  test("wss+unix:// connects to a TLS server over a unix socket", async () => {
+    const unix = sockPath("tls");
+    await using server = Bun.serve({
+      unix,
+      tls: tlsCert,
+      fetch(req, server) {
+        if (server.upgrade(req)) return;
+        return new Response("no", { status: 400 });
+      },
+      websocket: {
+        message(ws, message) {
+          ws.send(`secure:${message}`);
+        },
+      },
+    });
+
+    const ws = new WebSocket(`wss+unix://${unix}`, {
+      tls: { rejectUnauthorized: false },
+    });
+    const { promise, resolve, reject } = Promise.withResolvers<string>();
+    ws.onerror = e => reject(e);
+    ws.onopen = () => ws.send("hello");
+    ws.onmessage = e => {
+      resolve(String(e.data));
+      ws.close();
+    };
+    const got = await promise;
+    expect(got).toBe("secure:hello");
+  });
+
+  // Only an IP address in the strict form of net.isIP gets no SNI. "wss+unix:"
+  // is not a special scheme, so the URL host stays as typed, and ares_inet_pton
+  // reads "127.1" (as 127.1.0.0), "10" and hex as an address.
+  test("wss+unix:// sends a URL host that is IP shorthand as SNI", async () => {
+    const unix = sockPath("sni");
+    const seen: (string | null)[] = [];
+    const server = tls.createServer(tlsCert, socket => {
+      socket.on("error", () => {});
+      seen.push(socket.servername || null);
+      socket.destroy();
+    });
+    server.listen(unix);
+    await once(server, "listening");
+    try {
+      for (const host of ["127.1", "10", "0x7f000001", "127.0.0.1", "localhost"]) {
+        const ws = new WebSocket(`wss+unix://${host}${unix}`, {
+          tls: { rejectUnauthorized: false },
+        });
+        const { promise, resolve } = Promise.withResolvers<void>();
+        ws.onclose = () => resolve();
+        await promise;
+      }
+      expect(seen).toEqual(["127.1", "10", "0x7f000001", null, "localhost"]);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("wss+unix:// takes the SNI and the verified name from tls.serverName", async () => {
+    const unix = sockPath("name");
+    const seen: (string | null)[] = [];
+    const server = tls.createServer(
+      { ...tlsCert, SNICallback: (name, cb) => (seen.push(name), cb(null, undefined)) },
+      socket => {
+        socket.on("error", () => {});
+        socket.destroy();
+      },
+    );
+    server.listen(unix);
+    await once(server, "listening");
+    try {
+      const errors: (string | undefined)[] = [];
+      // The harness certificate is for localhost. The server disconnects the client whose handshake succeeds.
+      for (const [host, serverName] of [
+        ["evil.test", "localhost"],
+        ["localhost", "evil.test"],
+      ]) {
+        const ws = new WebSocket(`wss+unix://${host}${unix}`, { tls: { ca: tlsCert.cert, serverName } });
+        const { promise, resolve } = Promise.withResolvers<string | undefined>();
+        ws.onerror = event => resolve((event as ErrorEvent).error?.code);
+        errors.push(await promise);
+      }
+      expect({ seen, errors }).toEqual({
+        seen: ["localhost", "evil.test"],
+        errors: ["ECONNRESET", "ERR_TLS_CERT_ALTNAME_INVALID"],
+      });
+    } finally {
+      server.close();
+    }
+  });
+
+  test("works from a subprocess", async () => {
+    const unix = sockPath("sp");
+    await using server = Bun.serve({
+      unix,
+      fetch(req, server) {
+        if (server.upgrade(req)) return;
+        return new Response("no", { status: 400 });
+      },
+      websocket: {
+        message(ws, message) {
+          ws.send(`pong:${message}`);
+        },
+      },
+    });
+
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `
+          const ws = new WebSocket(process.argv[1]);
+          ws.onopen = () => ws.send("from-child");
+          ws.onmessage = e => {
+            console.log(String(e.data));
+            ws.close();
+          };
+          ws.onerror = e => {
+            console.error("error", e && e.message);
+            process.exit(1);
+          };
+        `,
+        `ws+unix://${unix}`,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "inherit",
+    });
+
+    const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+    expect(stdout.trim()).toBe("pong:from-child");
+    expect(exitCode).toBe(0);
+  });
+});

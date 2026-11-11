@@ -1,0 +1,460 @@
+use crate as css;
+use crate::css_rules::{CssRule, CssRuleList, Location, MinifyContext};
+use crate::declaration::{DeclarationBlock, DeclarationList};
+use crate::error::MinifyErr;
+use crate::selectors::selector;
+use crate::{PrintErr, Printer, VendorPrefix};
+
+// `StyleRule` is generic over the custom at-rule type `R`.
+//
+// `DeclarationBlock<'bump>` borrows the parser arena (bumpalo Vecs).
+// Threading `'bump` here cascades into `CssRule<'bump, R>` / `CssRuleList<'bump, R>`
+// (see the rules/mod.rs lifetime-erasure note); for now the lifetime is erased
+// to `'static`.
+pub struct StyleRule<R> {
+    /// The selectors for the style rule.
+    pub(crate) selectors: selector::parser::SelectorList,
+    /// A vendor prefix override, used during selector printing.
+    pub(crate) vendor_prefix: VendorPrefix,
+    /// The declarations within the style rule.
+    pub(crate) declarations: DeclarationBlock<'static>,
+    /// Nested rules within the style rule.
+    pub(crate) rules: CssRuleList<R>,
+    /// The location of the rule in the source file.
+    pub(crate) loc: Location,
+}
+
+impl<R> StyleRule<R> {
+    /// Returns whether the rule is empty.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.selectors.v.is_empty() || (self.declarations.is_empty() && self.rules.v.len() == 0)
+    }
+}
+
+// ─── behavior bodies ──────────────────────────────────────────────────────
+impl<R> StyleRule<R> {
+    /// Returns a hash of this rule for use when deduplicating.
+    /// Includes the selectors and properties.
+    pub(crate) fn hash_key(&self) -> u64 {
+        use core::hash::Hash;
+        // Wyhash seeded with 0 — same algorithm as bun.hash
+        let mut hasher = bun_wyhash::Wyhash::init(0);
+        self.selectors.hash(&mut hasher);
+        for decl in self.declarations.declarations.iter() {
+            decl.property_id().hash(&mut hasher);
+        }
+        for decl in self.declarations.important_declarations.iter() {
+            decl.property_id().hash(&mut hasher);
+        }
+        hasher.final_()
+    }
+
+    /// Not with nested rules: the `:is(list)` that their `&` compiles to forgives the unknown prefix.
+    fn prints_selectors_as_written(&self) -> bool {
+        self.rules.v.is_empty() && selector::is_list_with_vendor_prefix(self.selectors.v.slice())
+    }
+
+    pub(crate) fn update_prefix(&mut self, context: &mut MinifyContext<'_, '_>) {
+        if self.prints_selectors_as_written() {
+            self.vendor_prefix = VendorPrefix::empty();
+            return;
+        }
+        self.vendor_prefix = selector::get_prefix(&self.selectors);
+        if self.vendor_prefix.contains(VendorPrefix::NONE)
+            && context.targets.should_compile_selectors()
+        {
+            self.vendor_prefix = selector::downlevel_selectors(
+                context.arena,
+                self.selectors.v.slice_mut(),
+                context.targets,
+            );
+        }
+    }
+
+    pub(crate) fn is_compatible(&self, targets: &css::targets::Targets) -> bool {
+        selector::is_compatible(self.selectors.v.slice(), targets)
+    }
+
+    /// How many rules this rule prints as: a selector that a target cannot parse gets its own copy.
+    pub(crate) fn split_rule_count(&self, targets: &css::targets::Targets) -> u32 {
+        let selectors = self.selectors.v.slice();
+        if selectors.len() <= 1
+            || !targets.should_compile_selectors()
+            || self.prints_selectors_as_written()
+        {
+            return 1;
+        }
+        let moved = selectors
+            .iter()
+            .filter(|one| !selector::is_compatible(core::slice::from_ref(*one), targets))
+            .count();
+        (moved + usize::from(moved < selectors.len())) as u32
+    }
+}
+
+// ─── to_css ───────────────────────────────────────────────────────────────
+
+/// Maximum number of bytes the per-vendor-prefix serialization may emit from
+/// duplicate passes across a whole stylesheet.
+///
+/// When a style rule's selector list carries more than one vendor prefix (e.g.
+/// a list mixing `:-webkit-autofill` with an unprefixed pseudo-class, or a
+/// single pseudo downleveled to several prefixes), `StyleRule::to_css`
+/// serializes the rule once per prefix, and every pass after the first
+/// re-serializes the rule's whole body — declarations, nested rules, and
+/// everything under them. Nesting such rules repeats that body once per prefix
+/// at every level, so the output grows by (prefix count)^depth. The bytes
+/// emitted by each duplicate pass are measured and bounded, so a few kilobytes
+/// of deeply nested input cannot expand into gigabytes — whatever the
+/// duplicated payload is (nested rules, a large declaration block, etc.). Real
+/// stylesheets repeat only a little output across prefixes; anything past this
+/// limit is a runaway expansion, so bail out with an error instead of
+/// allocating gigabytes. Complements `MAX_NESTING_EXPANSIONS`
+/// (`selectors/selector.rs`) and `MAX_SELECTOR_EXPANSION` (`rules/mod.rs`).
+const MAX_PREFIX_EXPANSION_BYTES: usize = 64 << 20;
+
+impl<R> StyleRule<R> {
+    pub fn to_css(&self, dest: &mut Printer) -> Result<(), PrintErr> {
+        if self.vendor_prefix.is_empty() {
+            self.to_css_base(dest, true)?;
+        } else {
+            let mut first_rule = true;
+            let mut emitted_first_pass = false;
+            let mut remaining_prefixes = self.vendor_prefix;
+            // `inline for (css.VendorPrefix.FIELDS) |field|` — iterate the bool fields of the
+            // packed struct in declared order. In Rust the bitflags type exposes the same
+            // ordered single-bit table directly.
+            for &prefix in VendorPrefix::FIELDS {
+                if self.vendor_prefix.contains(prefix) {
+                    remaining_prefixes.remove(prefix);
+                    if !first_rule {
+                        if !dest.minify {
+                            dest.write_char(b'\n')?; // no indent
+                        }
+                        dest.newline()?;
+                    }
+
+                    dest.vendor_prefix = prefix;
+                    let (line, col) = (dest.line, dest.col);
+                    // The first prefix pass is the original; every later pass
+                    // re-serializes the same body (declarations + nested rules),
+                    // so its output is a duplicate produced by the fan-out.
+                    // Measure how much it emits and charge it against the
+                    // expansion-byte budget so nesting fanning-out rules can't
+                    // expand a few kilobytes into gigabytes. The first pass
+                    // (and a single-prefix rule, which has no later pass) does
+                    // not charge; a flat multi-prefix rule's later passes do,
+                    // but without nesting to compound them that stays linear.
+                    let is_duplicate_pass = emitted_first_pass;
+                    let bytes_before = if is_duplicate_pass {
+                        dest.bytes_written()
+                    } else {
+                        0
+                    };
+                    self.to_css_base(dest, remaining_prefixes.is_empty())?;
+                    if is_duplicate_pass {
+                        let emitted = dest.bytes_written().saturating_sub(bytes_before);
+                        dest.prefix_expansion_bytes =
+                            dest.prefix_expansion_bytes.saturating_add(emitted);
+                        if dest.prefix_expansion_bytes > MAX_PREFIX_EXPANSION_BYTES {
+                            return dest.new_error(
+                                css::error::PrinterErrorKind::maximum_vendor_prefix_expansion,
+                                None,
+                            );
+                        }
+                    }
+                    // A non-final pass emits nothing when the rule has no
+                    // declarations of its own and all of its nested rules are
+                    // deferred to the final pass; don't write a separator
+                    // after such a pass.
+                    if dest.line != line || dest.col != col {
+                        first_rule = false;
+                        emitted_first_pass = true;
+                    }
+                }
+            }
+
+            dest.vendor_prefix = VendorPrefix::empty();
+        }
+        Ok(())
+    }
+
+    fn to_css_base(&self, dest: &mut Printer, is_final_prefix_pass: bool) -> Result<(), PrintErr> {
+        use css::properties::Property;
+
+        // If supported, or there are no targets, preserve nesting. Otherwise, write nested rules after parent.
+        let supports_nesting = self.rules.v.len() == 0
+            || !css::targets::Targets::should_compile_same(&dest.targets, css::Feature::Nesting);
+
+        let len =
+            self.declarations.declarations.len() + self.declarations.important_declarations.len();
+        let has_declarations = supports_nesting || len > 0 || self.rules.v.len() == 0;
+
+        if has_declarations {
+            //   #[cfg(feature = "sourcemap")]
+            //   dest.add_mapping(self.loc);
+
+            // `dest.context()` borrows `dest`; copy the (Copy) raw
+            // ctx field out so it doesn't conflict with the `&mut *dest` below.
+            let ctx = dest.ctx;
+            // Each rule prelude gets its own budget for `&` substitutions when
+            // compiling nesting (see `serialize::serialize_nesting`).
+            dest.nesting_expansions = 0;
+            selector::serialize::serialize_selector_list(
+                self.selectors.v.slice(),
+                dest,
+                ctx,
+                false,
+            )?;
+            dest.whitespace()?;
+            dest.write_char(b'{')?;
+            dest.indent();
+
+            let mut i: usize = 0;
+            // A pair of (slice, important) tuples; declarations first, then
+            // important declarations.
+            let decls_groups: [(&[Property], bool); 2] = [
+                (self.declarations.declarations.as_slice(), false),
+                (self.declarations.important_declarations.as_slice(), true),
+            ];
+            for (decls, important) in decls_groups {
+                for decl in decls {
+                    // The parser checked it and recorded it in `StyleSheet::composes`.
+                    if matches!(decl, Property::Composes(_)) {
+                        continue;
+                    }
+
+                    dest.newline()?;
+                    decl.to_css(dest, important)?;
+                    if i != len - 1 || !dest.minify || (supports_nesting && self.rules.v.len() > 0)
+                    {
+                        dest.write_char(b';')?;
+                    }
+
+                    i += 1;
+                }
+            }
+        }
+
+        fn helpers_newline<R>(
+            self_: &StyleRule<R>,
+            d: &mut Printer,
+            supports_nesting2: bool,
+            len1: usize,
+        ) -> Result<(), PrintErr> {
+            if !d.minify && (supports_nesting2 || len1 > 0) && self_.rules.v.len() > 0 {
+                if len1 > 0 {
+                    d.write_char(b'\n')?;
+                }
+                d.newline()?;
+            }
+            Ok(())
+        }
+
+        fn helpers_end(d: &mut Printer, has_decls: bool) -> Result<(), PrintErr> {
+            if has_decls {
+                d.dedent();
+                d.newline()?;
+                d.write_char(b'}')?;
+            }
+            Ok(())
+        }
+
+        // Write nested rules after the parent.
+        if supports_nesting {
+            helpers_newline(self, dest, supports_nesting, len)?;
+            self.rules.to_css(dest)?;
+            dest.pending_semicolon = false;
+            helpers_end(dest, has_declarations)?;
+        } else {
+            // This rule is serialized once per vendor prefix, and each pass
+            // re-serializes the nested rules. Nested style rules that carry
+            // their own vendor prefixes override `dest.vendor_prefix`, so they
+            // produce identical output in every pass; mark non-final passes so
+            // they are skipped and emitted only in the final pass. Otherwise
+            // they would be duplicated once per ancestor prefix, which grows
+            // exponentially with nesting depth.
+            let saved_skip = dest.skip_prefixed_nested_rules;
+            let skip_prefixed_nested = saved_skip || !is_final_prefix_pass;
+            // Whether any nested rule is emitted in this pass; if not, don't
+            // write the separator between the declarations and the nested
+            // rules (nothing would follow it).
+            let has_nested_output = !skip_prefixed_nested
+                || self.rules.v.iter().any(|rule| {
+                    !matches!(rule, CssRule::Ignored) && !rule.is_deferred_to_final_prefix_pass()
+                });
+
+            helpers_end(dest, has_declarations)?;
+            if has_nested_output {
+                helpers_newline(self, dest, supports_nesting, len)?;
+            }
+            dest.skip_prefixed_nested_rules = skip_prefixed_nested;
+            // `with_context` keeps the (closure-data, fn) split so the
+            // `Printer` reborrow lives only inside `func`.
+            let result =
+                dest.with_context(&self.selectors, &self.rules, |rules, d| rules.to_css(d));
+            dest.skip_prefixed_nested_rules = saved_skip;
+            result?;
+        }
+        Ok(())
+    }
+}
+
+impl<R> StyleRule<R> {
+    pub(crate) fn minify(
+        &mut self,
+        context: &mut MinifyContext<'_, '_>,
+        parent_is_unused: bool,
+        split_rule_count: u32,
+    ) -> Result<bool, MinifyErr>
+    where
+        R: for<'b> css::generics::DeepClone<'b>,
+    {
+        use css::context::DeclarationContext;
+
+        let mut unused = false;
+        if context.unused_symbols.count() > 0 {
+            if selector::is_unused(
+                self.selectors.v.slice(),
+                context.unused_symbols,
+                &context.extra.symbols,
+                parent_is_unused,
+            ) {
+                if self.rules.v.len() == 0 {
+                    return Ok(true);
+                }
+
+                self.declarations.declarations.clear();
+                self.declarations.important_declarations.clear();
+                unused = true;
+            }
+        }
+
+        self.charge_selector_expansion(context)?;
+
+        // TODO: this
+        // let pure_css_modules = context.pure_css_modules;
+        // if context.pure_css_modules {
+        //   if !self.selectors.0.iter().all(is_pure_css_modules_selector) {
+        //     return Err(MinifyError {
+        //       kind: crate::error::MinifyErrorKind::ImpureCSSModuleSelector,
+        //       loc: self.loc,
+        //     });
+        //   }
+        //
+        //   // Parent rule contained id or class, so child rules don't need to.
+        //   context.pure_css_modules = false;
+        // }
+
+        context.handler_context.context = DeclarationContext::StyleRule;
+        // `DeclarationBlock<'static>` (see the struct-level note above) forces
+        // `minify` to want `DeclarationHandler<'static>`; route through the
+        // single centralized `'bump`-erasure helper instead of open-coding the
+        // lifetime cast. Collapses when `CssRule<'bump, R>`
+        // re-threads the arena lifetime.
+        self.declarations.minify(
+            super::dc::decl_handler_static(&mut *context.handler),
+            super::dc::decl_handler_static(&mut *context.important_handler),
+            &mut context.handler_context,
+        );
+        context.handler_context.context = DeclarationContext::None;
+
+        if self.rules.v.len() > 0 {
+            self.minify_nested_rules(context, unused, split_rule_count)?;
+            if unused && self.rules.v.len() == 0 {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Charge this rule's selectors against the selector-expansion budget.
+    ///
+    /// Compiling the enclosing nesting away for the targets repeats this rule's
+    /// selectors once per combination of the enclosing style rules' selectors.
+    /// That expansion is multiplicative across nesting levels, so bound it —
+    /// otherwise a few hundred bytes of deeply nested multi-selector rules
+    /// expand into gigabytes of cloned rules and output. See
+    /// [`css_rules::MAX_SELECTOR_EXPANSION`](super::MAX_SELECTOR_EXPANSION).
+    pub(crate) fn charge_selector_expansion(
+        &self,
+        context: &mut MinifyContext<'_, '_>,
+    ) -> Result<(), MinifyErr> {
+        context.charge_selector_expansion(self.selectors.v.len(), self.loc)
+    }
+
+    /// Minify this rule's nested rules, bumping the selector-expansion
+    /// multiplier by this rule's selector count first (and restoring it after)
+    /// so the nested rules are charged for the combinations they expand into.
+    pub(crate) fn minify_nested_rules(
+        &mut self,
+        context: &mut MinifyContext<'_, '_>,
+        parent_is_unused: bool,
+        split_rule_count: u32,
+    ) -> Result<(), MinifyErr>
+    where
+        R: for<'b> css::generics::DeepClone<'b>,
+    {
+        use css::context::{DeclarationContext, PropertyHandlerContext};
+
+        // Native nesting repeats the nested rules only once per rule this list is split into.
+        let saved_expansion_multiplier = context.selector_expansion_multiplier;
+        let copies = if context.targets.should_compile_same(css::Feature::Nesting) {
+            self.selectors.v.len().max(1)
+        } else {
+            split_rule_count
+        };
+        context.selector_expansion_multiplier =
+            context.selector_expansion_multiplier.saturating_mul(copies);
+
+        let mut handler_context = context.handler_context.child(DeclarationContext::StyleRule);
+        core::mem::swap::<PropertyHandlerContext<'_>>(
+            &mut context.handler_context,
+            &mut handler_context,
+        );
+        // After the swap `handler_context` is this rule's own.
+        let result =
+            self.rules
+                .minify_nested(context, parent_is_unused, Some(&mut handler_context));
+        core::mem::swap::<PropertyHandlerContext<'_>>(
+            &mut context.handler_context,
+            &mut handler_context,
+        );
+        context.selector_expansion_multiplier = saved_expansion_multiplier;
+        result
+    }
+
+    /// Returns whether this rule is a duplicate of another rule.
+    /// This means it has the same selectors, properties, and importance.
+    #[inline]
+    pub(crate) fn is_duplicate(&self, other: &Self) -> bool {
+        let same_property_ids = |a: &DeclarationList<'_>, b: &DeclarationList<'_>| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(a, b)| a.property_id() == b.property_id())
+        };
+        let (a, b) = (&self.declarations, &other.declarations);
+        same_property_ids(&a.declarations, &b.declarations)
+            && same_property_ids(&a.important_declarations, &b.important_declarations)
+            && self.selectors.eql(&other.selectors)
+    }
+}
+
+// ─── deep_clone ───────────────────────────────────────────────────────────
+impl<R> StyleRule<R> {
+    pub(crate) fn deep_clone<'bump>(&self, bump: &'bump bun_alloc::Arena) -> Self
+    where
+        R: crate::generics::DeepClone<'bump>,
+    {
+        // css is an AST crate (PORTING.md §Allocators): the allocator is &'bump Bump, threaded.
+        Self {
+            selectors: self.selectors.deep_clone(),
+            vendor_prefix: self.vendor_prefix,
+            declarations: super::dc::decl_block_static(&self.declarations, bump),
+            rules: self.rules.deep_clone(bump),
+            loc: self.loc,
+        }
+    }
+}

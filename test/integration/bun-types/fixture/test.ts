@@ -1,0 +1,791 @@
+import {
+  afterAll,
+  afterEach,
+  aroundAll,
+  aroundEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  expectTypeOf,
+  type ExtendTest,
+  jest,
+  type Matchers,
+  mock,
+  type Mock,
+  spyOn,
+  test,
+  type TestOptions,
+  vi,
+  xdescribe,
+  xit,
+  xtest,
+} from "bun:test";
+import { expectType } from "./utilities";
+
+const hooks = [beforeAll, beforeEach, afterAll, afterEach];
+
+for (const hook of hooks) {
+  hook(() => {
+    // ...
+  });
+  // eslint-disable-next-line
+  hook(async () => {
+    // ...
+    return;
+  });
+  hook((done: (err?: unknown) => void) => {
+    done();
+    done(new Error());
+    done("Error");
+  });
+}
+
+describe("bun:test", () => {
+  describe("expect()", () => {
+    test("toThrow()", () => {
+      function fail() {
+        throw new Error("Bad");
+      }
+      expect(fail).toThrow();
+      expect(fail).toThrow("Bad");
+      expect(fail).toThrow(/bad/i);
+      expect(fail).toThrow(Error);
+      expect(fail).toThrow(new Error("Bad"));
+    });
+  });
+  test("expect()", () => {
+    expect(1).toBe(1);
+    expect(1).not.toBe(2);
+    // @ts-expect-error
+    expect({ a: 1 }).toEqual<{ a: number }>({ a: 1, b: undefined });
+
+    // @ts-expect-error
+    expect({ a: 1 }).toEqual<{ a: number; b: number }>({ a: 1, b: undefined });
+
+    // Support passing a type parameter to force exact type matching
+    expect({ a: 1 }).toEqual<{ a: number; b: number }>({ a: 1, b: 1 });
+
+    expect({ a: 1 }).toStrictEqual({ a: 1 });
+    expect(new Set()).toHaveProperty("size");
+    expect(new Uint8Array()).toHaveProperty("byteLength", 0);
+    expect([]).toHaveLength(0);
+    expect(["bun"]).toContain("bun");
+    expect("hello").toContain("bun");
+    expect(true).toBeTruthy();
+    expect(false).toBeFalsy();
+    expect(Math.PI).toBeGreaterThan(3.14);
+    expect(Math.PI).toBeGreaterThan(3n);
+    expect(Math.PI).toBeGreaterThanOrEqual(3.14);
+    expect(Math.PI).toBeGreaterThanOrEqual(3n);
+    expect(NaN).toBeNaN();
+    expect(null).toBeNull();
+    expect(undefined).toBeUndefined();
+    expect(undefined).not.toBeDefined();
+  });
+});
+
+test.each([1, 2, 3])("test.each", a => {
+  expectType<1 | 2 | 3>(a);
+});
+
+// inference should work when data is passed directly in
+test.each([
+  ["a", true, 5],
+  ["b", false, 1234],
+])("test.each", (a, b, c) => {
+  expectType<string>(a);
+  expectType<boolean>(b);
+  expectType<number | string>(c);
+});
+describe.each([
+  ["a", true, 5],
+  ["b", false, 5],
+])("test.each", (a, b, c) => {
+  expectType<string>(a);
+  expectType<boolean>(b);
+  expectType<number | string>(c);
+});
+describe.each([
+  ["a", true, 5],
+  ["b", false, "asdf"],
+])("test.each", (a, b, c) => {
+  expectType<string>(a);
+  expectType<boolean>(b);
+  expectType<number | string>(c);
+});
+// @ts-expect-error
+describe.each([{ asdf: "asdf" }, { asdf: "asdf" }])("test.each", (a, b, c) => {
+  // this test was wrong because this describe.each call will only have one argument, not three.
+  // it is now marked with ts-expect-error and the fixed test is below.
+});
+describe.each([{ asdf: "asdf" }, { asdf: "asdf" }])("test.each", a => {
+  expectType<{ asdf: string }>(a);
+});
+test.each([{ asdf: "asdf" }, { asdf: "asdf" }])("test.each", (a, done) => {
+  expectType<{ asdf: string }>(a);
+  expectType<(err?: unknown) => void>(done);
+});
+
+// no inference on data
+const data = [
+  ["a", true, 5],
+  ["b", false, "asdf"],
+];
+
+test.each(data)("test.each", (a, b, c) => {
+  expectType<string | number | boolean | ((err?: unknown) => void)>(a);
+  expectType<string | number | boolean | ((err?: unknown) => void)>(b);
+  expectType<string | number | boolean | ((err?: unknown) => void)>(c);
+});
+describe.each(data)("test.each", (a, b, c) => {
+  expectType<string | number | boolean>(a);
+  expectType<string | number | boolean>(b);
+  expectType<string | number | boolean>(c);
+});
+
+// as const
+const dataAsConst = [
+  ["a", true, 5],
+  ["b", false, "asdf"],
+] as const;
+
+test.each(dataAsConst)("test.each", (...args) => {
+  expectType<string>(args[0]);
+  expectType<boolean>(args[1]);
+  expectType<string | number>(args[2]);
+});
+describe.each(dataAsConst)("test.each", (...args) => {
+  expectType<string>(args[0]);
+  expectType<boolean>(args[1]);
+  expectType<string | number>(args[2]);
+});
+describe.each(dataAsConst)("test.each", (a, b, c) => {
+  expectType<"a" | "b">(a);
+  expectType<boolean>(b);
+  expectType<5 | "asdf">(c);
+});
+
+expect().pass();
+expect().fail();
+
+expectType(expect()).is<import("bun:test").Matchers<undefined>>();
+expectType(expect<string>()).is<import("bun:test").Matchers<string | undefined>>();
+expectType(expect("")).is<import("bun:test").Matchers<string>>();
+expectType(expect<string>("")).is<import("bun:test").Matchers<string>>();
+expectType(expect(undefined, "Fail message")).is<import("bun:test").Matchers<undefined>>();
+expectType(expect<string>(undefined, "Fail message")).is<import("bun:test").Matchers<string | undefined>>();
+expectType(expect("", "Fail message")).is<import("bun:test").Matchers<string>>();
+expectType(expect<string>("", "Fail message")).is<import("bun:test").Matchers<string>>();
+
+describe("Matcher Overload Type Tests", () => {
+  const num = 1;
+  const str = "hello";
+  const numArr = [1, 2, 3];
+  const strArr = ["a", "b", "c"];
+  const mixedArr = [1, "a", true];
+  const obj = { a: 1, b: "world", 10: true };
+  const numSet = new Set([10, 20]);
+
+  test("toBe", () => {
+    expect(num).toBe(1);
+    expect(str).toBe("hello");
+    // @ts-expect-error - Type 'string' is not assignable to type 'number'.
+    expect(num).toBe<number>("1");
+    // @ts-expect-error - Type 'number' is not assignable to type 'string'.
+    expect(str).toBe<string>(123);
+    // @ts-expect-error - Type 'boolean' is not assignable to type 'number'.
+    expect(num).toBe<number>(true);
+    // @ts-expect-error - Too many arguments for specific overload
+    expect(num).toBe<number>(1, 2);
+    // @ts-expect-error - Expecting number, passed function
+    expect(num).toBe<number>(() => {});
+  });
+
+  test("toEqual", () => {
+    expect(numArr).toEqual([1, 2, 3]);
+    expect(obj).toEqual({ a: 1, b: "world", 10: true });
+    // @ts-expect-error - Type 'string' is not assignable to type 'number' at index 0.
+    expect(numArr).toEqual<number[]>(["1", 2, 3]);
+    // @ts-expect-error - Property 'c' is missing in type '{ a: number; b: string; 10: boolean; }'.
+    expect(obj).toEqual<typeof obj>({ a: 1, b: "world", c: false });
+    // @ts-expect-error - Type 'boolean' is not assignable to type 'number[]'.
+    expect(numArr).toEqual<number[]>(true);
+    // @ts-expect-error - Too many arguments for specific overload
+    expect(numArr).toEqual<number[]>([1, 2], [3]);
+    // @ts-expect-error - Expecting object, passed number
+    expect(obj).toEqual<object>(123);
+  });
+
+  test("toStrictEqual", () => {
+    expect(numArr).toStrictEqual([1, 2, 3]);
+    expect(obj).toStrictEqual({ a: 1, b: "world", 10: true });
+    // @ts-expect-error - Type 'string' is not assignable to type 'number' at index 0.
+    expect(numArr).toStrictEqual<number[]>(["1", 2, 3]);
+    // @ts-expect-error - Properties are missing
+    expect(obj).toStrictEqual<typeof obj>({ a: 1 });
+    // @ts-expect-error - Type 'boolean' is not assignable to type 'number[]'.
+    expect(numArr).toStrictEqual<number[]>(true);
+    // @ts-expect-error - Too many arguments for specific overload
+    expect(numArr).toStrictEqual<number[]>([1, 2], [3]);
+    // @ts-expect-error - Expecting object, passed number
+    expect(obj).toStrictEqual<object>(123);
+  });
+
+  test("toBeOneOf", () => {
+    expect(num).toBeOneOf([1, 2, 3]);
+    expect(str).toBeOneOf(strArr);
+    expect(num).toBeOneOf(numSet);
+    // @ts-expect-error - Argument of type 'number[]' is not assignable to parameter of type 'Iterable<string>'.
+    expect(str).toBeOneOf<Iterable<string>>(numArr);
+    // @ts-expect-error - Argument of type 'string[]' is not assignable to parameter of type 'Iterable<number>'.
+    expect(num).toBeOneOf<Iterable<number>>(strArr);
+    // @ts-expect-error - Argument of type 'Set<number>' is not assignable to parameter of type 'Iterable<string>'.
+    expect(str).toBeOneOf<Iterable<string>>(numSet);
+    // @ts-expect-error - Argument must be iterable
+    expect(num).toBeOneOf<number>(1);
+    // @ts-expect-error - Expecting string iterable, passed number iterable
+    expect(str).toBeOneOf<Iterable<string>>([1, 2, 3]);
+  });
+
+  test("toContainKey", () => {
+    expect(obj).toContainKey("a");
+    expect(obj).toContainKey("b");
+    // @ts-expect-error simple check for key does not exist
+    expect(obj).toContainKey("c");
+    expect(obj).toContainKey(10); // object key is number
+    // @ts-expect-error - Argument of type '"c"' is not assignable to parameter of type 'number | "a" | "b"'.
+    expect(obj).toContainKey<typeof obj>("c");
+    // @ts-expect-error - Argument of type 'boolean' is not assignable to parameter of type 'string | number'.
+    expect(obj).toContainKey<typeof obj>(true);
+    // @ts-expect-error - Too many arguments for specific overload
+    expect(obj).toContainKey<typeof obj>("a", "b");
+    // @ts-expect-error - Argument of type 'symbol' is not assignable to parameter of type 'string | number'.
+    expect(obj).toContainKey<typeof obj>(Symbol("a"));
+  });
+
+  test("toContainAllKeys", () => {
+    expect(obj).toContainAllKeys(["a", "b"]);
+    expect(obj).toContainAllKeys([10, "a"]);
+    // @ts-expect-error simple check for key does not exist
+    expect(obj).toContainAllKeys(["c"]);
+    // @ts-expect-error - Type '"c"' is not assignable to type 'number | "a" | "b"'.
+    expect(obj).toContainAllKeys<(typeof obj)[]>(["a", "c"]);
+    // @ts-expect-error - Type 'boolean' is not assignable to type 'string | number'.
+    expect(obj).toContainAllKeys<(typeof obj)[]>(["a", true]);
+    // @ts-expect-error - Argument must be an array
+    expect(obj).toContainAllKeys<Array<typeof obj>>("a");
+    // @ts-expect-error - Array element type 'symbol' is not assignable to 'string | number'.
+    expect(obj).toContainAllKeys<(typeof obj)[]>(["a", Symbol("b")]);
+  });
+
+  test("toContainAnyKeys", () => {
+    expect(obj).toContainAnyKeys(["a", "b", 10]);
+    // @ts-expect-error simple check for key does not exist
+    expect(obj).toContainAnyKeys(["c"]);
+    // @ts-expect-error - 11 is not a key
+    expect(obj).toContainAnyKeys(["a", "b", 11]);
+    // @ts-expect-error - c is not a key
+    expect(obj).toContainAnyKeys(["a", "c"]); // c doesn't exist, but 'a' does
+    // @ts-expect-error d is not a key
+    expect(obj).toContainAnyKeys([10, "d"]);
+    // @ts-expect-error - Type '"c"' is not assignable to type 'number | "a" | "b"'. Type '"d"' is not assignable to type 'number | "a" | "b"'.
+    expect(obj).toContainAnyKeys<(typeof obj)[]>(["c", "d"]);
+    // @ts-expect-error - Type 'boolean' is not assignable to type 'string | number'.
+    expect(obj).toContainAnyKeys<(typeof obj)[]>([true, false]);
+    // @ts-expect-error - Argument must be an array
+    expect(obj).toContainAnyKeys<Array<typeof obj>>("a");
+    // @ts-expect-error - Array element type 'symbol' is not assignable to 'string | number'.
+    expect(obj).toContainAnyKeys<(typeof obj)[]>([Symbol("a")]);
+  });
+
+  test("toContainKeys", () => {
+    // Alias for toContainAllKeys
+    expect(obj).toContainKeys(["a", "b"]);
+    expect(obj).toContainKeys([10, "a"]);
+    // @ts-expect-error simple check for key does not exist
+    expect(obj).toContainKeys(["c"]);
+    // @ts-expect-error - Type '"c"' is not assignable to type 'number | "a" | "b"'.
+    expect(obj).toContainKeys<(typeof obj)[]>(["a", "c"]);
+    // @ts-expect-error - Type 'boolean' is not assignable to type 'string | number'.
+    expect(obj).toContainKeys<(typeof obj)[]>(["a", true]);
+    // @ts-expect-error - Argument must be an array
+    expect(obj).toContainKeys<Array<typeof obj>>("a");
+    // @ts-expect-error - Array element type 'symbol' is not assignable to 'string | number'.
+    expect(obj).toContainKeys<(typeof obj)[]>(["a", Symbol("b")]);
+  });
+
+  test("toContainEqual", () => {
+    expect(mixedArr).toContainEqual(1);
+    expect(mixedArr).toContainEqual("a");
+    expect(mixedArr).toContainEqual(true);
+    // @ts-expect-error - Argument of type 'null' is not assignable to parameter of type 'string | number | boolean'.
+    expect(mixedArr).toContainEqual<string | number | boolean>(null);
+    // @ts-expect-error - Argument of type 'number[]' is not assignable to parameter of type 'string | number | boolean'.
+    expect(mixedArr).toContainEqual<string | number | boolean>(numArr);
+    // @ts-expect-error - Too many arguments for specific overload
+    expect(mixedArr).toContainEqual<string | number | boolean>(1, 2);
+    // @ts-expect-error - Expecting string | number | boolean, got object
+    expect(mixedArr).toContainEqual<string | number | boolean>({ a: 1 });
+  });
+});
+
+const mySpyOnObjectWithOptionalMethod: {
+  optionalMethod?: (input: { question: string }) => { answer: string };
+} = {
+  optionalMethod: input => ({ answer: `Aswer to ${input.question}` }),
+};
+
+const mySpiedMethodOfOptional = spyOn(mySpyOnObjectWithOptionalMethod, "optionalMethod");
+mySpiedMethodOfOptional({ question: "asdf" });
+expectType<Mock<(input: { question: string }) => { answer: string }>>(mySpiedMethodOfOptional);
+
+const myNormalSpyOnObject = {
+  normalMethod: (name: string) => `Hello ${name}`,
+};
+
+const myNormalSpiedMethod = spyOn(myNormalSpyOnObject, "normalMethod");
+myNormalSpiedMethod("asdf");
+expectType<Mock<(name: string) => string>>(myNormalSpiedMethod);
+
+const spy = spyOn(console, "log");
+expectType(spy.mock.calls).is<any[][]>();
+expectType(expect(spy).toHaveBeenCalledOnce()).is<void>();
+
+jest.spyOn(console, "log");
+jest.fn(() => 123 as const);
+
+expectType(jest.useFakeTimers({ now: new Date(0), doNotFake: ["performance"], advanceTimers: 20, timerLimit: 100 })).is<
+  typeof jest
+>();
+expectType(
+  vi.useFakeTimers({
+    now: 0,
+    toFake: ["setTimeout", "Date"],
+    shouldAdvanceTime: true,
+    advanceTimeDelta: 20,
+    loopLimit: 100,
+  }),
+).is<typeof vi>();
+jest.useFakeTimers("legacy");
+vi.useFakeTimers("modern");
+// @ts-expect-error
+vi.useFakeTimers({ toFake: ["setTimeOut"] });
+expectType(jest.advanceTimersByTimeAsync(1)).is<Promise<void>>();
+expectType(jest.advanceTimersToNextTimerAsync(2)).is<Promise<void>>();
+expectType(jest.runAllTimersAsync()).is<Promise<void>>();
+expectType(jest.runOnlyPendingTimersAsync()).is<Promise<void>>();
+expectType(vi.advanceTimersByTimeAsync(1)).is<Promise<typeof vi>>();
+expectType(vi.advanceTimersToNextTimerAsync()).is<Promise<typeof vi>>();
+expectType(vi.runAllTimersAsync()).is<Promise<typeof vi>>();
+expectType(vi.runOnlyPendingTimersAsync()).is<Promise<typeof vi>>();
+expectType(vi.advanceTimersToNextTimer(2).advanceTimersToNextFrame().runAllTicks()).is<typeof vi>();
+expectType(jest.advanceTimersToNextTimer(2).advanceTimersToNextFrame().runAllTicks().runAllImmediates()).is<
+  typeof jest
+>();
+vi.setTimerTickMode("nextTimerAsync").setTimerTickMode("interval", 5).setTimerTickMode("manual");
+// @ts-expect-error
+vi.setTimerTickMode("manual", 5);
+jest.setTimerTickMode({ mode: "interval", delta: 5 }).setTimerTickMode({ mode: "nextAsync" });
+expectType(vi.setSystemTime("2020-01-01T00:00:00.000Z")).is<typeof vi>();
+jest.setSystemTime("2020-01-01T00:00:00.000Z");
+expectType(vi.getMockedSystemTime()).is<Date | null>();
+expectType(vi.getRealSystemTime()).is<number>();
+expectType(jest.getRealSystemTime()).is<number>();
+
+xtest("", () => {});
+xdescribe("", () => {});
+xit("", () => {});
+
+test("expectTypeOf basic type checks", () => {
+  expectTypeOf({ name: "test" }).toMatchObjectType<{ name: string }>();
+
+  // @ts-expect-error
+  expectTypeOf({ name: 123 }).toMatchObjectType<{ name: string }>();
+});
+
+mock.clearAllMocks();
+
+test
+  .each([
+    [1, 2, 3],
+    [4, 5, 6],
+  ])
+  .todo("test.each", (a, b, c, done) => {
+    expectType<number>(a);
+    expectType<number>(b);
+    expectType<number>(c);
+    expectType<(err?: unknown) => void>(done);
+  });
+describe.each([
+  [1, 2, 3],
+  [4, 5, 6],
+])("describe.each", (a, b, c) => {
+  expectType<number>(a);
+  expectType<number>(b);
+  expectType<number>(c);
+});
+
+declare let mylist: number[];
+describe.each(mylist)("describe.each", a => {
+  expectTypeOf(a).toBeNumber();
+});
+test.each(mylist)("test.each", (a, done) => {
+  expectTypeOf(a).toBeNumber();
+  expectType<(err?: unknown) => void>(done);
+});
+
+const readonlyList = ["hoisted", "isolated"] as const;
+describe.each(readonlyList)("describe.each", a => {
+  expectType<"hoisted" | "isolated">(a);
+});
+test.each(readonlyList)("test.each", a => {
+  expectType<"hoisted" | "isolated">(a);
+});
+
+// #25959
+test.todo("only a label");
+describe.todo("only a label");
+// @ts-expect-error
+test("only a label");
+
+// A call that is only generic in its return type is not the `expect()` that takes no arguments
+declare function query<T = any>(): Promise<T>;
+expectType<Matchers<any>>(expect(await query()));
+expect(await query()).toEqual([{ x: 1 }]);
+expect(await query<number>()).toBe(1);
+expectType<Matchers<undefined>>(expect());
+
+// Advanced use case tests for #18511:
+
+// 1. => When assignable to, we should pass (e.g. new Set() is assignable to Set<string>).
+//       But when unassigbale, we should type error (e.g `string` is not assignable to `"bun"`)
+// 2. => Expect that exact matches pass
+// 3. => Expect that when we opt out of type safety, any value can be passed
+
+declare const input: "bun" | "baz" | null;
+declare const expected: string;
+
+// @ts-expect-error
+/** 1. **/ expect(input).toBe(expected); // Type error - string is not assignable to `'bun' | ...`
+/** 2. **/ expect(input).toBe("bun"); // happy!
+/** 3. **/ expect(input).toBe<string>(expected); // happy! We opted out of type safety for this expectation
+
+declare const setOfStrings: Set<string>;
+/** 1. **/ expect(setOfStrings).toBe(new Set()); // this is inferrable to Set<string> so this should pass
+/** 2. **/ expect(setOfStrings).toBe(new Set<string>()); // exact, so we are happy!
+/** 3. **/ expect(setOfStrings).toBe<Set<string>>(new Set()); // happy! We opted out of type safety for this expectation
+
+// Cases for #24591
+declare const unknownMatchers: Matchers<unknown>;
+unknownMatchers.toContainKeys(["a", "b"]);
+unknownMatchers.toContainAnyKeys(["a", "b"]);
+unknownMatchers.toContainAllKeys(["a", "b"]);
+unknownMatchers.toContainKey("a");
+unknownMatchers.toContainEqual([""]);
+unknownMatchers.toEqual(["a", "b"]);
+unknownMatchers.toBeCloseTo(2);
+unknownMatchers.toBe("a");
+
+test.for([
+  [1, "a"],
+  [2, "b"],
+] as const)("test.for", ([n, s], context) => {
+  expectType<1 | 2>(n);
+  expectType<"a" | "b">(s);
+  expectType<string>(context.task.name);
+  expectType<"run" | "pass" | "fail" | "skip">(context.task.result.state);
+  expectType<AbortSignal>(context.signal);
+  context.expect(n).toBeNumber();
+  context.onTestFinished(({ task }) => {
+    expectType<string>(task.fullName);
+  });
+  context.onTestFailed(async () => {}, 1000);
+  context.skip(n === 1, "note");
+});
+test.for([1, 2])("test.for", { timeout: 100 }, (n, { expect }) => {
+  expect(n).toBe(n);
+});
+describe.for([[1, 2]])("describe.for", row => {
+  expectType<readonly [1, 2]>(row);
+});
+test.each`
+  a    | b
+  ${1} | ${2}
+`("$a $b", ({ a, b }, done) => {
+  expectType<any>(a + b);
+  expectType<(err?: unknown) => void>(done);
+});
+
+const extended = test.extend<{ port: number; url: string; label: string }>({
+  port: async ({}, use) => {
+    await use(3000);
+  },
+  url: [
+    async ({ port, task }, use) => {
+      expectType<number>(port);
+      expectType<string>(task.name);
+      await use(`http://localhost:${port}`);
+    },
+    { auto: true, scope: "test" },
+  ],
+  label: "a value",
+});
+extended("test.extend", ({ port, url, label, task, expect }) => {
+  expectType<number>(port);
+  expectType<string>(url);
+  expectType<string>(label);
+  expectType<string>(task.name);
+  expect(port).toBe(3000);
+});
+extended.skip("test.extend", { retry: 1 }, async ({ url }) => expectType<string>(url));
+extended.concurrent.for([1])("test.extend", (row, { port }) => {
+  expectType<number>(row + port);
+});
+extended.each([[1, "a"]] as const)("test.extend", (n, s) => {
+  expectType<1>(n);
+  expectType<"a">(s);
+});
+extended("options before the function", 1000, async ({ port }) => expectType<number>(port));
+extended("options after the function", async ({ port }) => expectType<number>(port), 1000);
+extended.for([1])("options before the function", 1000, async (row, { port }) => expectType<number>(row + port));
+extended.each([[1, "a"]])("options before the function", { timeout: 1000 }, (n, s) => {
+  expectType<number>(n);
+  expectType<string>(s);
+});
+// An array row is spread into arguments even when it isn't a tuple.
+extended.each([] as readonly (readonly string[])[])("test.extend", (...args) => {
+  expectType<readonly string[]>(args);
+});
+extended.each([1, 2])("test.extend", async row => expectType<1 | 2>(row));
+extended.each`
+  a    | b
+  ${1} | ${2}
+`("$a $b", async ({ a, b }) => expectType<any>(a + b));
+// `Parameters<>` must see the (label, fn, options?) overload, same as for `test`.
+expectType<Parameters<typeof extended>[2]>().is<number | TestOptions | undefined>();
+expectType<Parameters<typeof extended.skip>[2]>().is<number | TestOptions | undefined>();
+expectType<Parameters<ReturnType<typeof extended.each>>[2]>().is<number | TestOptions | undefined>();
+// `any` options must not break contextual typing of the callback's parameters.
+extended("options that are any", async ({ port }) => expectType<number>(port), {} as any);
+extended.skip("options that are any", async ({ port }) => expectType<number>(port), {} as any);
+extended.each([[1, "a"]])("options that are any", async (n, s) => expectType<string>(n + s), {} as any);
+test("options that are any", done => void expectType<(err?: unknown) => void>(done), {} as any);
+test.skip("options that are any", done => void expectType<(err?: unknown) => void>(done), {} as any);
+test.each([[1, "a"]])("options that are any", (n, s) => void expectType<string>(n + s), {} as any);
+test.each([1, 2])("options that are any", n => void expectType<number>(n), {} as any);
+extended.skip("only a label");
+extended.for([1]).skip("only a label");
+// @ts-expect-error
+extended("only a label");
+// @ts-expect-error
+extended.only("only a label");
+extended.beforeEach(({ port }) => {
+  expectType<number>(port);
+  return () => {};
+});
+extended.afterAll(({ port }, suite) => {
+  expectType<number>(port);
+  expectType<string>(suite.name);
+});
+extended.aroundEach(async (runTest, { port, task }, suite) => {
+  expectType<number>(port);
+  expectType<string>(task.name);
+  expectType<string>(suite.name);
+  expectType<Promise<void>>(runTest());
+}, 1000);
+extended.aroundAll(async (runSuite, { port }, suite) => {
+  expectType<number>(port);
+  expectType<string>(suite.name);
+  await runSuite();
+});
+extended.override({ label: "another" }).override({ port: async ({}, use) => use(1) });
+// @ts-expect-error
+extended.override({ label: 1 });
+// @ts-expect-error
+extended("test.extend", ({ nope }) => {});
+// @ts-expect-error
+test.extend<{ port: number }>({ port: "not a number" });
+
+const further = extended.extend<{ port: string; extra: boolean }>({
+  port: async ({ url }, use) => use(url),
+  extra: true,
+});
+further("test.extend", ({ port, extra, label }) => {
+  expectType<string>(port);
+  expectType<boolean>(extra);
+  expectType<string>(label);
+});
+const built = test
+  .extend("one", 1)
+  .extend("two", async ({ one }) => `${one}`)
+  .extend("three", { scope: "file" }, ({}, { onCleanup }) => {
+    onCleanup(async () => {});
+    return true;
+  });
+built("test.extend", ({ one, two, three }) => {
+  expectType<number>(one);
+  expectType<string>(two);
+  expectType<boolean>(three);
+});
+expectType(test.extend).is<ExtendTest<object>>();
+export const spreadTest = { ...test };
+export const spreadDescribe = { ...describe };
+
+test.todo("to be written");
+test.todo("to be fixed", () => {});
+test.concurrent.todo("to be written");
+extended.todo("to be written");
+describe.todo("to be written");
+expectType<Parameters<typeof test.todo>["length"]>().is<2 | 3>();
+// @ts-expect-error
+test("no callback");
+
+test.describe("test.describe", () => {
+  test.beforeEach(() => {});
+  test.afterAll(done => done());
+  test.aroundEach(runTest => runTest());
+  test.aroundAll(runSuite => runSuite(), { timeout: 1000 });
+});
+
+aroundEach(async (runTest, context, suite) => {
+  expectType<() => Promise<void>>(runTest);
+  expectType<string>(context.task.name);
+  expectType<string>(suite.name);
+  await runTest();
+});
+aroundAll(async (runSuite, {}, suite) => {
+  expectType<"suite">(suite.type);
+  await runSuite();
+}, 1000);
+// @ts-expect-error
+aroundEach();
+// @ts-expect-error
+aroundAll(async (runSuite, { nope }) => {});
+
+expectType(expect(Promise.resolve(1)).resolves.toBe(1)).is<Promise<void>>();
+expectType(expect(Promise.resolve(1)).resolves.not.toBe(2)).is<Promise<void>>();
+expectType(expect(Promise.resolve(1)).not.resolves.toBe(2)).is<Promise<void>>();
+expectType(expect(Promise.reject(new Error())).rejects.toThrow()).is<Promise<void>>();
+expectType(expect(async () => 1).resolves.toBe(1)).is<Promise<void>>();
+expectType(expect(1).toBe(1)).is<void>();
+expectType(expect(1).not.toBe(2)).is<void>();
+// @ts-expect-error
+expect(Promise.resolve(1)).resolves.toBe("1");
+// @ts-expect-error
+expect(async () => 1).resolves.toBe("1");
+
+expect({ count: 3 }).toEqual({ count: expect.toSatisfy((n: number) => n % 2 === 1) });
+expect({ count: 3 }).toEqual({ count: expect.toSatisfy(n => n % 2 === 1, "an odd number") });
+expect({ count: 2 }).toEqual({ count: expect.not.toSatisfy(n => n % 2 === 1, "an odd number") });
+// @ts-expect-error
+expect.toSatisfy();
+// @ts-expect-error
+expect.toSatisfy("not a function");
+// @ts-expect-error
+expect.not.toSatisfy(() => true, 1);
+
+declare module "bun:test" {
+  interface Matchers<T> {
+    toBeWithinRange(floor: number, ceiling: number): void;
+    toHaveClassNames(...names: string[]): void;
+    toHaveClassNames(names: string, options: { exact: boolean }): void;
+    toBeOfKind<Kind>(kind: Kind): void;
+  }
+}
+expect.extend({
+  toBeWithinRange(received: unknown, floor: unknown, ceiling: unknown) {
+    return { pass: true, message: () => this.utils.matcherHint("toBeWithinRange", received, floor) };
+  },
+});
+expectType(expect(1).toBeWithinRange(0, 2)).is<void>();
+expectType(expect(Promise.resolve(1)).resolves.toBeWithinRange(0, 2)).is<Promise<void>>();
+expectType(expect(Promise.resolve(1)).resolves.not.toBeWithinRange(0, 2)).is<Promise<void>>();
+expectType(expect(Promise.reject(1)).rejects.toBeWithinRange(0, 2)).is<Promise<void>>();
+expectType(expect.poll(() => 1).toBeWithinRange(0, 2)).is<Promise<void>>();
+expect(Promise.resolve(1)).resolves.toHaveClassNames("a", "b");
+expect(Promise.resolve(1)).resolves.toHaveClassNames("a b", { exact: true });
+expect(Promise.resolve(1)).resolves.toBeOfKind<string>("kind");
+expect(Promise.resolve(1)).resolves.toBeOfKind("kind");
+// @ts-expect-error
+expect(Promise.resolve(1)).resolves.toBeWithinRange("0", 2);
+const resolvedMatchers: Matchers<number> = expect(Promise.resolve(1)).resolves;
+
+expectType(expect.soft(1, "message").toBe(1)).is<void>();
+expectType(expect.soft(Promise.resolve(1)).resolves.not.toBe(2)).is<Promise<void>>();
+// @ts-expect-error
+expect.soft(1).toBe("1");
+
+expectType(expect.poll(() => 1).toBe(1)).is<Promise<void>>();
+expectType(expect.poll(async () => 1, { interval: 1, timeout: 10, message: "message" }).not.toBe(2)).is<
+  Promise<void>
+>();
+// @ts-expect-error
+expect.poll(async () => 1).toBe("1");
+// @ts-expect-error
+expect.poll(() => 1).toThrow();
+// @ts-expect-error
+expect.poll(() => 1).resolves;
+// @ts-expect-error
+expect.poll(1);
+
+expectType(expect("text").toMatchFileSnapshot("./text.txt")).is<Promise<void>>();
+expectType(expect("text").toMatchFileSnapshot("./text.txt", "hint")).is<Promise<void>>();
+expectType(expect(Promise.resolve("text")).resolves.toMatchFileSnapshot("./text.txt")).is<Promise<void>>();
+// @ts-expect-error
+expect("text").toMatchFileSnapshot();
+
+expect.addSnapshotSerializer({
+  test: value => value instanceof Date,
+  serialize: (value, config, indentation, depth, refs, printer) =>
+    `Date(${printer(value.getTime(), config, indentation + config.indent, depth, refs)})`,
+});
+expect.addSnapshotSerializer({
+  test: value => typeof value === "string",
+  print: (value, print, indent) => indent(print([value])),
+});
+// @ts-expect-error
+expect.addSnapshotSerializer({ test: () => true });
+// @ts-expect-error
+expect.addSnapshotSerializer({ serialize: () => "" });
+
+test("options before the function", { timeout: 1000, retry: 1 }, () => {});
+test("options before the function", 1000, async () => {});
+test.each([[1, "a"]])("options before the function", { timeout: 1000 }, (a, b) => {
+  expectType<number>(a);
+  expectType<string>(b);
+});
+// The signature that `Parameters<>` reads is still (label, fn, options?)
+expectType<Parameters<typeof test>[1]>(() => {});
+function wrapped(...args: Parameters<typeof test>) {
+  test(...args);
+}
+wrapped("label", () => {});
+wrapped("label", () => {}, 1000);
+
+// A row that is a readonly array is spread, like any other array
+declare const readonlyRows: readonly (readonly string[])[];
+test.each(readonlyRows)("test.each", (...args) => {
+  expectType<readonly string[]>(args);
+});
+describe.each(readonlyRows)("describe.each", (...args) => {
+  expectType<string[]>(args);
+});
+
+test.skip("only a label");
+describe.skip("only a label");
+// ...and `Parameters<>` still reads (label, fn, options?) for `skip` and `todo`
+expectType<Parameters<typeof test.skip>>(["label", () => {}, 1000]);
+expectType<Parameters<typeof test.todo>>(["label", () => {}]);
+expectType<Parameters<typeof describe.skip>>(["label", () => {}]);
+expectType<Parameters<typeof describe.todo>>(["label", () => {}]);
+// On its own, a function is the body of the group and not its label, so a class throws
+describe.skip(123);
+describe.skip(() => {});
+// @ts-expect-error
+describe.skip(class Foo {});
+// @ts-expect-error
+describe.todo(class Foo {});
+// @ts-expect-error
+describe.skip({ name: "label" });
+describe.skip(class Foo {}, () => {});
